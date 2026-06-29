@@ -200,11 +200,28 @@ The honest takeaway: the trend filter beats buy-and-hold **risk-adjusted, unleve
 thin edge. It's a daily allocation model and is **research/backtest only** — not
 wired into a live runner. (Leveraged-ETF daily-reset decay isn't modeled either.)
 
+## Momentum rotation (`bot/momentum_rotation.py`)
+
+Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,
+but only those with *positive* momentum (else cash). The other research-backed
+beat-the-market idea.
+
+```bash
+python -m bot.momentum_rotation --symbols SPY QQQ GLD TLT EFA EEM IWM \
+    --start 2005-01-01 --data-source yahoo --lookback-months 12 --top-k 2
+```
+
+Honest finding on 2005–2026: it's **highly parameter-sensitive** (Sharpe ranged
+0.42→0.76 across lookback/top-k), and the canonical 12-1 spec *underperformed*
+buy-and-hold. A few shorter-lookback configs beat it — but picking those after
+seeing the results is textbook overfitting. Treat any single "win" with suspicion
+and walk-forward it before believing it.
+
 ## Testing
 
 Offline test suite (no network, no broker) covering the strategy logic, the
-backtester, the sweep mechanics, the trend-exposure model, the benchmark, and the
-live runner's order/stop/reconcile machinery against fakes:
+backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
+the benchmark, and the live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt
