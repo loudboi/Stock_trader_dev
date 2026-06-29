@@ -79,6 +79,19 @@ def test_leverage_amplifies_invested_returns():
     assert eq2.iloc[-1] > eq1.iloc[-1]       # 2x makes more in a pure uptrend
 
 
+def test_borrow_rate_only_charges_the_levered_portion():
+    daily = _daily(np.linspace(100, 200, 200))   # clean uptrend, always invested late
+    base = te.strategy_returns(daily, 20, 0.0, leverage=1.0, borrow_rate=0.10)
+    no_fee = te.strategy_returns(daily, 20, 0.0, leverage=2.0, borrow_rate=0.0)
+    fee = te.strategy_returns(daily, 20, 0.0, leverage=2.0, borrow_rate=0.10)
+    # Unlevered: borrow rate must not matter (nothing borrowed).
+    assert np.allclose(base.values,
+                       te.strategy_returns(daily, 20, 0.0, 1.0, 0.0).values)
+    # Levered: financing drags the return below the no-fee version.
+    assert te.equity_from_returns(fee, None).iloc[-1] < \
+           te.equity_from_returns(no_fee, None).iloc[-1]
+
+
 def test_run_smoke_two_symbols():
     a = _daily(np.linspace(100, 180, 300))
     b = _daily(np.linspace(100, 140, 300))

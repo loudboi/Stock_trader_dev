@@ -70,9 +70,16 @@ def exposure_series(close: pd.Series, ma_period: int, buffer: float = 0.0) -> pd
 
 
 def strategy_returns(daily: pd.DataFrame, ma_period: int, buffer: float,
-                     leverage: float) -> pd.Series:
+                     leverage: float, borrow_rate: float = 0.0,
+                     periods_per_year: int = 252) -> pd.Series:
     """Daily strategy returns: yesterday's exposure × leverage × today's move,
-    minus a slippage cost each time exposure flips."""
+    minus a slippage cost each time exposure flips, minus financing on the
+    borrowed portion while invested.
+
+    `borrow_rate` is the annual cost of the leveraged (>1×) part — margin interest,
+    or a stand-in for a leveraged ETF's expense/decay. It's a first-order model
+    (the borrow is charged daily on `(leverage-1)` of notional while invested); it
+    does not capture leveraged-ETF daily-reset path dependence."""
     close = daily["close"]
     target = exposure_series(close, ma_period, buffer)
     held = target.shift(1).fillna(0.0)               # act on the next bar (no lookahead)
@@ -80,7 +87,8 @@ def strategy_returns(daily: pd.DataFrame, ma_period: int, buffer: float,
     gross = held * leverage * asset_ret
     flips = held.diff().abs().fillna(0.0)
     cost = flips * leverage * SLIPPAGE
-    return gross - cost
+    financing = held * max(leverage - 1.0, 0.0) * (borrow_rate / periods_per_year)
+    return gross - cost - financing
 
 
 def equity_from_returns(rets: pd.Series, begin_ts, initial=INITIAL_EQUITY) -> pd.Series:
@@ -99,11 +107,11 @@ def _trade_count(daily, ma_period, buffer) -> int:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def run(daily_data, ma_period, buffer, leverage, begin_ts):
+def run(daily_data, ma_period, buffer, leverage, begin_ts, borrow_rate=0.0):
     n = len(daily_data)
     per_strat, per_bh, per_series, ret_frame = {}, {}, {}, {}
     for name, daily in daily_data.items():
-        rets = strategy_returns(daily, ma_period, buffer, leverage)
+        rets = strategy_returns(daily, ma_period, buffer, leverage, borrow_rate)
         eq = equity_from_returns(rets, begin_ts)
         m = compute_metrics([], eq)
         m["trades"] = _trade_count(daily, ma_period, buffer)
@@ -122,7 +130,8 @@ def run(daily_data, ma_period, buffer, leverage, begin_ts):
     combined_bh = compute_metrics([], buy_hold_combined(daily_data, begin_ts))
 
     print(f"\nTREND-EXPOSURE  ma={ma_period}  buffer={buffer:.0%}  leverage={leverage:g}"
-          f"  (hold above MA, cash below; {SLIPPAGE:.2%} slippage per switch)")
+          f"  borrow={borrow_rate:.1%}/yr  (hold above MA, cash below; "
+          f"{SLIPPAGE:.2%} slippage/switch)")
     print_vs_benchmark(per_strat, per_bh, combined, combined_bh)
     plot_equity(per_series, combined_eq, RESULTS_PNG, buy_hold_combined(daily_data, begin_ts))
     return 0
@@ -136,6 +145,9 @@ def main():
                     help="Re-entry buffer above the MA (e.g. 0.01 = 1%%) to cut whipsaw.")
     ap.add_argument("--leverage", type=float, default=1.0,
                     help="Exposure while invested (1.0 = unlevered; 2.0 = 2x).")
+    ap.add_argument("--borrow-rate", type=float, default=0.06,
+                    help="Annual financing cost on the leveraged (>1x) portion "
+                         "(margin interest / leveraged-ETF cost stand-in). Default 6%%.")
     ap.add_argument("--months", type=int, default=240)
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end", type=str, default=None)
@@ -152,7 +164,8 @@ def main():
     if not daily_data:
         log.error("No data fetched; aborting.")
         return 1
-    return run(daily_data, args.ma_period, args.buffer, args.leverage, begin_ts=start_dt)
+    return run(daily_data, args.ma_period, args.buffer, args.leverage,
+               begin_ts=start_dt, borrow_rate=args.borrow_rate)
 
 
 if __name__ == "__main__":

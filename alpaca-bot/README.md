@@ -190,13 +190,15 @@ python -m bot.trend_exposure --symbols SPY QQQ GLD --start 2005-01-01 \
     --data-source yahoo --leverage 1.5 --buffer 0.01
 ```
 
-On the 2005–2026 full cycle this beats buy-and-hold risk-adjusted unlevered
-(Sharpe ~0.98 vs 0.88, roughly half the max drawdown), and at ~1.5× leverage beats
-it on raw return *and* drawdown. **Caveat:** the backtest does **not** model the
-cost of leverage (margin interest, or leveraged-ETF decay/expense) — real financing
-costs would reduce the levered numbers, so treat >1× results as an optimistic
-ceiling. It's a daily allocation model and is **research/backtest only** — it is not
-wired into a live runner.
+On the 2005–2026 full cycle, **unlevered** it beats buy-and-hold risk-adjusted
+(Sharpe ~0.98 vs 0.88, roughly half the max drawdown) — a real, robust edge. But
+the `--borrow-rate` (default 6%/yr) models the cost of leverage, and once it's
+applied the "beat on raw return" result **evaporates**: 1.5× trails B&H on return
+*and* Sharpe; 2× beats on raw return only by taking more risk at a worse Sharpe.
+The honest takeaway: the trend filter beats buy-and-hold **risk-adjusted, unlevered**
+— leverage doesn't buy you a free lunch on raw return, because financing eats the
+thin edge. It's a daily allocation model and is **research/backtest only** — not
+wired into a live runner. (Leveraged-ETF daily-reset decay isn't modeled either.)
 
 ## Testing
 
