@@ -200,6 +200,26 @@ The honest takeaway: the trend filter beats buy-and-hold **risk-adjusted, unleve
 thin edge. It's a daily allocation model and is **research/backtest only** — not
 wired into a live runner. (Leveraged-ETF daily-reset decay isn't modeled either.)
 
+## Strategy lab (`bot/lab.py`)
+
+Six research-backed beat-buy-and-hold approaches in one comparable harness, ranked
+against an equal-weight buy-and-hold over a full cycle: `vol_target` (target a
+constant volatility), `inverse_vol` (risk parity), `managed_futures` (diversified
+inverse-vol trend), `mean_reversion` (RSI dip-buying in uptrends), `trend_vol`
+(vol-targeted trend), and `ensemble` (a blend). Costs modelled (0.05% turnover
+slippage + a borrow rate on leverage); all signals act next-day (no lookahead).
+
+```bash
+python -m bot.lab --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+Finding on 2005–2026 (4-asset universe, B&H Sharpe 0.96): **`inverse_vol` (risk
+parity) was the only one to beat B&H risk-adjusted** (Sharpe 1.11), and `vol_target`
+beat it on raw return only by levering into more risk (worse Sharpe). The fancier
+combinations (`trend_vol`, `ensemble`, `mean_reversion`) underperformed — the edge
+keeps coming from *simple risk management* (diversify, risk-weight), not from
+return prediction or added complexity. Research/backtest only.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,
