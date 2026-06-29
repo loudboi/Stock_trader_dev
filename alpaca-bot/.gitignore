@@ -1,5 +1,7 @@
-# Secrets — NEVER commit
+# Secrets — NEVER commit (real env files; the *.env.example templates are kept)
 .env
+*.env
+!*.env.example
 
 # Runtime outputs
 pullback_trades.csv

@@ -168,9 +168,11 @@ It refuses the real-money endpoint unless you pass `--live`.
 > they'll fight over the position. To change which symbols it trades, edit
 > `PULLBACK_SYMBOLS` (and `PULLBACK_UNIVERSE` for new tickers) in `config.py`.
 
-Leave it running in the terminal. To run it unattended later, look into `tmux`,
-`screen`, or a `systemd` service (Linux), but get comfortable watching it live
-first. (For the EUR-only Interactive Brokers path, see `IBKR_SETUP.md`.)
+Leave it running in the terminal. To run it unattended on a Linux VPS, use the
+systemd units and runbook in `deploy/` (auto-restart, journal logs, graceful
+shutdown) — but get comfortable watching it live first. Set `ALERT_WEBHOOK_URL` or
+the `TELEGRAM_*` env vars to be pinged on entries/exits, stalls, and errors. (For
+the EUR-only Interactive Brokers path, see `IBKR_SETUP.md`.)
 
 ---
 

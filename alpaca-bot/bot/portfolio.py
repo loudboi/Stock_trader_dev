@@ -22,8 +22,9 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (MarketOrderRequest, StopOrderRequest,
+                                     GetOrdersRequest)
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import (StockBarsRequest, CryptoBarsRequest,
@@ -170,3 +171,55 @@ class Portfolio:
         except APIError as e:
             log.error("Close failed for %s: %s", instrument.name, e)
             return False
+
+    def submit_stop_order(self, instrument, qty: float, stop_price: float):
+        """Rest a protective SELL stop at the broker (long-only Strategy 4).
+
+        Returns the order id (str) on success, or None if not placed. Alpaca
+        crypto doesn't take a plain stop order, so for crypto we return None and
+        let the in-process stop cover it. The equity stop is GTC so it survives
+        restarts / downtime.
+        """
+        if instrument.asset_class == "crypto":
+            log.info("%s: broker stop not placed (crypto); in-process stop active.",
+                     instrument.name)
+            return None
+        if qty <= 0 or stop_price <= 0:
+            return None
+        req = StopOrderRequest(symbol=instrument.api_symbol, qty=qty,
+                               side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+                               stop_price=round(stop_price, 2))
+        try:
+            order = self.trading.submit_order(order_data=req)
+            return str(order.id)
+        except APIError as e:
+            log.warning("Stop order failed for %s: %s (in-process stop active).",
+                        instrument.name, e)
+            return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        if not order_id:
+            return True
+        try:
+            self.trading.cancel_order_by_id(order_id)
+            return True
+        except APIError as e:
+            log.debug("Cancel order %s failed: %s", order_id, e)
+            return False
+
+    def recent_fill_price(self, instrument, side: str):
+        """filled_avg_price of the most recent filled order on `side`, or None.
+
+        Used to recover the true exit price when a resting stop fills while we're
+        between loops (or down).
+        """
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED,
+                                   symbols=[instrument.api_symbol],
+                                   side=OrderSide(side), limit=20, nested=False)
+            for o in self.trading.get_orders(filter=req):
+                if getattr(o, "filled_avg_price", None):
+                    return float(o.filled_avg_price)
+        except APIError as e:
+            log.debug("recent_fill_price failed for %s: %s", instrument.name, e)
+        return None

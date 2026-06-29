@@ -385,3 +385,17 @@ class IBKRPortfolio:
             return True                            # already flat
         side = "sell" if r["side"] == "long" else "buy"
         return self.submit_market_order(inst, r["qty"], side)
+
+    # ---- resting-stop surface (parity with the Alpaca Portfolio) ---------- #
+    # Resting broker stops aren't implemented for the IBKR path yet, so the
+    # trader falls back to its in-process stop (monitored while the bot runs).
+    def submit_stop_order(self, inst, qty: float, stop_price: float):
+        log.debug("%s: broker stop not implemented for IBKR; in-process stop active.",
+                  inst.name)
+        return None
+
+    def cancel_order(self, order_id) -> bool:
+        return True
+
+    def recent_fill_price(self, inst, side: str):
+        return None

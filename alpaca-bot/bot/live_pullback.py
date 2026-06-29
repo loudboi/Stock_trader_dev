@@ -44,6 +44,7 @@ from datetime import datetime, timezone, timedelta
 import config
 from bot import indicators as ind
 from bot import risk_manager as rm
+from bot.notifier import Notifier
 from bot.portfolio import Portfolio
 from bot.backtest_pullback import _DAILY_WARMUP_DAYS
 from bot.strategies.trend_pullback import TrendPullbackStrategy, PullbackParams
@@ -56,6 +57,8 @@ PULLBACK_TRADES_CSV = "pullback_trades.csv"
 PULLBACK_DAILY_PNL_CSV = "pullback_daily_pnl.csv"
 PULLBACK_STATE_FILE = "pullback_state.json"
 POLL_SECONDS = 60
+# Consecutive no-data cycles for a symbol before we raise a data-stall alert.
+STALL_ALERT_AFTER = 5
 
 _RUNNING = True
 
@@ -68,11 +71,12 @@ def _handle_sigterm(signum, frame):
 
 class PullbackLiveTrader:
     def __init__(self, pf: Portfolio, symbols, params: PullbackParams,
-                 state_file=PULLBACK_STATE_FILE):
+                 state_file=PULLBACK_STATE_FILE, notifier: Notifier = None):
         self.pf = pf
         self.symbols = symbols
         self.params = params
         self.state_file = state_file
+        self.notifier = notifier or Notifier()
         self.instruments = {s: config.resolve_instrument(s) for s in symbols}
         missing = [s for s, i in self.instruments.items() if i is None]
         if missing:
@@ -86,6 +90,13 @@ class PullbackLiveTrader:
         # refetch on rollover. The realtime stop still uses latest_price() each
         # loop; this just spares a historical-bars API call every cycle.
         self._daily_cache = {}   # name -> (utc_date, DataFrame)
+        self._stall = {s: 0 for s in symbols}        # consecutive no-data cycles
+        self._stall_alerted = set()                  # symbols already alerted
+
+    def notify(self, message: str) -> None:
+        """Local log + outbound alert (alerting is best-effort and never raises)."""
+        log.info("ALERT: %s", message)
+        self.notifier.notify(message)
 
     # ------------------------------------------------------------------ #
     # State
@@ -132,19 +143,39 @@ class PullbackLiveTrader:
                 qty, avg = bl
                 if name not in self.state["positions"]:
                     # Adopt: assume fully built so we don't keep pyramiding into it.
-                    self.state["positions"][name] = {
+                    # Size the stop from the CURRENT daily ATR, not the 5% floor.
+                    stop_dist = self._current_stop_dist(name, inst, avg)
+                    pos = {
                         "tranches": len(self.params.tranches),
                         "qty": qty, "avg_entry": avg,
-                        "last_add_price": avg, "stop_dist": self.params.min_stop,
+                        "last_add_price": avg, "stop_dist": stop_dist,
+                        "stop_order_id": None,
                         "entry_time": datetime.now(timezone.utc).isoformat(),
                     }
-                    log.info("Adopted existing %s long (qty=%s @%.4f).", name, qty, avg)
+                    self.state["positions"][name] = pos
+                    self._place_stop(name, inst, pos)
+                    log.info("Adopted existing %s long (qty=%s @%.4f, stop_dist=%.3f).",
+                             name, qty, avg, stop_dist)
             else:
                 if name in self.state["positions"]:
                     log.info("State had %s but broker is flat; clearing.", name)
                     self.state["positions"].pop(name, None)
                 self.state["intents"].pop(name, None)
         self.save_state()
+
+    def _current_stop_dist(self, name, inst, price) -> float:
+        """ATR-based stop distance from the latest completed daily bars."""
+        try:
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=_DAILY_WARMUP_DAYS + 30)
+            daily = self.pf.get_historical_bars(inst, "1Day", start, end)
+            if daily is None or daily.empty:
+                return self.params.min_stop
+            a = ind.atr(daily, self.params.atr_period).iloc[-1]
+            atr_v = float(a) if a == a else 0.0
+            return self.strats[name].stop_distance(atr_v, price)
+        except Exception:  # noqa: BLE001
+            return self.params.min_stop
 
     # ------------------------------------------------------------------ #
     # Orders
@@ -175,15 +206,31 @@ class PullbackLiveTrader:
             pos["qty"] = pos.get("qty", 0.0) + qty
             pos["avg_entry"] = price
         self.state["positions"][name] = pos
+        # (Re)rest a protective broker stop sized to the full position.
+        self._place_stop(name, inst, pos)
         self.save_state()
         log.info("BUY %s tranche %d/%d qty=%s @~%.4f (%s) stop_dist=%.3f",
                  name, pos["tranches"], len(self.params.tranches), qty, price,
                  how, pos["stop_dist"])
+        self.notify(f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
+                    f"qty={qty} @~{price:.4f} ({how})")
+
+    def _place_stop(self, name, inst, pos):
+        """Cancel any existing resting stop and place a fresh one at the current
+        average-entry-based stop level. No-op fallback for brokers/assets that
+        don't take a resting stop (the in-process stop covers those)."""
+        old = pos.get("stop_order_id")
+        if old:
+            self.pf.cancel_order(old)
+        stop_level = pos["avg_entry"] * (1 - pos["stop_dist"])
+        pos["stop_order_id"] = self.pf.submit_stop_order(inst, pos["qty"], stop_level)
 
     def _close(self, name, inst, exit_price, reason):
         pos = self.state["positions"].get(name)
         if not pos:
             return
+        if pos.get("stop_order_id"):                 # drop the resting stop first
+            self.pf.cancel_order(pos["stop_order_id"])
         if not self.pf.close_position_raw(inst):
             return
         pnl = (exit_price - pos["avg_entry"]) * pos["qty"]
@@ -193,6 +240,25 @@ class PullbackLiveTrader:
         self.state["intents"].pop(name, None)
         self.save_state()
         log.info("CLOSE %s @~%.4f pnl=%.2f (%s)", name, exit_price, pnl, reason)
+        self.notify(f"CLOSE {name} @~{exit_price:.4f} pnl={pnl:.2f} ({reason})")
+
+    def _finalize_external_close(self, name, inst, pos):
+        """The broker is flat but we still hold state — a resting stop fired (or
+        the position was closed externally) while we were between loops or down.
+        Recover the true exit price if we can, log the trade, and clear state."""
+        exit_px = self.pf.recent_fill_price(inst, "sell")
+        if exit_px is None:                          # estimate at the stop level
+            exit_px = pos["avg_entry"] * (1 - pos.get("stop_dist", self.params.min_stop))
+        if pos.get("stop_order_id"):
+            self.pf.cancel_order(pos["stop_order_id"])
+        pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
+        self._log_trade(name, pos, exit_px, pnl, "broker stop / external close")
+        self._accrue_daily(pnl)
+        self.state["positions"].pop(name, None)
+        self.state["intents"].pop(name, None)
+        self.save_state()
+        log.info("CLOSE %s @~%.4f pnl=%.2f (broker stop/external)", name, exit_px, pnl)
+        self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} (broker stop/external)")
 
     # ------------------------------------------------------------------ #
     # Logging
@@ -254,6 +320,7 @@ class PullbackLiveTrader:
             start = end - timedelta(days=_DAILY_WARMUP_DAYS + 30)
             daily_full = self.pf.get_historical_bars(inst, "1Day", start, end)
             if daily_full is None or daily_full.empty:
+                self._mark_data(name, ok=False)
                 return
             self._daily_cache[name] = (today, daily_full)
         # Only act on COMPLETED daily bars (exclude today's still-forming bar).
@@ -270,9 +337,20 @@ class PullbackLiveTrader:
         stop_dist = strat.stop_distance(atr_i, price_i)
         latest = self._latest_price(inst, daily)
         if latest is None:
+            self._mark_data(name, ok=False)
             return
+        self._mark_data(name, ok=True)
 
         pos = self.state["positions"].get(name)
+
+        # 0. Broker truth for a held position: if it's gone, a resting stop fired
+        #    (or it was closed externally) while we were between loops or down.
+        if pos:
+            broker = self.pf.get_position_raw(inst)
+            if broker is None or broker.get("side") != "long":
+                self._finalize_external_close(name, inst, pos)
+                return
+            pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
 
         # 1. Real-time volatility stop.
         if pos:
@@ -337,16 +415,30 @@ class PullbackLiveTrader:
             self.state["intents"].pop(name, None)
             self.save_state()
 
+    def _mark_data(self, name, ok: bool) -> None:
+        """Track consecutive no-data cycles and alert once when a symbol stalls."""
+        if ok:
+            self._stall[name] = 0
+            self._stall_alerted.discard(name)
+            return
+        self._stall[name] = self._stall.get(name, 0) + 1
+        if self._stall[name] >= STALL_ALERT_AFTER and name not in self._stall_alerted:
+            self._stall_alerted.add(name)
+            self.notify(f"DATA STALL: no price/bars for {name} "
+                        f"({self._stall[name]} cycles).")
+
     def step(self):
         for name in self.symbols:
             try:
                 self._process(name)
             except Exception as e:  # noqa: BLE001
                 log.exception("%s processing error (continuing): %s", name, e)
+                self.notify(f"ERROR processing {name}: {e}")
         self.save_state()
 
     def run(self):
         log.info("Strategy 4 live runner started. Symbols: %s", ", ".join(self.symbols))
+        self.notify("Strategy 4 live runner started: " + ", ".join(self.symbols))
         signal.signal(signal.SIGINT, _handle_sigterm)
         signal.signal(signal.SIGTERM, _handle_sigterm)
         while _RUNNING:
@@ -357,6 +449,7 @@ class PullbackLiveTrader:
                 time.sleep(1)
         self.flush_daily()
         log.info("Strategy 4 live runner stopped cleanly.")
+        self.notify("Strategy 4 live runner stopped.")
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,29 @@
+[Unit]
+Description=Strategy 4 (trend-pullback) live runner — Alpaca
+Documentation=https://github.com/loudboi/Stock_trader_dev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/opt/alpaca-bot
+# Keys + optional alert config. chmod 600, owned by the alpaca user.
+EnvironmentFile=/etc/alpaca-bot/pullback.env
+ExecStart=/opt/alpaca-bot/.venv/bin/python -m bot.live_pullback
+# The runner traps SIGTERM, finishes the cycle, and flushes the day's P&L.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Restart=always
+RestartSec=10
+# Light hardening (loosen if your paths differ).
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alpaca-pullback
+
+[Install]
+WantedBy=multi-user.target
