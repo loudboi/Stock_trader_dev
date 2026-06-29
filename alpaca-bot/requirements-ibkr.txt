@@ -1,0 +1,6 @@
+# IBKR path only — install alongside the base requirements when using
+# bot.live_pullback_ibkr. The Alpaca path does NOT need this.
+#
+#   pip install -r requirements.txt -r requirements-ibkr.txt
+#
+ib_async>=2.0

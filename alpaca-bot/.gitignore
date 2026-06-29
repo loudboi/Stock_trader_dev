@@ -1,0 +1,21 @@
+# Secrets — NEVER commit
+.env
+
+# Runtime outputs
+pullback_trades.csv
+pullback_daily_pnl.csv
+pullback_state.json
+pullback_state.json.tmp
+pullback_ibkr_trades.csv
+pullback_ibkr_daily_pnl.csv
+pullback_ibkr_state.json
+ibkr_cache/
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.DS_Store
