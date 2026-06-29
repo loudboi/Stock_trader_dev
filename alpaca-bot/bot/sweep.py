@@ -190,6 +190,8 @@ def main():
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end", type=str, default=None)
     ap.add_argument("--ema", action="store_true")
+    ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
+                    help="yahoo = decades of free daily history (daily fills only).")
     ap.add_argument("--folds", type=int, default=4, help="Walk-forward folds.")
     for axis in _AXES:
         ap.add_argument(f"--{axis.replace('_', '-')}", nargs="+", type=float,
@@ -207,7 +209,7 @@ def main():
     log.info("Grid size: %d combinations", len(grid))
 
     daily_data, intra_data, exec_is_intraday = fetch_all(
-        args.symbols, args.exec_timeframe, start_dt, end_dt)
+        args.symbols, args.exec_timeframe, start_dt, end_dt, source=args.data_source)
     if not daily_data:
         log.error("No data fetched; aborting.")
         return 1

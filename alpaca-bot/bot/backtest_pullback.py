@@ -386,11 +386,16 @@ def flag_negative_sharpe(per_instrument, combined):
               "over this window across the chosen instruments.")
 
 
-def plot_equity(per_series, combined_series, path):
+def plot_equity(per_series, combined_series, path, bh_series=None):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), height_ratios=[1.4, 1])
     cs = combined_series.copy()
     cs.index = cs.index.tz_localize(None) if cs.index.tz else cs.index
     ax1.plot(cs.index, cs.values, color="#2e7d32", lw=1.8, label="Combined portfolio")
+    if bh_series is not None and len(bh_series):
+        bh = bh_series.copy()
+        bh.index = bh.index.tz_localize(None) if bh.index.tz else bh.index
+        ax1.plot(bh.index, bh.values, color="#9467bd", lw=1.4, ls=":",
+                 label="Buy & hold (equal-weight)")
     ax1.axhline(INITIAL_EQUITY, color="#888", ls="--", lw=1, label="Starting equity")
     rmx = cs.cummax()
     ax1.fill_between(cs.index, cs.values, rmx.values, where=(cs.values < rmx.values),
@@ -425,16 +430,37 @@ def fetch_bars(pf, instrument, tf_key, days_back):
     return pf.get_historical_bars(instrument, tf_key, start, end)
 
 
-def fetch_all(symbols, exec_tf, start_dt, end_dt):
+def fetch_all(symbols, exec_tf, start_dt, end_dt, source="alpaca"):
     """Fetch daily history with ~320d of warmup lead before start_dt (so the
-    200-day MA is valid at the start), and intraday only over the test window."""
-    from bot.portfolio import Portfolio
-    config.validate_config()
-    pf = Portfolio()
+    200-day MA is valid at the start), and intraday only over the test window.
+
+    source="alpaca" uses the live data path (IEX); source="yahoo" pulls decades of
+    free daily history for full-cycle studies (intraday isn't available there, so
+    execution falls back to next-daily-bar fills)."""
     daily_start = start_dt - timedelta(days=_DAILY_WARMUP_DAYS)
     intra_start = start_dt - timedelta(days=_INTRA_BUFFER_DAYS)
     exec_is_intraday = exec_tf != "none"
 
+    if source == "yahoo":
+        if exec_is_intraday:
+            log.info("Yahoo source: no intraday history -> using next-daily-bar fills.")
+            exec_is_intraday = False
+        from bot.data import load_yahoo
+        daily_data = {}
+        for name in symbols:
+            log.info("Fetching %s daily (yahoo)...", name)
+            d = load_yahoo(name, daily_start, end_dt)
+            if d.empty:
+                log.warning("No daily data for %s; skipping.", name)
+                continue
+            daily_data[name] = d
+            log.info("  daily bars: %d (%s -> %s)", len(d),
+                     d.index[0].date(), d.index[-1].date())
+        return daily_data, {}, exec_is_intraday
+
+    from bot.portfolio import Portfolio
+    config.validate_config()
+    pf = Portfolio()
     daily_data, intra_data = {}, {}
     for name in symbols:
         inst = config.resolve_instrument(name)
@@ -451,6 +477,68 @@ def fetch_all(symbols, exec_tf, start_dt, end_dt):
             intra_data[name] = it
             log.info("  intraday bars: %d", len(it))
     return daily_data, intra_data, exec_is_intraday
+
+
+# --------------------------------------------------------------------------- #
+# Buy-and-hold benchmark (the bar Strategy 4 is trying to beat)
+# --------------------------------------------------------------------------- #
+def buy_hold_equity(daily, begin_ts=None, initial=INITIAL_EQUITY):
+    """Equity curve of holding `initial` in one symbol from begin_ts to the end."""
+    df = daily[daily.index >= begin_ts] if begin_ts is not None else daily
+    if df.empty:
+        return pd.Series(dtype=float)
+    c = df["close"]
+    return (initial * c / c.iloc[0]).rename("buy_hold")
+
+
+def buy_hold_combined(daily_data, begin_ts=None, initial=INITIAL_EQUITY):
+    """Equal-weight buy-and-hold across all symbols, rebalanced once at the start."""
+    n = len(daily_data)
+    if not n:
+        return pd.Series(dtype=float)
+    parts = [buy_hold_equity(d, begin_ts, initial / n) for d in daily_data.values()]
+    merged = pd.concat(parts, axis=1).sort_index().ffill().dropna(how="all")
+    return merged.sum(axis=1)
+
+
+def print_vs_benchmark(per_strat, per_bh, combined_strat, combined_bh):
+    """Strategy vs buy-and-hold, head to head, with the verdict that matters."""
+    cols = ["Instrument", "Strat Ret%", "B&H Ret%", "Strat MaxDD%", "B&H MaxDD%",
+            "Strat Shp", "B&H Shp", "Beat B&H?"]
+    rows = []
+    for name in per_strat:
+        s, b = per_strat[name], per_bh[name]
+        beat = "YES" if s["total_return"] > b["total_return"] else "no"
+        rows.append([name, f"{s['total_return']*100:.1f}", f"{b['total_return']*100:.1f}",
+                     f"{s['max_drawdown']*100:.1f}", f"{b['max_drawdown']*100:.1f}",
+                     f"{s['sharpe']:.2f}", f"{b['sharpe']:.2f}", beat])
+    beat_c = "YES" if combined_strat["total_return"] > combined_bh["total_return"] else "no"
+    rows.append(["PORTFOLIO", f"{combined_strat['total_return']*100:.1f}",
+                 f"{combined_bh['total_return']*100:.1f}",
+                 f"{combined_strat['max_drawdown']*100:.1f}",
+                 f"{combined_bh['max_drawdown']*100:.1f}",
+                 f"{combined_strat['sharpe']:.2f}", f"{combined_bh['sharpe']:.2f}", beat_c])
+
+    widths = [max(len(str(r[i])) for r in ([cols] + rows)) for i in range(len(cols))]
+    line = "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols))
+    print("\n" + "=" * len(line))
+    print("VS BUY-AND-HOLD  (equal-weight, same window; 'Beat?' is on raw return)")
+    print("=" * len(line))
+    print(line)
+    print("-" * len(line))
+    for r in rows:
+        if r[0] == "PORTFOLIO":
+            print("-" * len(line))
+        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
+    print("=" * len(line))
+    sr, br = combined_strat["total_return"], combined_bh["total_return"]
+    sdd, bdd = combined_strat["max_drawdown"], combined_bh["max_drawdown"]
+    if sr > br:
+        print(f"Portfolio BEAT buy-and-hold on return ({sr*100:.1f}% vs {br*100:.1f}%).")
+    else:
+        print(f"Portfolio TRAILED buy-and-hold on return ({sr*100:.1f}% vs {br*100:.1f}%) "
+              f"— but at {sdd*100:.1f}% max drawdown vs B&H's {bdd*100:.1f}%. Risk-adjusted "
+              "(Sharpe / drawdown) is the fairer lens for a defensive strategy.")
 
 
 # --------------------------------------------------------------------------- #
@@ -476,9 +564,16 @@ def run_backtest(daily_data, intra_data, params, exec_is_intraday,
     ct, ce = run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts)
     combined = compute_metrics(ct, ce)
 
+    # Buy-and-hold benchmark on the same window.
+    per_bh, bh_combined_series = {}, buy_hold_combined(daily_data, begin_ts)
+    for name, daily in daily_data.items():
+        per_bh[name] = compute_metrics([], buy_hold_equity(daily, begin_ts))
+    combined_bh = compute_metrics([], bh_combined_series)
+
     print_summary(per_instrument, combined, signal_tf, exec_tf)
+    print_vs_benchmark(per_instrument, per_bh, combined, combined_bh)
     flag_negative_sharpe(per_instrument, combined)
-    plot_equity(per_series, ce, RESULTS_PNG)
+    plot_equity(per_series, ce, RESULTS_PNG, bh_combined_series)
     return 0
 
 
@@ -496,6 +591,9 @@ def main():
     ap.add_argument("--start", type=str, default=None, help="Start date YYYY-MM-DD.")
     ap.add_argument("--end", type=str, default=None, help="End date YYYY-MM-DD (default today).")
     ap.add_argument("--ema", action="store_true", help="Use EMAs instead of SMAs.")
+    ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
+                    help="yahoo = decades of free daily history for full-cycle studies "
+                         "(daily fills only; split/dividend-adjusted, not live-identical).")
     args = ap.parse_args()
 
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
@@ -504,7 +602,7 @@ def main():
 
     params = PullbackParams(use_ema=args.ema)
     daily_data, intra_data, exec_is_intraday = fetch_all(
-        args.symbols, args.exec_timeframe, start_dt, end_dt)
+        args.symbols, args.exec_timeframe, start_dt, end_dt, source=args.data_source)
     return run_backtest(daily_data, intra_data, params, exec_is_intraday,
                         "1Day", args.exec_timeframe, begin_ts=start_dt)
 

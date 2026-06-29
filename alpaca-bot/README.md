@@ -130,6 +130,27 @@ chart to `backtest_pullback_results.png`.
 When you pass `--start`, the fetcher pulls ~320 days of **lead** history before it
 (the 200-day MA needs ~200 bars) so indicators are warm on day one of your window.
 
+Every run also prints a **VS BUY-AND-HOLD** table — strategy vs. an equal-weight
+buy-and-hold of the same symbols (return, max drawdown, Sharpe, and a "beat it?"
+verdict) — and overlays the buy-and-hold curve on the chart, so "did I actually
+beat just holding?" is always answered, not assumed.
+
+### Full-cycle history (`--data-source yahoo`)
+
+Alpaca's free IEX history only reaches ~mid-2020, which is a bull market — a window
+that flatters any long-only strategy. For an honest test you want a full cycle
+including a crash. Pass `--data-source yahoo` to pull decades of free daily history:
+
+```bash
+pip install -r requirements-backtest.txt
+python -m bot.backtest_pullback --symbols SPY QQQ GLD --start 2005-01-01 \
+    --end 2026-06-01 --exec-timeframe none --data-source yahoo
+```
+
+Yahoo bars are split/dividend-adjusted (not bar-identical to live Alpaca data) and
+daily-only, so treat this as a regime study, not a live proxy. It's the right tool
+for "how would this have behaved through 2008?".
+
 Modelling assumptions: 0.05% slippage applied adversely to every fill, $0 commission,
 the daily signal filled via the chosen execution timeframe, and the volatility stop
 checked against execution-candle lows with gap handling.

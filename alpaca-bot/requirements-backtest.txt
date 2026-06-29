@@ -1,0 +1,4 @@
+# Optional: decades of free daily history for full-cycle backtests via
+#   --data-source yahoo  (bot/data.py). Not needed for live trading.
+#   pip install -r requirements-backtest.txt
+yfinance>=0.2.40
