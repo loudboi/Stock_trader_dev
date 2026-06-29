@@ -177,11 +177,32 @@ python -m bot.sweep --mode walk --add-step 0.02 0.03 0.05 --atr-mult 1.5 2.0 2.5
   Consistent out-of-sample results are the honest read; in-sample-best that falls
   apart OOS is the overfit tell.
 
+## Beating buy-and-hold (`bot/trend_exposure.py`)
+
+The pullback strategy is defensive — over a full cycle (2005–2026) it badly trails
+buy-and-hold on both return *and* Sharpe, because it sits in cash most of the time.
+`trend_exposure.py` is the opposite posture: a classic 200-day-MA timing model —
+**hold (optionally leveraged) while price is above its long MA, move to cash below
+it** — so it captures most of the uptrend but sidesteps the big bear drawdowns.
+
+```bash
+python -m bot.trend_exposure --symbols SPY QQQ GLD --start 2005-01-01 \
+    --data-source yahoo --leverage 1.5 --buffer 0.01
+```
+
+On the 2005–2026 full cycle this beats buy-and-hold risk-adjusted unlevered
+(Sharpe ~0.98 vs 0.88, roughly half the max drawdown), and at ~1.5× leverage beats
+it on raw return *and* drawdown. **Caveat:** the backtest does **not** model the
+cost of leverage (margin interest, or leveraged-ETF decay/expense) — real financing
+costs would reduce the levered numbers, so treat >1× results as an optimistic
+ceiling. It's a daily allocation model and is **research/backtest only** — it is not
+wired into a live runner.
+
 ## Testing
 
 Offline test suite (no network, no broker) covering the strategy logic, the
-backtester, the sweep mechanics, and the live runner's order/stop/reconcile
-machinery against fakes:
+backtester, the sweep mechanics, the trend-exposure model, the benchmark, and the
+live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt
