@@ -1,0 +1,7 @@
+# Accumulated nightly GEX snapshots (your growing dataset — back these up, but
+# they don't belong in git by default). Remove this line if you WANT to commit them.
+snapshots/
+__pycache__/
+*.pyc
+.venv/
+*.png
