@@ -10,7 +10,14 @@ prints one scoreboard.
 Strategies:
   vol_target      Scale an equal-weight book to a constant target volatility
                   (lever calm markets, cut risk in turbulent ones).
-  inverse_vol     Risk parity: weight assets by 1/volatility (always invested).
+  inverse_vol     Risk parity (naive): weight assets by 1/volatility.
+  erc             Equal-risk-contribution risk parity (uses the full covariance
+                  matrix, not just each asset's own vol) — the textbook risk-parity
+                  construction. Monthly rebalance, 60-day trailing covariance.
+  min_var         Long-only global minimum-variance portfolio (analytic solution
+                  on trailing covariance, negative weights clipped to 0).
+  rp_voltarget    Inverse-vol weights, then the whole book scaled to a constant
+                  target volatility — the standard institutional combination.
   managed_futures Diversified time-series trend (hold above MA), inverse-vol
                   weighted — "crisis alpha".
   mean_reversion  Buy short-term-oversold (RSI) dips while in an uptrend.
@@ -18,8 +25,11 @@ Strategies:
   ensemble        Equal blend of the daily returns of the above (diversify across
                   strategies — the one real free lunch).
 
-Costs modelled: 0.05% slippage on turnover, and a borrow rate on leverage >1×.
-All signals act on the NEXT day (shift by one), so there is no lookahead.
+All new strategies (erc, min_var, rp_voltarget) use FIXED, standard textbook
+parameters (60-day covariance, monthly rebalance, 10-15% vol target) — chosen
+before looking at results, not swept for the best backtest number. Costs modelled:
+0.05% slippage on turnover, and a borrow rate on leverage >1×. All signals act on
+the NEXT day (shift by one), so there is no lookahead.
 
     python -m bot.lab --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.lab --strategies trend_vol ensemble --target-vol 0.12
@@ -139,6 +149,76 @@ def trend_vol(panel, ma_period=200, target_vol=0.15, vol_lookback=20,
     return scale * base - financing - _turn_cost(w) - scale.diff().abs().fillna(0.0) * SLIPPAGE
 
 
+def rp_voltarget(panel, target_vol=0.10, lookback=20, max_leverage=1.5,
+                 borrow_rate=0.06) -> pd.Series:
+    """Vol-targeted risk parity: inverse-vol weights, then scale the whole book to
+    a constant target volatility (the standard institutional construction)."""
+    rets = daily_returns(panel)
+    inv = (1.0 / realized_vol(rets, lookback)).replace([np.inf, -np.inf], np.nan)
+    w = inv.div(inv.sum(axis=1), axis=0).fillna(0.0).shift(1).fillna(0.0)
+    base = (w * rets).sum(axis=1)
+    scale = (target_vol / realized_vol(base, lookback)).clip(upper=max_leverage)
+    scale = scale.shift(1).fillna(0.0)
+    financing = (scale - 1.0).clip(lower=0) * (borrow_rate / _ANNUAL)
+    return scale * base - financing - _turn_cost(w) - scale.diff().abs().fillna(0.0) * SLIPPAGE
+
+
+# --- covariance-based portfolio construction (monthly rebalance) --------------- #
+def _erc_weights(cov: np.ndarray) -> np.ndarray:
+    """Equal-risk-contribution weights (each asset contributes equal portfolio risk)."""
+    n = cov.shape[0]
+    w = 1.0 / np.sqrt(np.diag(cov).clip(1e-12))
+    w /= w.sum()
+    for _ in range(500):
+        rc = w * (cov @ w)                    # risk contributions
+        if rc.sum() <= 0:
+            break
+        w = w * np.sqrt(rc.mean() / np.maximum(rc, 1e-12))
+        w = np.clip(w, 1e-9, None)
+        w /= w.sum()
+    return w
+
+
+def _minvar_weights(cov: np.ndarray) -> np.ndarray:
+    """Long-only global minimum-variance weights (analytic, negatives clipped)."""
+    n = cov.shape[0]
+    try:
+        inv = np.linalg.pinv(cov)
+        ones = np.ones(n)
+        w = inv @ ones / (ones @ inv @ ones)
+    except np.linalg.LinAlgError:
+        return np.ones(n) / n
+    w = np.clip(w, 0.0, None)
+    s = w.sum()
+    return w / s if s > 0 else np.ones(n) / n
+
+
+def _monthly_cov_strategy(panel, lookback, weight_fn) -> pd.Series:
+    """Rebalance monthly to weight_fn(trailing covariance); hold in between."""
+    rets = daily_returns(panel)
+    weights = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    cur = np.ones(len(panel.columns)) / len(panel.columns)
+    last = None
+    for i, ts in enumerate(panel.index):
+        per = (ts.year, ts.month)
+        if last is not None and per != last and i >= lookback:
+            cov = rets.iloc[i - lookback:i].cov().values
+            if np.all(np.isfinite(cov)):
+                cur = weight_fn(cov)
+        weights.iloc[i] = cur
+        last = per
+    weights = weights.shift(1).fillna(0.0)
+    return (weights * rets).sum(axis=1) - _turn_cost(weights)
+
+
+def erc(panel, cov_lookback=60) -> pd.Series:
+    return _monthly_cov_strategy(panel, cov_lookback, _erc_weights)
+
+
+def min_var(panel, cov_lookback=60) -> pd.Series:
+    return _monthly_cov_strategy(panel, cov_lookback, _minvar_weights)
+
+
 def ensemble(components: dict) -> pd.Series:
     """Equal-weight blend of several strategies' daily return series."""
     return pd.concat(components.values(), axis=1).mean(axis=1)
@@ -147,6 +227,9 @@ def ensemble(components: dict) -> pd.Series:
 _STRATEGIES = {
     "vol_target": vol_target,
     "inverse_vol": inverse_vol,
+    "erc": erc,
+    "min_var": min_var,
+    "rp_voltarget": rp_voltarget,
     "managed_futures": managed_futures,
     "mean_reversion": mean_reversion,
     "trend_vol": trend_vol,

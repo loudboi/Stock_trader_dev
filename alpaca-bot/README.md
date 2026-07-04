@@ -202,23 +202,37 @@ wired into a live runner. (Leveraged-ETF daily-reset decay isn't modeled either.
 
 ## Strategy lab (`bot/lab.py`)
 
-Six research-backed beat-buy-and-hold approaches in one comparable harness, ranked
+Nine research-backed beat-buy-and-hold approaches in one comparable harness, ranked
 against an equal-weight buy-and-hold over a full cycle: `vol_target` (target a
-constant volatility), `inverse_vol` (risk parity), `managed_futures` (diversified
-inverse-vol trend), `mean_reversion` (RSI dip-buying in uptrends), `trend_vol`
-(vol-targeted trend), and `ensemble` (a blend). Costs modelled (0.05% turnover
-slippage + a borrow rate on leverage); all signals act next-day (no lookahead).
+constant volatility), `inverse_vol` (naive risk parity), `erc` (equal-risk-
+contribution risk parity, using the full covariance matrix), `min_var` (long-only
+global minimum-variance), `rp_voltarget` (inverse-vol weights scaled to a target
+vol), `managed_futures` (diversified inverse-vol trend), `mean_reversion` (RSI
+dip-buying in uptrends), `trend_vol` (vol-targeted trend), and `ensemble` (a blend).
+`erc`/`min_var`/`rp_voltarget` use fixed, standard textbook parameters (60-day
+trailing covariance, monthly rebalance, 10–15% vol target) chosen before looking at
+any result — not swept for the best number. Costs modelled (0.05% turnover slippage
++ a borrow rate on leverage); all signals act next-day (no lookahead).
 
 ```bash
 python -m bot.lab --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 ```
 
-Finding on 2005–2026 (4-asset universe, B&H Sharpe 0.96): **`inverse_vol` (risk
-parity) was the only one to beat B&H risk-adjusted** (Sharpe 1.11), and `vol_target`
-beat it on raw return only by levering into more risk (worse Sharpe). The fancier
-combinations (`trend_vol`, `ensemble`, `mean_reversion`) underperformed — the edge
-keeps coming from *simple risk management* (diversify, risk-weight), not from
-return prediction or added complexity. Research/backtest only.
+Finding, run ONCE each on two different universes (no post-hoc tuning) over
+2005/2006–2026:
+
+| Universe | B&H Sharpe | Beat B&H on Sharpe |
+|---|---|---|
+| SPY/QQQ/GLD/TLT (4 assets) | 0.96 | `min_var` 1.13, `inverse_vol` 1.11, `erc` 1.02 (+return: 1162% vs 972%) |
+| SPY/QQQ/IWM/EFA/EEM/TLT/IEF/GLD (8 assets) | 0.77 | `min_var` 0.88, `inverse_vol` 0.87 |
+
+**`min_var` and `inverse_vol` beat buy-and-hold's Sharpe in BOTH universes — the
+robust result.** `erc` won big on universe 1 (even beating raw return) but *failed*
+on universe 2 (0.66 < 0.77) — testing two universes is what catches that kind of
+luck. `vol_target`/`rp_voltarget`/`managed_futures`/`trend_vol`/`mean_reversion`
+underperformed on both. The edge keeps coming from *simple risk management*
+(diversify, minimize/equalize risk), not from return prediction or leverage.
+Research/backtest only.
 
 ## Momentum rotation (`bot/momentum_rotation.py`)
 

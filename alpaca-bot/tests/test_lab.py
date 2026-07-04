@@ -100,6 +100,93 @@ def test_mean_reversion_only_trades_in_uptrend():
 
 
 # --------------------------------------------------------------------------- #
+# ERC risk parity (equal risk contribution via the covariance matrix)
+# --------------------------------------------------------------------------- #
+def test_erc_weights_equalize_risk_contribution():
+    rng = np.random.default_rng(5)
+    # Three assets with very different vols and some correlation.
+    n = 400
+    f = rng.normal(0, 0.01, n)
+    a = rng.normal(0, 0.004, n) + 0.3 * f
+    b = rng.normal(0, 0.012, n) + 0.5 * f
+    c = rng.normal(0, 0.025, n) + 0.7 * f
+    cov = np.cov(np.vstack([a, b, c]))
+    w = lab._erc_weights(cov)
+    assert abs(w.sum() - 1.0) < 1e-6 and (w >= 0).all()
+    rc = w * (cov @ w)                              # per-asset risk contribution
+    # Equal risk contribution -> all three contributions close to each other.
+    assert (rc.max() - rc.min()) / rc.mean() < 0.05
+
+
+def test_erc_underweights_the_volatile_asset_vs_equal_weight():
+    rng = np.random.default_rng(6)
+    n = 400
+    calm = rng.normal(0, 0.004, n)
+    wild = rng.normal(0, 0.03, n)
+    cov = np.cov(np.vstack([calm, wild]))
+    w = lab._erc_weights(cov)
+    assert w[0] > w[1]                               # calm asset gets more weight than wild
+    assert w[0] > 0.5                                # more than equal-weight (0.5)
+
+
+# --------------------------------------------------------------------------- #
+# Minimum variance
+# --------------------------------------------------------------------------- #
+def test_min_var_weights_sum_to_one_and_nonnegative():
+    rng = np.random.default_rng(9)
+    n = 300
+    data = rng.normal(0, 0.01, (4, n))
+    cov = np.cov(data)
+    w = lab._minvar_weights(cov)
+    assert abs(w.sum() - 1.0) < 1e-6
+    assert (w >= 0).all()
+
+
+def test_min_var_beats_equal_weight_variance_in_sample():
+    rng = np.random.default_rng(10)
+    n = 300
+    data = rng.normal(0, [[0.004], [0.01], [0.02]], (3, n))
+    cov = np.cov(data)
+    w_mv = lab._minvar_weights(cov)
+    w_eq = np.ones(3) / 3
+    var_mv = w_mv @ cov @ w_mv
+    var_eq = w_eq @ cov @ w_eq
+    assert var_mv <= var_eq + 1e-12                  # min-var is, by construction, <= equal-weight
+
+
+def test_monthly_cov_strategy_no_lookahead():
+    rng = np.random.default_rng(11)
+    n = 300
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0, 0.01, n)),
+                    "B": 100 * np.cumprod(1 + rng.normal(0, 0.02, n))})
+    # Before enough history exists for the first covariance estimate (lookback=60),
+    # the book must stay at the equal-weight default -> return = mean of the two
+    # asset returns, minus the one-time turnover cost of entering from zero on day 1
+    # (the function's own internal shift(1) already encodes the decide-then-act lag).
+    rets = lab.daily_returns(panel)
+    equal_weight_ret = rets.mean(axis=1)
+    equal_weight_ret.iloc[1] -= lab.SLIPPAGE          # entering the initial position
+    r = lab._monthly_cov_strategy(panel, lookback=60, weight_fn=lab._minvar_weights)
+    assert np.allclose(r.iloc[:60].values, equal_weight_ret.iloc[:60].values)
+
+
+# --------------------------------------------------------------------------- #
+# Vol-targeted risk parity
+# --------------------------------------------------------------------------- #
+def test_rp_voltarget_scales_toward_target_vol():
+    rng = np.random.default_rng(12)
+    n = 500
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0.0002, 0.006, n)),
+                    "B": 100 * np.cumprod(1 + rng.normal(0.0002, 0.018, n))})
+    r = lab.rp_voltarget(panel, target_vol=0.10, lookback=20, max_leverage=1.5,
+                         borrow_rate=0.0)
+    realized = r.iloc[100:].std() * np.sqrt(252)
+    # Not an exact match (leverage cap + lag), but should land in a sane range,
+    # not wildly off (e.g. not 3x or 0.2x the 10% target).
+    assert 0.04 < realized < 0.20
+
+
+# --------------------------------------------------------------------------- #
 # Ensemble + run
 # --------------------------------------------------------------------------- #
 def test_ensemble_is_the_mean_of_components():
