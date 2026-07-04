@@ -197,6 +197,102 @@ def test_ensemble_is_the_mean_of_components():
     assert np.allclose(e.values, 0.005)
 
 
+# --------------------------------------------------------------------------- #
+# Walk-forward (fold slicing, consistency check — no per-fold fitting)
+# --------------------------------------------------------------------------- #
+def test_fold_bounds_partition_sequentially():
+    s = pd.Timestamp("2005-01-01", tz="UTC")
+    e = pd.Timestamp("2025-01-01", tz="UTC")
+    bounds = lab.fold_bounds(s, e, 5)
+    assert len(bounds) == 5
+    assert bounds[0][0] == s and bounds[-1][1] == e
+    for i in range(len(bounds) - 1):
+        assert bounds[i][1] == bounds[i + 1][0]      # contiguous, no gaps/overlap
+        assert bounds[i][0] < bounds[i][1]           # each fold has positive length
+
+
+def test_slice_equity_starts_compounding_from_the_window_start():
+    idx = pd.date_range("2005-01-01", periods=10, freq="B", tz="UTC")
+    r = pd.Series([0.0, 0.01, 0.02, -0.01, 0.03, 0.0, 0.01, -0.02, 0.01, 0.0], index=idx)
+    eq = lab.slice_equity(r, start_ts=idx[3], end_ts=idx[7], initial=1000.0)
+    # eq.iloc[0] applies that first in-window day's return on top of `initial`
+    # (matches how compute_metrics treats eq.iloc[0] as the baseline elsewhere).
+    assert eq.index[0] == idx[3] and abs(eq.iloc[0] - 1000.0 * (1 + r.iloc[3])) < 1e-9
+    assert eq.index[-1] == idx[7]
+    assert len(eq) == 5
+    # A slice starting one bar later must NOT be affected by the return excluded.
+    eq2 = lab.slice_equity(r, start_ts=idx[4], end_ts=idx[7], initial=1000.0)
+    assert abs(eq2.iloc[0] - 1000.0 * (1 + r.iloc[4])) < 1e-9
+
+
+def test_slice_equity_empty_window_returns_empty_series():
+    idx = pd.date_range("2005-01-01", periods=5, freq="B", tz="UTC")
+    r = pd.Series([0.0, 0.01, 0.02, -0.01, 0.03], index=idx)
+    empty = lab.slice_equity(r, start_ts=idx[-1] + pd.Timedelta(days=10))
+    assert empty.empty
+
+
+def _wf_panel(n=1200, seed=3):
+    rng = np.random.default_rng(seed)
+    cols = {s: 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, n))
+            for s in ("SPY", "QQQ", "GLD", "TLT")}
+    idx = pd.date_range("2005-01-01", periods=n, freq="B", tz="UTC")
+    return {k: pd.DataFrame({"open": v, "high": v, "low": v, "close": v,
+                             "volume": np.ones_like(v)}, index=idx)
+            for k, v in cols.items()}
+
+
+def test_walk_forward_folds_cover_the_full_window_disjointly():
+    panel_data = _wf_panel()
+    idx = panel_data["SPY"].index
+    per_fold = lab.run_walk_forward(
+        panel_data, ["inverse_vol", "min_var"],
+        params={"borrow_rate": 0.06, "with_ensemble": False},
+        start_ts=idx[300], end_ts=idx[-1], folds=4)
+    assert len(per_fold) == 4
+    # Sequential, contiguous folds spanning the requested window.
+    assert per_fold[0]["start"] == idx[300]
+    assert per_fold[-1]["end"] == idx[-1]
+    for i in range(len(per_fold) - 1):
+        assert per_fold[i]["end"] == per_fold[i + 1]["start"]
+    for row in per_fold:
+        assert "bh" in row and set(row["strategies"]) == {"inverse_vol", "min_var"}
+        assert "sharpe" in row["bh"]
+
+
+def test_walk_forward_no_per_fold_fitting_matches_full_window_slice():
+    # The whole point: a fold's metrics must equal slicing the SAME full-history
+    # return series (computed once) to that fold's window — never a series
+    # recomputed/refit using only that fold's data.
+    panel_data = _wf_panel(seed=4)
+    idx = panel_data["SPY"].index
+    names = ["inverse_vol"]
+    params = {"borrow_rate": 0.06, "with_ensemble": False}
+    full_returns = lab.compute_strategy_returns(panel_data, names, params)["inverse_vol"]
+
+    per_fold = lab.run_walk_forward(panel_data, names, params,
+                                    start_ts=idx[300], end_ts=idx[-1], folds=3)
+    fold0 = per_fold[0]
+    expected_eq = lab.slice_equity(full_returns, fold0["start"], fold0["end"])
+    expected_m = lab.compute_metrics([], expected_eq)
+    assert abs(fold0["strategies"]["inverse_vol"]["sharpe"] - expected_m["sharpe"]) < 1e-9
+    assert abs(fold0["strategies"]["inverse_vol"]["total_return"]
+              - expected_m["total_return"]) < 1e-9
+
+
+def test_print_walk_forward_runs_without_error(capsys):
+    panel_data = _wf_panel(seed=5)
+    idx = panel_data["SPY"].index
+    per_fold = lab.run_walk_forward(
+        panel_data, ["inverse_vol", "min_var", "vol_target"],
+        params={"target_vol": 0.15, "vol_lookback": 20, "max_leverage": 2.0,
+               "borrow_rate": 0.06, "with_ensemble": False},
+        start_ts=idx[300], end_ts=idx[-1], folds=3)
+    lab.print_walk_forward(per_fold)
+    out = capsys.readouterr().out
+    assert "WALK-FORWARD" in out and "SUMMARY" in out
+
+
 def test_run_smoke_scoreboard():
     rng = np.random.default_rng(7)
     cols = {s: 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, 500))

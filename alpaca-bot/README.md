@@ -226,12 +226,33 @@ Finding, run ONCE each on two different universes (no post-hoc tuning) over
 | SPY/QQQ/GLD/TLT (4 assets) | 0.96 | `min_var` 1.13, `inverse_vol` 1.11, `erc` 1.02 (+return: 1162% vs 972%) |
 | SPY/QQQ/IWM/EFA/EEM/TLT/IEF/GLD (8 assets) | 0.77 | `min_var` 0.88, `inverse_vol` 0.87 |
 
-**`min_var` and `inverse_vol` beat buy-and-hold's Sharpe in BOTH universes — the
-robust result.** `erc` won big on universe 1 (even beating raw return) but *failed*
-on universe 2 (0.66 < 0.77) — testing two universes is what catches that kind of
-luck. `vol_target`/`rp_voltarget`/`managed_futures`/`trend_vol`/`mean_reversion`
-underperformed on both. The edge keeps coming from *simple risk management*
-(diversify, minimize/equalize risk), not from return prediction or leverage.
+**`min_var` and `inverse_vol` beat buy-and-hold's Sharpe in BOTH universes.** `erc`
+won big on universe 1 (even beating raw return) but *failed* on universe 2
+(0.66 < 0.77) — testing two universes is what catches that kind of luck.
+`vol_target`/`rp_voltarget`/`managed_futures`/`trend_vol`/`mean_reversion`
+underperformed on both.
+
+**`--mode walk` (walk-forward across 5 sequential time folds, both universes,
+no per-fold parameter fitting — these strategies have nothing left to fit)
+sharpens the finding further, and it's more modest than the full-window average
+suggests:**
+
+```bash
+python -m bot.lab --mode walk --folds 5 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+`min_var`/`inverse_vol` do **not** beat B&H's Sharpe in every fold (3/5 and 3/5 in
+universe 1; 2/5 and 3/5 in universe 2) — so "robust winner in all conditions" is
+too strong a claim. What actually holds up: **the edge is concentrated in the
+high-volatility/crisis folds** (the 2008-era fold in both universes shows the
+largest outperformance — e.g. min_var 0.90 vs B&H 0.51 in universe 1, 1.28 vs 0.38
+in universe 2), while in calm strong-bull folds they roughly tie or slightly trail
+(sensible: a risk-based book underweights the highest-beta winners in a bull run).
+Mean Sharpe across folds still beats B&H's mean in both universes for both
+strategies. `erc`/`vol_target`/`managed_futures` are weaker and more sporadic here
+too. **Honest read: not "wins always," but "smoother ride, protection concentrated
+in crises, roughly even the rest of the time" — a real, explainable pattern, not
+noise, but a more modest claim than the single full-window number implies.**
 Research/backtest only.
 
 ## Momentum rotation (`bot/momentum_rotation.py`)

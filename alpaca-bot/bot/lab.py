@@ -31,8 +31,13 @@ before looking at results, not swept for the best backtest number. Costs modelle
 0.05% slippage on turnover, and a borrow rate on leverage >1×. All signals act on
 the NEXT day (shift by one), so there is no lookahead.
 
+--mode walk splits the full window into sequential folds and checks whether each
+strategy's edge over buy-and-hold is CONSISTENT across time (not just a good
+average) — with no per-fold parameter fitting, since there's nothing to fit.
+
     python -m bot.lab --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.lab --strategies trend_vol ensemble --target-vol 0.12
+    python -m bot.lab --mode walk --folds 5 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 """
 
 import argparse
@@ -239,27 +244,44 @@ _STRATEGIES = {
 # --------------------------------------------------------------------------- #
 # Runner / reporting
 # --------------------------------------------------------------------------- #
-def run(daily_data, names, begin_ts, params):
+def compute_strategy_returns(daily_data, names, params) -> dict:
+    """Full-history daily return series per strategy (unsliced). Callers slice
+    by whatever period they need (a single window, or per-fold for walk-forward) —
+    the return series itself is computed ONCE, with no per-period refitting, so
+    slicing it later can't introduce any lookahead or parameter-selection bias."""
     panel = build_panel(daily_data)
     comp_returns = {}
     for name in names:
         fn = _STRATEGIES[name]
-        kw = {k: v for k, v in params.items()
-              if k in fn.__code__.co_varnames}
+        kw = {k: v for k, v in params.items() if k in fn.__code__.co_varnames}
         comp_returns[name] = fn(panel, **kw)
-    if "ensemble" in (names if isinstance(names, list) else []) or params.get("with_ensemble"):
+    if params.get("with_ensemble"):
         comp_returns["ensemble"] = ensemble(
             {k: v for k, v in comp_returns.items() if k in _STRATEGIES})
+    return comp_returns
 
-    def metrics_for(rets):
-        r = rets[rets.index >= begin_ts] if begin_ts is not None else rets
-        eq = INITIAL_EQUITY * (1 + r).cumprod()
-        return eq, compute_metrics([], eq)
+
+def slice_equity(rets: pd.Series, start_ts=None, end_ts=None,
+                 initial=INITIAL_EQUITY) -> pd.Series:
+    """Equity curve of a return series restricted to [start_ts, end_ts], rebased
+    to `initial` at the first bar in range (so each slice is self-contained)."""
+    r = rets
+    if start_ts is not None:
+        r = r[r.index >= start_ts]
+    if end_ts is not None:
+        r = r[r.index <= end_ts]
+    if not len(r):
+        return pd.Series(dtype=float)
+    return initial * (1 + r).cumprod()
+
+
+def run(daily_data, names, begin_ts, params):
+    comp_returns = compute_strategy_returns(daily_data, names, params)
 
     results, series = {}, {}
     for name, rets in comp_returns.items():
-        eq, m = metrics_for(rets)
-        results[name] = m
+        eq = slice_equity(rets, begin_ts)
+        results[name] = compute_metrics([], eq)
         series[name] = eq
 
     bh_series = buy_hold_combined(daily_data, begin_ts)
@@ -294,8 +316,79 @@ def run(daily_data, names, begin_ts, params):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Walk-forward: consistency across time, not parameter fitting
+# --------------------------------------------------------------------------- #
+# These strategies deliberately have no tunable parameters to search (that was
+# the point — avoid overfitting). So "walk-forward" here isn't fit-in-sample /
+# test-out-of-sample; it's simpler and stronger: each strategy's return series is
+# computed ONCE over the full history with its fixed parameters, then sliced into
+# sequential folds and checked against buy-and-hold on that SAME fold. No fitting
+# happens per fold, so this only answers one question: is the full-window result
+# an average that holds up regime by regime, or is it a few great years carrying
+# a mediocre track record?
+def fold_bounds(start_ts, end_ts, folds: int) -> list:
+    """Split [start_ts, end_ts] into `folds` equal, sequential, non-overlapping
+    (start, end) periods."""
+    total = (end_ts - start_ts) / folds
+    return [(start_ts + total * k, start_ts + total * (k + 1)) for k in range(folds)]
+
+
+def run_walk_forward(daily_data, names, params, start_ts, end_ts, folds=5) -> list:
+    comp_returns = compute_strategy_returns(daily_data, names, params)
+    out = []
+    for fs, fe in fold_bounds(start_ts, end_ts, folds):
+        bh_eq = buy_hold_combined(daily_data, begin_ts=fs)
+        bh_eq = bh_eq[bh_eq.index <= fe]
+        row = {"start": fs, "end": fe, "bh": compute_metrics([], bh_eq), "strategies": {}}
+        for name, rets in comp_returns.items():
+            row["strategies"][name] = compute_metrics([], slice_equity(rets, fs, fe))
+        out.append(row)
+    return out
+
+
+def print_walk_forward(per_fold):
+    names = list(per_fold[0]["strategies"]) if per_fold else []
+    print("\n" + "=" * 88)
+    print(f"WALK-FORWARD  {len(per_fold)} sequential folds, each vs buy-and-hold on that SAME fold")
+    print("(fixed parameters throughout — no per-fold fitting; this checks CONSISTENCY,")
+    print(" not the best backtest number)")
+    print("=" * 88)
+    print(f"{'Fold':>4}  {'Window':>23}  {'B&H Shp':>8}  Strategy Sharpe ('*' = beat B&H)")
+    print("-" * 88)
+    beat = {n: 0 for n in names}
+    sharpes = {n: [] for n in names}
+    for k, row in enumerate(per_fold):
+        win = f"{row['start'].date()}->{row['end'].date()}"
+        bits = []
+        for n in names:
+            shp = row["strategies"][n]["sharpe"]
+            sharpes[n].append(shp)
+            won = shp > row["bh"]["sharpe"]
+            beat[n] += int(won)
+            bits.append(f"{n}={shp:.2f}{'*' if won else ' '}")
+        print(f"{k+1:>4}  {win:>23}  {row['bh']['sharpe']:>8.2f}  " + "  ".join(bits))
+    print("-" * 88)
+    print("SUMMARY (folds beaten / total, mean Sharpe across folds):")
+    bh_mean = sum(r["bh"]["sharpe"] for r in per_fold) / len(per_fold)
+    print(f"  buy_and_hold{'':<4}mean Sharpe {bh_mean:.2f}  (benchmark)")
+    for n in sorted(names, key=lambda x: -beat[x]):
+        mean_s = sum(sharpes[n]) / len(sharpes[n])
+        robust = "ROBUST" if beat[n] == len(per_fold) else (
+            "inconsistent" if 0 < beat[n] < len(per_fold) else "never beat B&H")
+        print(f"  {n:<16}{beat[n]}/{len(per_fold)} folds beat B&H, "
+              f"mean Sharpe {mean_s:.2f}  [{robust}]")
+    print("=" * 88)
+    print("A strategy that only wins on the FULL-window average but not most folds is")
+    print("regime-dependent luck, not a durable edge.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Strategy lab: beat-buy-and-hold approaches.")
+    ap.add_argument("--mode", choices=["score", "walk"], default="score",
+                    help="score = single full-window scoreboard (default); "
+                         "walk = split into folds and check consistency across time.")
+    ap.add_argument("--folds", type=int, default=5, help="Walk-forward fold count.")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--strategies", nargs="+",
                     default=list(_STRATEGIES) + ["ensemble"],
@@ -314,7 +407,7 @@ def main():
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
     start_dt = (_parse_date(args.start) if args.start
                 else end_dt - pd.Timedelta(days=int(args.months * 31)))
-    log.info("Lab window: %s -> %s", start_dt.date(), end_dt.date())
+    log.info("Lab window: %s -> %s (%s mode)", start_dt.date(), end_dt.date(), args.mode)
 
     daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt, source=args.data_source)
     if len(daily_data) < 2:
@@ -326,6 +419,11 @@ def main():
                   vol_lookback=args.vol_lookback, max_leverage=args.max_leverage,
                   borrow_rate=args.borrow_rate,
                   with_ensemble="ensemble" in args.strategies)
+
+    if args.mode == "walk":
+        per_fold = run_walk_forward(daily_data, names, params, start_dt, end_dt, args.folds)
+        print_walk_forward(per_fold)
+        return 0
     return run(daily_data, names, begin_ts=start_dt, params=params)
 
 
