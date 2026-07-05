@@ -461,6 +461,21 @@ combination technique.** This matches the mechanistic lesson above:
 diversification needs component quality, and on FX/commodities neither
 component has much.
 
+**A fourth universe — refining "equity-like" to an asset-class distinction, not
+a geography one.** Tested the SAME construction on 11 major country ETFs
+spanning developed and emerging markets across four continents (Japan, Germany,
+UK, Canada, Australia, Brazil, China, South Korea, Taiwan, Hong Kong, Singapore
+— no US exposure at all). Full-window: min_var alone is weak here (0.43, similar
+to buy-and-hold's own 0.44 — country-level risk parity isn't as strong a
+standalone edge as it is on the SPY/QQQ/GLD/TLT-style universes), so the blend
+(0.53) ties/slightly trails pure TE (0.54) rather than clearly beating both.
+**But walk-forward tells a better story: the blend beat buy-and-hold in 4/5
+folds** (matching the best record found on any universe) **and pure TE in 4/5
+folds**, only trailing pure min_var (2/5, since min_var's own edge here is
+weak). **This generalizes the finding correctly: it's not "US equities/bonds/
+gold only" — it's equities broadly (US or international), vs. FX/commodities
+specifically**, which lack the structural risk premia both components rely on.
+
 **Leverage on the blend (`--leverage`) — tested, and it doesn't help, again.**
 The RP+TE blend starts from the highest Sharpe found in this project (1.15/0.90
 with `inverse_vol`, 1.18/0.99 with `min_var`), so it's the best candidate
