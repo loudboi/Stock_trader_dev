@@ -90,6 +90,41 @@ def test_normalize_empty():
     assert data.normalize_ohlcv(None).empty
 
 
+# --------------------------------------------------------------------------- #
+# Outlier/bad-tick cleaning (discovered need: real free-data corruption in
+# FX/futures tickers — see bot/data.py clean_price_series docstring)
+# --------------------------------------------------------------------------- #
+def test_clean_price_series_patches_a_spurious_spike():
+    px = pd.Series([100.0, 101.0, 250.0, 102.0, 103.0])   # a bad tick at index 2
+    cleaned = data.clean_price_series(px, max_abs_return=0.15)
+    assert cleaned.iloc[2] == cleaned.iloc[1]              # carried forward, not the spike
+    assert cleaned.iloc[3] == 102.0                        # unaffected downstream values untouched
+
+
+def test_clean_price_series_handles_a_negative_price_crossing():
+    # The real April 2020 WTI event: price crosses through/below zero, which makes
+    # a percentage return mathematically undefined, not just large.
+    px = pd.Series([18.27, -37.63, 10.01, 13.78])
+    cleaned = data.clean_price_series(px, max_abs_return=0.15)
+    assert (cleaned > 0).all()                              # no non-positive price survives
+    assert cleaned.iloc[1] == cleaned.iloc[0]                # the crossing day carried forward
+
+
+def test_clean_price_series_leaves_normal_moves_alone():
+    px = pd.Series([100.0, 102.0, 99.0, 101.5, 98.0])       # all well under 15%/day
+    cleaned = data.clean_price_series(px, max_abs_return=0.15)
+    assert (cleaned == px).all()
+
+
+def test_clean_daily_data_only_touches_close():
+    df = pd.DataFrame({"open": [1, 1], "high": [1, 1], "low": [1, 1],
+                       "close": [100.0, 500.0], "volume": [10, 10]})
+    cleaned = data.clean_daily_data({"X": df}, max_abs_return=0.15)["X"]
+    assert cleaned["close"].iloc[1] == 100.0                # patched
+    assert (cleaned["open"] == df["open"]).all()             # other columns untouched
+    assert data.clean_daily_data({"EMPTY": pd.DataFrame()})["EMPTY"].empty
+
+
 if __name__ == "__main__":
     fns = [(k, v) for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

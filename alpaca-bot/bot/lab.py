@@ -32,6 +32,10 @@ Strategies:
                   strongest-momentum assets and short the weakest, equal dollar
                   amounts (market-neutral) — the classic academic momentum factor
                   (12-1 lookback, Jegadeesh & Titman-style).
+  managed_futures_ls  Same long/short trend signal as trend_ls, but INVERSE-VOL
+                  weighted across active signals (like managed_futures, but
+                  allowed to short) instead of equal-weighted — so a low-vol FX
+                  pair and a high-vol commodity don't get equal dollar weight.
 
 All new strategies (erc, min_var, rp_voltarget, trend_ls, xsmom_ls) use FIXED,
 standard textbook parameters (60-day covariance, monthly rebalance, 10-15% vol
@@ -60,6 +64,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from bot.data import clean_daily_data
 from bot.momentum_rotation import build_panel, momentum, _DAYS_PER_MONTH
 from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
                                    plot_equity, _parse_date, INITIAL_EQUITY, SLIPPAGE)
@@ -261,6 +266,28 @@ def trend_ls(panel, ma_period=200, short_borrow=0.01) -> pd.Series:
     return gross - financing - _turn_cost(w)
 
 
+def managed_futures_ls(panel, ma_period=200, vol_lookback=20, short_borrow=0.01) -> pd.Series:
+    """Time-series trend, long AND short, INVERSE-VOL weighted (not equal-weighted
+    across active signals like trend_ls) — the standard managed-futures
+    construction, so a low-vol instrument (e.g. an FX pair) and a high-vol one
+    (e.g. a commodity) don't get the same dollar weight. Same long-above/short-
+    below-the-MA signal as trend_ls; this is the long-only managed_futures'
+    natural long/short sibling."""
+    rets = daily_returns(panel)
+    ma = panel.rolling(ma_period, min_periods=ma_period).mean()
+    signal = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    signal[panel > ma] = 1.0
+    signal[panel < ma] = -1.0
+    inv_vol = (1.0 / realized_vol(rets, vol_lookback)).replace([np.inf, -np.inf], np.nan)
+    raw = (signal * inv_vol).fillna(0.0)
+    w = raw.div(raw.abs().sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+    w = w.shift(1).fillna(0.0)
+    gross = (w * rets).sum(axis=1)
+    short_notional = w.clip(upper=0).abs().sum(axis=1)
+    financing = short_notional * (short_borrow / _ANNUAL)
+    return gross - financing - _turn_cost(w)
+
+
 def xsmom_weights(panel, lookback_months=12, skip_months=1, top_frac=0.3) -> pd.DataFrame:
     """Pre-shift target weights for the cross-sectional momentum long/short book:
     monthly rebalance, long the top `top_frac` and short the bottom `top_frac` of
@@ -319,6 +346,7 @@ _STRATEGIES = {
     "trend_vol": trend_vol,
     "trend_ls": trend_ls,
     "xsmom_ls": xsmom_ls,
+    "managed_futures_ls": managed_futures_ls,
 }
 
 
@@ -489,6 +517,15 @@ def main():
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end", type=str, default=None)
     ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca")
+    ap.add_argument("--clean-outliers", action="store_true",
+                    help="Patch implausible single-day price moves (bad ticks, or a "
+                         "real zero-crossing event like WTI's 2020-04-20 negative "
+                         "print) before backtesting. Off by default so existing "
+                         "results are unaffected; recommended for FX (=X) / futures "
+                         "(=F) tickers, which have real, documented data-quality "
+                         "issues in free feeds. See bot/data.py clean_price_series.")
+    ap.add_argument("--max-abs-return", type=float, default=0.15,
+                    help="Cap used by --clean-outliers (fixed, not a tuning knob).")
     args = ap.parse_args()
 
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
@@ -500,6 +537,9 @@ def main():
     if len(daily_data) < 2:
         log.error("Need >= 2 symbols with data; got %d.", len(daily_data))
         return 1
+    if args.clean_outliers:
+        daily_data = clean_daily_data(daily_data, args.max_abs_return)
+        log.info("Cleaned implausible single-day moves (cap %.0f%%).", args.max_abs_return * 100)
 
     names = [s for s in args.strategies if s in _STRATEGIES]
     params = dict(ma_period=args.ma_period, target_vol=args.target_vol,

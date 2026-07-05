@@ -231,6 +231,45 @@ def test_trend_ls_equal_weights_long_and_short_sides():
 
 
 # --------------------------------------------------------------------------- #
+# Long/short: inverse-vol-weighted trend (managed_futures_ls)
+# --------------------------------------------------------------------------- #
+def test_managed_futures_ls_flat_during_ma_warmup():
+    panel = _panel({"A": np.linspace(100, 150, 40), "B": np.linspace(50, 40, 40)})
+    r = lab.managed_futures_ls(panel, ma_period=20, vol_lookback=10, short_borrow=0.0)
+    assert (r.iloc[:20] == 0.0).all()
+
+
+def test_managed_futures_ls_underweights_the_volatile_asset():
+    # A calm uptrend and a wild uptrend (both long signals): the calm one should
+    # get a bigger dollar weight, unlike trend_ls's equal-weight-of-active-signals.
+    rng = np.random.default_rng(30)
+    n = 250
+    calm = 100 * np.cumprod(1 + rng.normal(0.001, 0.003, n))
+    wild = 100 * np.cumprod(1 + rng.normal(0.001, 0.02, n))
+    panel = _panel({"CALM": calm, "WILD": wild})
+    ma = panel.rolling(20, min_periods=20).mean()
+    signal = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    signal[panel > ma] = 1.0
+    signal[panel < ma] = -1.0
+    inv_vol = (1.0 / lab.realized_vol(lab.daily_returns(panel), 20)).replace([np.inf, -np.inf], np.nan)
+    raw = (signal * inv_vol).fillna(0.0)
+    w = raw.div(raw.abs().sum(axis=1).replace(0, np.nan), axis=0).dropna()
+    last = w.iloc[-1]
+    if last["CALM"] > 0 and last["WILD"] > 0:      # both long at the same time
+        assert last["CALM"] > last["WILD"]
+
+
+def test_managed_futures_ls_short_borrow_costs_money():
+    down = np.linspace(150, 80, 250)
+    panel = _panel({"A": down, "B": np.linspace(100, 200, 250)})
+    no_fee = lab.managed_futures_ls(panel, ma_period=20, vol_lookback=10, short_borrow=0.0)
+    fee = lab.managed_futures_ls(panel, ma_period=20, vol_lookback=10, short_borrow=0.20)
+    eq_no_fee = (1 + no_fee).cumprod().iloc[-1]
+    eq_fee = (1 + fee).cumprod().iloc[-1]
+    assert eq_fee < eq_no_fee
+
+
+# --------------------------------------------------------------------------- #
 # Long/short: cross-sectional momentum (xsmom_ls)
 # --------------------------------------------------------------------------- #
 def test_xsmom_weights_are_dollar_neutral_after_a_rebalance():

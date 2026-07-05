@@ -255,47 +255,80 @@ in crises, roughly even the rest of the time" — a real, explainable pattern, n
 noise, but a more modest claim than the single full-window number implies.**
 Research/backtest only.
 
-### Long/short strategies (`trend_ls`, `xsmom_ls`) — tried, and they don't work here
+### Long/short strategies (`trend_ls`, `xsmom_ls`, `managed_futures_ls`) — tried hard, still don't work
 
-Every strategy above is long-or-cash. Two long/short extensions were added and
-tested the same disciplined way (fixed textbook parameters, no tuning, two
-universes, full-window AND walk-forward):
+Every strategy above is long-or-cash. Three long/short constructions were added
+and tested the same disciplined way (fixed textbook parameters chosen before
+looking at any result, full-window AND walk-forward):
 
 - **`trend_ls`** — the same 200-day MA filter as `trend_vol`/`managed_futures`, but
-  SHORTS below the MA instead of moving to cash (the classic managed-futures/CTA
-  construction).
+  SHORTS below the MA instead of moving to cash, equal-weighted across active
+  signals (the classic managed-futures/CTA construction).
+- **`managed_futures_ls`** — the same long/short trend signal, but INVERSE-VOL
+  weighted (like `managed_futures`, but allowed to short) — so a calm FX pair and
+  a volatile commodity don't get equal dollar weight.
 - **`xsmom_ls`** — the classic academic cross-sectional momentum factor: monthly,
   long the strongest-momentum assets and short the weakest, equal dollar amounts
   each side (market-neutral), 12-1 lookback.
 
-Both charge a `--short-borrow` cost (default 1%/yr) on short notional, separate
-from the leverage `--borrow-rate` — see the honest caveat on that assumption in the
-module docstring (real single-name borrow costs can be far higher or unavailable).
+All charge a `--short-borrow` cost (default 1%/yr) on short notional, separate
+from the leverage `--borrow-rate` — see the caveat in the module docstring (real
+single-name borrow costs can be far higher or unavailable).
 
-**Result: neither beat buy-and-hold in either universe, on the full-window average
-OR in a single walk-forward fold (0/5 in both cases for both strategies).**
-`xsmom_ls` went outright negative on the broader universe (Sharpe −0.13, −60.8%
-max drawdown). This is not a tuning problem — the causes are structural, and worth
-understanding rather than parameter-chasing away:
+**Round 1 (SPY/QQQ/GLD/TLT and the 8-asset ETF mix): both `trend_ls` and
+`xsmom_ls` failed everywhere** — 0/5 walk-forward folds beaten in either universe,
+`xsmom_ls` reaching Sharpe −0.13 with a −60.8% max drawdown on the 8-asset mix.
+Diagnosed cause: every asset in both universes has persistent structural upward
+drift over 2005–2026, so shorting any of it (via `trend_ls`'s downtrend legs)
+fights that drift, and 4–8 broad, correlated ETFs give `xsmom_ls` barely a
+cross-section to work with.
 
-1. **Every asset here (SPY, QQQ, GLD, TLT, IWM, EFA, EEM, IEF) has had persistent,
-   structural positive drift over 2005–2026.** Shorting any of them — even
-   temporarily, in `trend_ls`'s downtrend legs — systematically fights that drift.
-   This is the standard reason "don't short a rising asset class" is conventional
-   wisdom, and it's exactly what the backtest shows.
-2. **`xsmom_ls` needs genuine breadth to work.** The academic momentum factor is
-   built and validated on hundreds of individual stocks, where the long/short
-   split captures real relative winners/losers while the broad market factor
-   mostly cancels out. With only 4–8 broad, correlated ASSET-CLASS ETFs, there's
-   barely a cross-section — the long and short legs are thin, concentrated, and
-   whipsaw hard, which is exactly the huge drawdowns observed.
+**Round 2 — a genuinely fairer test.** Two structural fixes, each addressing a
+specific objection above (not parameter tuning):
 
-**If you want a fair test of long/short, this project's current universes are the
-wrong instrument for it** — it would need either a broad basket of many individual
-stocks (for `xsmom_ls` to have real breadth) or instruments without persistent
-one-directional drift, like currencies or individual commodities (for `trend_ls`
-to have a genuine two-sided market to trade). Neither is set up here yet.
-Research/backtest only.
+- `xsmom_ls` re-tested on **30 diversified individual large-cap stocks** (real
+  cross-sectional breadth, the setting the factor is actually validated on). Still
+  failed — Sharpe −0.08, and the walk-forward failure pattern (worst fold exactly
+  2009–2013) matches the well-documented real-world **"momentum crash"** of
+  2009, when prior losers rallied hard off the 2008 bottom and wrecked
+  momentum books industry-wide. Not a fluke of this test; a known phenomenon.
+- `trend_ls`/`managed_futures_ls` re-tested on **6 major FX pairs + 7 commodity
+  futures** (no persistent one-directional drift, a genuine two-sided market).
+
+**A data-integrity problem surfaced during that second test, and was fixed before
+trusting any number.** `CL=F` (crude oil) showed a "306% daily move" that is
+actually the real April 2020 WTI negative-price settlement — a percentage return
+is mathematically undefined across a sign change, and it poisons any 20-day
+volatility/trend window it touches. `EURUSD=X`/`JPY=X` separately showed 17%+
+single-day moves in Dec 2008 that reversed almost completely within two days —
+implausible for the most liquid FX pairs in the world and almost certainly a free-
+data glitch. **`bot/data.py:clean_price_series`/`clean_daily_data`** (a fixed,
+asset-class-agnostic 15% cap, chosen before re-running anything — see
+`--clean-outliers`) patches these; only carried-forward prices are changed, not
+strategy logic. Re-running with `--clean-outliers` moved buy-and-hold's own Sharpe
+on that universe from 0.42 to 0.50 (confirming the fix mattered) but **did not
+rescue either strategy** — still 2/5 and 1/5 walk-forward folds, negative mean
+Sharpe. The remaining honest story: `trend_ls` actually beat buy-and-hold in the
+2005–2009 fold (crisis/high-vol trending regime), then failed hard every fold
+from 2013 onward — which matches the real, well-documented industry-wide struggle
+of trend-following/CTA strategies through the low-volatility, central-bank-
+suppressed 2011–2019 era.
+
+```bash
+python -m bot.lab --symbols EURUSD=X GBPUSD=X JPY=X USDCAD=X USDCHF=X NZDUSD=X GC=F CL=F NG=F SI=F ZC=F ZS=F HG=F \
+    --start 2005-01-01 --data-source yahoo --clean-outliers --strategies trend_ls managed_futures_ls
+```
+
+**Bottom line: after two genuinely fair attempts (real breadth for momentum, a
+genuinely two-sided market for trend, and a verified data-integrity fix), neither
+long/short construction produced a durable edge.** This isn't for lack of trying —
+it's consistent with well-documented, real phenomena (the 2009 momentum crash, the
+2011–2019 CTA drought), which is exactly what makes it trustworthy rather than a
+broken test. If you want to keep pursuing long/short, the next honest step isn't
+another universe swap — it's a fundamentally different signal (e.g.
+volatility-managed momentum, or a shorter/adaptive trend lookback with its own
+walk-forward validation), not re-tuning these same constructions until one
+number looks good. Research/backtest only.
 
 ## Momentum rotation (`bot/momentum_rotation.py`)
 

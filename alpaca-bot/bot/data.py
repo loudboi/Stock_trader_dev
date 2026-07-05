@@ -46,6 +46,46 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_index().dropna(how="any")
 
 
+def clean_price_series(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Patch implausible single-day moves by carrying forward the prior price.
+
+    Free vendor data (especially FX/futures "=X"/"=F" tickers) occasionally has
+    bad ticks, and continuous futures contracts can cross zero on a real event
+    (e.g. WTI crude settled at -$37.63 on 2020-04-20) where a PERCENTAGE return is
+    mathematically undefined, not just large. Either case would otherwise inject a
+    spurious spike into any trend/volatility calculation for weeks around it (a
+    20-day realized-vol window means one bad day contaminates a month of signal).
+
+    `max_abs_return` is a single, conservative, asset-class-agnostic bound chosen
+    BEFORE looking at any backtest result — legitimate daily moves in liquid FX,
+    commodity, or equity markets essentially never exceed 15% outside a handful of
+    well-documented pathological events (which this targets, not conceals: the
+    patched days are still visible by comparing to the raw series). Not a strategy
+    parameter; do not tune this per backtest.
+    """
+    px = close.copy().astype(float)
+    for i in range(1, len(px)):
+        prev = px.iloc[i - 1]
+        cur = px.iloc[i]
+        if prev <= 0 or cur <= 0 or abs(cur / prev - 1.0) > max_abs_return:
+            px.iloc[i] = prev
+    return px
+
+
+def clean_daily_data(daily_data: dict, max_abs_return: float = 0.15) -> dict:
+    """Apply clean_price_series to the close column of every symbol's OHLCV frame
+    (open/high/low left as-is; only close drives the strategies in bot/lab.py)."""
+    out = {}
+    for name, df in daily_data.items():
+        if df.empty:
+            out[name] = df
+            continue
+        clean = df.copy()
+        clean["close"] = clean_price_series(clean["close"], max_abs_return)
+        out[name] = clean
+    return out
+
+
 def load_yahoo(symbol: str, start, end) -> pd.DataFrame:
     """Daily OHLCV from Yahoo (lazy import so it's optional)."""
     try:
