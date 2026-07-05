@@ -626,13 +626,83 @@ buy-and-hold. A few shorter-lookback configs beat it — but picking those after
 seeing the results is textbook overfitting. Treat any single "win" with suspicion
 and walk-forward it before believing it.
 
+## Slovenian capital-gains tax (`bot/taxes.py`, `bot/aftertax.py`)
+
+Every backtest above this section is **pre-tax**. That's a bad basis for a real
+decision if you're a Slovenian taxpayer: Slovenia taxes realized securities
+gains at **25%** by default, but that rate steps down with holding period and
+hits **0%** once a single position has been held more than **15 years and a
+day**. That's not a minor tax-drag footnote — it's a structural moat around
+literal, untouched buy-and-hold that no actively-traded strategy in this
+project can cross, because every one of them (including the best pre-tax
+result, the `min_var`+trend-exposure combo) realizes gains constantly and pays
+25% on virtually all of them, every year.
+
+`bot/taxes.py` models this with two mechanics, since active and passive
+holdings are taxed completely differently:
+
+- `after_tax_active()` — an annual realize-and-tax simulation (with loss
+  carryforward) for anything that rebalances or flips exposure regularly.
+- `after_tax_buy_hold()` — tax deferred to a single final sale, so a holding
+  period past the 15-year exemption owes nothing, ever.
+- `after_tax_exposure_based()` — a more precise trade-level version of the above
+  for binary in/out strategies like trend-exposure, taxing only at actual exits.
+- `after_tax_core_satellite()` — splits capital between an untouched
+  buy-and-hold **core** (tax-deferred) and an actively-traded **satellite**
+  (taxed annually), as two separate tax lots.
+
+```bash
+python -m bot.aftertax --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.aftertax --mode checkpoints --core-weight 0.7 \
+    --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+**Headline finding: taxed, the project's best pre-tax strategy loses to plain
+buy-and-hold.** On the 4-asset universe (2005–2026, ~21.5y), the min_var+TE
+blend's Sharpe drops 1.17→0.86 after tax while buy-and-hold's holding period
+clears the 15-year exemption and stays at 0.94 untouched — same story on the
+8-asset universe (0.98→0.72 vs. buy-and-hold's untaxed 0.74). Slowing
+trend-exposure's turnover (MA periods up to 800 days) narrows the gap but never
+closes it.
+
+**But a core-satellite split beats after-tax buy-and-hold, on both universes.**
+Putting 50–90% of capital in a real, untouched buy-and-hold core and the rest in
+the active min_var+TE blend as a satellite comes out ahead of pure buy-and-hold's
+after-tax Sharpe — e.g. 0.947 vs. 0.938 (4-asset) and 0.799 vs. 0.744 (8-asset)
+at a 70/30 or wider split. This is the **first result in this project's history
+to beat buy-and-hold after realistic tax treatment.** The intuition: the core's
+gains stay fully tax-deferred exactly like pure buy-and-hold, while the small
+taxed satellite still contributes enough diversification/edge to lift the blend's
+risk-adjusted return above what the untouched core alone delivers.
+
+**Checked for robustness with `--mode checkpoints`**, since a core-satellite
+structure can't be walk-forward-folded in the usual sense (the core's tax
+treatment depends on one continuous multi-decade hold, not independent
+periods). Instead this measures the SAME continuous hold's after-tax Sharpe at
+several different end dates (10, 12, 15, 18, 21 years in). A 70% core / 30%
+satellite split beat pure buy-and-hold at **every checkpoint tested, on both
+universes (10/10)** — including well before the core itself reaches the 15-year
+exemption, where naive intuition might expect the tax drag to look worse.
+
+**Honest caveats:** the annual-realization model approximates real per-trade
+tax-lot accounting (exact holding periods and cost basis per trade aren't
+tracked) — the economically dominant effect, that active strategies pay tax
+almost every year and buy-and-hold doesn't, holds regardless. The exact
+Slovenian bracket schedule below the 15-year exemption is assumed flat at 25%;
+none of the strategies here hold individual positions anywhere near that
+threshold, so intermediate step-downs (if any) wouldn't change which bucket
+they land in — the one case where the schedule's shape matters (a literal
+never-touched position) is exactly what `after_tax_buy_hold` handles correctly.
+This is a personal-finance model, not tax advice — verify current rates and
+rules before acting on them.
+
 ## Testing
 
 Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
 the strategy lab (including long/short and macro-regime-conditioned strategies),
 the RP+TE combo tool, the overnight/intraday decomposition, the turn-of-month
-effect, the benchmark, and
+effect, the benchmark, the Slovenian after-tax comparison, and
 the live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
