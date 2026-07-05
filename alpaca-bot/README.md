@@ -626,6 +626,43 @@ buy-and-hold. A few shorter-lookback configs beat it — but picking those after
 seeing the results is textbook overfitting. Treat any single "win" with suspicion
 and walk-forward it before believing it.
 
+## Crypto sleeve (`bot/crypto_sleeve.py`)
+
+A genuinely new asset class for this project: a small, trend-filtered Bitcoin
+sleeve blended into the already-validated min_var+TE combo. Trend-filtered,
+not naive buy-and-hold — BTC-USD's own max drawdown is a brutal -83%
+(2014–2026), but the SAME no-lookahead 200-day MA filter already used
+elsewhere in this project (`bot.trend_exposure`) cuts that to -70% while
+actually IMPROVING both Sharpe (0.80→0.95) and total return.
+
+```bash
+python -m bot.crypto_sleeve --symbols SPY QQQ GLD TLT --start 2015-01-01 --data-source yahoo
+python -m bot.crypto_sleeve --mode walk --folds 5 --btc-weight 0.10 \
+    --symbols SPY QQQ IWM EFA EEM TLT IEF GLD --start 2015-01-01 --data-source yahoo
+```
+
+**Validated finding: blended at a modest 10–15% weight, this sleeve has LOW
+correlation with the existing book (0.122 on both primary universes — the
+same low-correlation bar that made the original RP+TE combo work) and
+provides a real Sharpe improvement.** 4-asset universe: 1.08 → 1.35 at 15%
+weight (return 172%→381%, max drawdown only -16.2%→-19.9%). 8-asset universe:
+0.87 → 1.20 at 10% weight, similar shape. Walk-forward (5 folds, 2015–2026,
+10% BTC weight): beat the pure blend in **4/5 folds on the 4-asset universe**
+and **3/5 on the 8-asset universe** — the shared losing fold is the most
+recent (2024–2026), and the 8-asset universe's other loss (2019–2021, which
+includes BTC's huge 2020–21 bull run) was a near-tie (1.27 vs. 1.25), not a
+meaningful defeat.
+
+**Honest caveats:** only ~10–11 years of BTC history exists, far shorter than
+this project's usual 20+ year windows — a less-tested result than the
+equity-only combo by construction. BTC's correlation with risk assets has
+structurally risen since institutional adoption (~2020); the low-correlation
+finding could erode over time and should be re-checked periodically, not
+assumed permanent. Crypto trading on Alpaca requires the slash-form symbol
+(`BTC/USD`) and is long-only there anyway (can't short crypto on Alpaca — see
+below), which matches this sleeve's construction (long/cash trend-exposure,
+never short).
+
 ## Slovenian capital-gains tax and EUR currency risk (`bot/taxes.py`, `bot/currency.py`, `bot/aftertax.py`)
 
 Every backtest above this section is **pre-tax**. That's a bad basis for a real
@@ -902,9 +939,10 @@ structure works against it, not with it.**
 Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
 the strategy lab (including long/short and macro-regime-conditioned strategies),
-the RP+TE combo tool, the overnight/intraday decomposition, the turn-of-month
-effect, the benchmark, the Slovenian after-tax comparison, the EUR currency-risk
-model, and the live runner's order/stop/reconcile machinery against fakes:
+the RP+TE combo tool, the crypto sleeve, the overnight/intraday decomposition,
+the turn-of-month effect, the benchmark, the Slovenian after-tax comparison,
+the EUR currency-risk model, and the live runner's order/stop/reconcile
+machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt
