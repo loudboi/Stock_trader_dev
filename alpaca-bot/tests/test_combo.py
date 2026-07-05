@@ -63,6 +63,14 @@ def test_compute_books_rp_strategy_selection():
     assert np.allclose(mv_books["te"].values, iv_books["te"].values)
 
 
+def test_compute_books_erc_option():
+    daily_data = _daily_data(seed=8)
+    erc_books = combo.compute_books(daily_data, rp_strategy="erc")
+    mv_books = combo.compute_books(daily_data, rp_strategy="min_var")
+    assert not np.allclose(erc_books["rp"].values, mv_books["rp"].values)
+    assert np.allclose(erc_books["te"].values, mv_books["te"].values)   # te leg unaffected
+
+
 def test_print_score_inverse_vol_label(capsys):
     daily_data = _daily_data(seed=7)
     books = combo.compute_books(daily_data, rp_strategy="inverse_vol")

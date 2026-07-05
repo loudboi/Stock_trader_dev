@@ -424,7 +424,18 @@ full-window Sharpe beat **both** pure components in **both** universes, for
 
 `min_var` is the marginally better risk-based leg (higher full-window Sharpe in
 both universes) and is the default; `inverse_vol` remains available and fully
-validated as the original variant.
+validated as the original variant. **A third option, `erc`** (equal-risk-
+contribution — the one that looked great on universe 1 early in the project but
+FAILED universe 2 as a *standalone* strategy, Sharpe 0.66 < B&H's 0.77): blended
+with TE, it beats B&H on **both** universes (1.14 vs 0.96; 0.80 vs 0.77) — the
+blend *rescues* `erc`'s earlier standalone failure, and walk-forward confirms
+it's real (4/5 folds beat pure `erc`, 3/5 beat B&H on universe 2, not just a
+full-window average). `erc`+TE is weaker than `min_var`+TE or `inverse_vol`+TE,
+so it isn't the recommended default — but **this closes out the "which risk leg"
+question: all three risk-based constructions, when blended with trend-exposure,
+beat buy-and-hold on both universes.** The diversification mechanism itself is
+robust to which specific risk-based strategy anchors it, not a fluke of one
+particular implementation.
 
 Walk-forward is honest about the limits: the `min_var`+TE blend beat buy-and-hold
 in 5/5 folds on universe 1 but only 3/5 on universe 2 (the same partly-universe-

@@ -35,7 +35,7 @@ import pandas as pd
 
 import bot.trend_exposure as te
 from bot.data import clean_daily_data
-from bot.lab import (build_panel, inverse_vol, min_var, combine_books, compute_metrics,
+from bot.lab import (build_panel, inverse_vol, min_var, erc, combine_books, compute_metrics,
                      slice_equity, fold_bounds)
 from bot.backtest_pullback import fetch_all, buy_hold_combined, _parse_date
 
@@ -48,7 +48,7 @@ COV_LOOKBACK = 60          # min_var's trailing-covariance window
 TE_MA_PERIOD = 200
 TE_BUFFER = 0.01
 _ANNUAL = 252
-_RP_STRATEGIES = {"inverse_vol": inverse_vol, "min_var": min_var}
+_RP_STRATEGIES = {"inverse_vol": inverse_vol, "min_var": min_var, "erc": erc}
 
 
 def leverage_returns(returns: pd.Series, leverage: float, borrow_rate: float = 0.06) -> pd.Series:
@@ -69,13 +69,18 @@ def compute_books(daily_data: dict, rp_strategy="min_var", rp_lookback=RP_LOOKBA
     """Return {'rp': ..., 'te': ...} full-history return series (unsliced).
 
     rp_strategy: 'min_var' (default -- marginally better, validated in the
-    README) or 'inverse_vol' (the original risk-parity leg). Other overrides
-    default to this module's headline (pre-chosen) parameters; they exist for
-    robustness checks (does the diversification benefit survive a different
-    lookback/MA?), not for tuning to a specific backtest result."""
+    README), 'inverse_vol' (the original risk-parity leg), or 'erc' (equal-risk-
+    contribution -- looked great on universe 1 early in the project but FAILED
+    universe 2 as a standalone strategy; included here to see if that fragility
+    also shows up when it's paired with trend-exposure). Other overrides default
+    to this module's headline (pre-chosen) parameters; they exist for robustness
+    checks (does the diversification benefit survive a different lookback/MA?),
+    not for tuning to a specific backtest result."""
     panel = build_panel(daily_data)
     if rp_strategy == "min_var":
         rp = min_var(panel, cov_lookback=cov_lookback)
+    elif rp_strategy == "erc":
+        rp = erc(panel, cov_lookback=cov_lookback)
     else:
         rp = inverse_vol(panel, lookback=rp_lookback)
     per_symbol = {name: te.strategy_returns(daily, ma_period=te_ma_period,
