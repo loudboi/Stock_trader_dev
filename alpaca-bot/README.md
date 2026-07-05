@@ -626,7 +626,7 @@ buy-and-hold. A few shorter-lookback configs beat it — but picking those after
 seeing the results is textbook overfitting. Treat any single "win" with suspicion
 and walk-forward it before believing it.
 
-## Slovenian capital-gains tax (`bot/taxes.py`, `bot/aftertax.py`)
+## Slovenian capital-gains tax and EUR currency risk (`bot/taxes.py`, `bot/currency.py`, `bot/aftertax.py`)
 
 Every backtest above this section is **pre-tax**. That's a bad basis for a real
 decision if you're a Slovenian taxpayer. Verified against the Financial
@@ -742,6 +742,71 @@ without it) — the satellite is simply too consistently profitable to carry a
 persistent unused loss into a later year. A weaker or more volatile satellite
 strategy might see a real effect here; this one doesn't.
 
+**A second, comparably large factor: currency risk (`bot/currency.py`).**
+Every number in this project — including everything above this paragraph —
+has quietly assumed a USD-based investor. SPY/QQQ/GLD/TLT are USD-denominated;
+the user is Slovenian (EUR-based). If those ETFs are actually held through a
+USD brokerage account, the REAL return that lands in a EUR-based investor's
+pocket is the USD return adjusted for the EUR/USD exchange-rate move, not the
+raw USD return everywhere else in this project reports — and Slovenian
+capital-gains tax is naturally computed on that EUR-denominated gain (cost
+basis and sale price both converted to EUR at their transaction dates), so the
+honest order of operations is: convert to EUR first, THEN apply the tax model.
+
+```bash
+python -m bot.aftertax --currency eur_naive --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.aftertax --currency eur_hedged --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+**Unhedged currency risk alone compresses every Sharpe by roughly as much as
+tax does** — on the 4-asset universe, buy-and-hold's Sharpe drops from 0.94
+(USD) to 0.83 (EUR, unhedged) purely from daily EUR/USD fluctuation, even
+though the multi-decade USD-strengthening trend over this window actually
+*boosted* EUR-denominated total return (927%→1116%). Two exposure models were
+tested: `eur_naive` (FX risk applies at all times, as if idle cash sits in a
+USD brokerage account) and `eur_smart` (FX risk only while actually invested
+in USD assets — trend-exposure's cash periods are assumed converted back to
+EUR, removing FX risk while flat). The smarter model gives the active blend a
+real boost (its own Sharpe rises from 0.80 to 0.87 pre-tax, since dodging
+market downturns via trend-exposure also happens to dodge some USD downside
+days) — but it isn't enough:
+
+**Combined with tax, unhedged currency risk REVERSES the core-satellite
+finding — plain buy-and-hold becomes the single best choice, beating every
+core-satellite split, on both primary universes, under BOTH exposure models.**
+4-asset universe (`eur_naive`): buy-and-hold's after-tax-after-FX Sharpe is
+0.826, and the core-satellite Sharpe falls MONOTONICALLY as satellite weight
+increases (0.818 at 90/10, all the way down to 0.615 at 0/100) — every single
+split underperforms pure buy-and-hold. Same shape holds for `eur_smart` (0.826
+vs. a monotonic decline to 0.659) and on the 8-asset universe under both
+models. The core-satellite edge found in the tax-only analysis above was real
+but was implicitly relying on a USD-based investor; once real currency risk is
+priced in for the user's actual EUR base currency, it evaporates.
+
+**Currency-hedging (`--currency eur_hedged`, a fixed 1.5%/yr cost drag
+approximating the historical USD-EUR short-rate differential via covered
+interest rate parity) partially restores the core-satellite edge, but much
+thinner than the tax-only picture suggested.** 4-asset universe: core-satellite
+peaks at 0.820 (60–70% core) vs. pure buy-and-hold's 0.817 — a real but tiny
+margin, not the 0.948-vs-0.938 gap found pre-currency. 8-asset universe: peaks
+at 0.649 (50% core) vs. 0.634 — similarly thin. **Practical conclusion: for
+this user's actual situation (Slovenian, EUR-based), core-satellite is only
+worth pursuing at all if currency-hedged (e.g. EUR-hedged ETF share classes, a
+real, commercially available product in Europe) — left unhedged, plain,
+literal buy-and-hold is simply the better, simpler answer once both tax and
+currency are honestly accounted for.**
+
+**Honest caveats on the currency model:** the 1.5%/yr hedging cost is a fixed,
+illustrative approximation (matching this project's existing convention for
+`bot.combo`'s leverage borrow-cost), not a fitted or historically-varying
+USD-EUR rate differential — a real hedge's cost moved a lot over 2005–2026 (US
+rates were near zero for much of 2009–2015, then well above EUR rates
+2022–2026), so actual results from a real EUR-hedged product would vary by
+period. The `eur_smart` exposure model assumes idle capital is fully converted
+back to EUR the moment a position is closed, which requires actually managing
+currency separately from the USD brokerage account — not automatic with a
+typical US broker.
+
 **Widened the grid (0–100% core in 10% steps) — there is no single universal
 split, it depends on how large the active edge is.** The optimum shifts by
 universe: 4-asset peaks near 60% core (Sharpe 0.948), 8-asset peaks near
@@ -791,8 +856,8 @@ Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
 the strategy lab (including long/short and macro-regime-conditioned strategies),
 the RP+TE combo tool, the overnight/intraday decomposition, the turn-of-month
-effect, the benchmark, the Slovenian after-tax comparison, and
-the live runner's order/stop/reconcile machinery against fakes:
+effect, the benchmark, the Slovenian after-tax comparison, the EUR currency-risk
+model, and the live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt

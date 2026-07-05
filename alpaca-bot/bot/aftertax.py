@@ -21,7 +21,17 @@ only matters before the core itself reaches its 0% exemption (see bot/taxes.py
 for why an intra-year "harvest sooner" variant was tried and dropped as a
 proven no-op).
 
+A SECOND, EQUALLY LARGE FACTOR (see bot/currency.py): every number above
+implicitly assumes a USD-based investor, but the user is Slovenian (EUR-based)
+and SPY/QQQ/GLD/TLT are USD-denominated. --currency {eur_naive,eur_smart,
+eur_hedged} converts the same comparison into a EUR investor's REAL return.
+Unhedged EUR exposure compresses every Sharpe by roughly as much as tax does,
+and the min_var+TE blend's pre-tax edge over buy-and-hold nearly disappears
+once currency risk is honestly priced in — see README for the combined
+(currency + tax) picture.
+
     python -m bot.aftertax --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+    python -m bot.aftertax --currency eur_naive --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.aftertax --mode checkpoints --core-weight 0.7 \
         --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 """
@@ -33,6 +43,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 import bot.taxes as tx
+import bot.currency as cur
 from bot.combo import compute_books, combine_books
 from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
                                    _parse_date, INITIAL_EQUITY)
@@ -48,21 +59,50 @@ def _slice(r, begin_ts, end_ts):
     return r[(r.index >= begin_ts) & (r.index <= end_ts)]
 
 
-def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RATE):
+def _apply_currency(r, name, currency, fx_close=None, te_frac=None, hedge_cost=0.015):
+    """currency: 'usd' (no change), 'eur_hedged' (fixed cost drag, no FX risk),
+    'eur_naive' (full FX exposure always, cash assumed held in USD), or
+    'eur_smart' (FX exposure only while actually invested in USD assets --
+    always 1.0 for rp/buy_and_hold, which never go to cash; te_frac for the
+    te leg; a 50/50 mix of the two for the blend)."""
+    if currency == "usd":
+        return r
+    if currency == "eur_hedged":
+        eq = cur.hedged_eur_equity(r, annual_hedge_cost=hedge_cost)
+        return eq.pct_change().fillna(0.0)
+    if currency == "eur_smart":
+        if name == "te":
+            frac = te_frac
+        elif name == "blend":
+            frac = 0.5 * 1.0 + 0.5 * te_frac
+        else:
+            frac = 1.0
+    else:
+        frac = 1.0
+    eq = cur.unhedged_eur_equity(r, fx_close, invested_frac=frac)
+    return eq.pct_change().fillna(0.0)
+
+
+def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RATE,
+                currency="usd", fx_close=None, te_frac=None, hedge_cost=0.015):
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
     bh_ret = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
     rp, te, blend, bh_ret = (_slice(books["rp"], begin_ts, end_ts),
                              _slice(books["te"], begin_ts, end_ts),
                              _slice(blend, begin_ts, end_ts),
                              _slice(bh_ret, begin_ts, end_ts))
+    rp = _apply_currency(rp, "rp", currency, fx_close, te_frac, hedge_cost)
+    te = _apply_currency(te, "te", currency, fx_close, te_frac, hedge_cost)
+    blend = _apply_currency(blend, "blend", currency, fx_close, te_frac, hedge_cost)
+    bh_ret = _apply_currency(bh_ret, "buy_and_hold", currency, fx_close, te_frac, hedge_cost)
 
     def pretax_m(r):
         eq = INITIAL_EQUITY * (1 + r).cumprod()
         return compute_metrics([], eq)
 
     hold_years = (bh_ret.index[-1] - bh_ret.index[0]).days / 365.0
-    print(f"\nAFTER-TAX COMPARISON  (Slovenia: {tax_rate:.0%} under 5y, 20% 5-10y, 15% "
-          f"10-15y, 0% past 15y; window covers {hold_years:.1f}y)")
+    print(f"\nAFTER-TAX COMPARISON  (currency={currency}; Slovenia: {tax_rate:.0%} under 5y, "
+          f"20% 5-10y, 15% 10-15y, 0% past 15y; window covers {hold_years:.1f}y)")
     print("=" * 70)
     print(f"{'Strategy':22}{'Pre-tax Shp':>13}{'Post-tax Shp':>14}{'Post-tax Ret%':>15}")
     print("-" * 70)
@@ -157,6 +197,13 @@ def main():
                     help="Core-satellite split for --mode checkpoints (fraction in "
                          "the untouched buy-and-hold core).")
     ap.add_argument("--tax-rate", type=float, default=tx.SLOVENIA_TAX_RATE)
+    ap.add_argument("--currency", choices=["usd", "eur_naive", "eur_smart", "eur_hedged"],
+                    default="usd", help="usd: no currency adjustment (default). eur_naive: "
+                    "full unhedged EUR/USD exposure at all times. eur_smart: EUR/USD exposure "
+                    "only while actually invested in USD assets (only affects --mode score). "
+                    "eur_hedged: currency risk removed at a fixed annual cost (--hedge-cost).")
+    ap.add_argument("--hedge-cost", type=float, default=0.015,
+                    help="Fixed annual cost drag assumed for --currency eur_hedged.")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--rp-strategy", choices=["min_var", "inverse_vol", "erc"], default="min_var")
     ap.add_argument("--months", type=int, default=240)
@@ -177,9 +224,21 @@ def main():
     books = compute_books(daily_data, rp_strategy=args.rp_strategy)
 
     if args.mode == "checkpoints":
+        if args.currency != "usd":
+            log.warning("--currency is not yet modeled in --mode checkpoints; ignoring.")
         print_checkpoints(daily_data, books, start_dt, args.core_weight, args.tax_rate)
     else:
-        print_score(daily_data, books, start_dt, end_dt, args.tax_rate)
+        fx_close, te_frac = None, None
+        if args.currency != "usd":
+            # EURUSD=X is a Yahoo-style ticker -- fetch it from yahoo regardless of
+            # --data-source, since alpaca doesn't carry FX pairs in this format.
+            fx_data, _, _ = fetch_all(["EURUSD=X"], "none", start_dt, end_dt, source="yahoo")
+            fx_close = fx_data["EURUSD=X"]["close"]
+            if args.currency == "eur_smart":
+                te_frac = cur.te_invested_fraction(daily_data)
+        print_score(daily_data, books, start_dt, end_dt, args.tax_rate,
+                   currency=args.currency, fx_close=fx_close, te_frac=te_frac,
+                   hedge_cost=args.hedge_cost)
     return 0
 
 
