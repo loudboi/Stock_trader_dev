@@ -50,7 +50,28 @@ def test_print_score_runs_without_error(capsys):
     end = list(daily_data.values())[0].index[-1]
     combo.print_score(daily_data, books, rp_weight=0.5, begin_ts=begin, end_ts=end)
     out = capsys.readouterr().out
-    assert "RP+TE COMBO" in out and "pure risk_parity" in out and "pure trend_exposure" in out
+    assert "MIN_VAR+TE COMBO" in out and "pure min_var" in out and "pure trend_exposure" in out
+
+
+def test_compute_books_rp_strategy_selection():
+    daily_data = _daily_data(seed=6)
+    mv_books = combo.compute_books(daily_data, rp_strategy="min_var")
+    iv_books = combo.compute_books(daily_data, rp_strategy="inverse_vol")
+    # Different constructions -> different (non-identical) return series.
+    assert not np.allclose(mv_books["rp"].values, iv_books["rp"].values)
+    # trend-exposure leg is unaffected by the rp_strategy choice.
+    assert np.allclose(mv_books["te"].values, iv_books["te"].values)
+
+
+def test_print_score_inverse_vol_label(capsys):
+    daily_data = _daily_data(seed=7)
+    books = combo.compute_books(daily_data, rp_strategy="inverse_vol")
+    begin = list(daily_data.values())[0].index[100]
+    end = list(daily_data.values())[0].index[-1]
+    combo.print_score(daily_data, books, rp_weight=0.5, begin_ts=begin, end_ts=end,
+                      rp_label="inverse_vol")
+    out = capsys.readouterr().out
+    assert "INVERSE_VOL+TE COMBO" in out and "pure inverse_vol" in out
 
 
 def test_leverage_returns_unlevered_is_unchanged():
@@ -89,7 +110,7 @@ def test_print_walk_runs_without_error(capsys):
     idx = list(daily_data.values())[0].index
     combo.print_walk(daily_data, books, rp_weight=0.5, start_dt=idx[100], end_dt=idx[-1], folds=3)
     out = capsys.readouterr().out
-    assert "WALK-FORWARD" in out and "beat pure RP" in out
+    assert "WALK-FORWARD" in out and "beat pure min_var" in out
 
 
 if __name__ == "__main__":

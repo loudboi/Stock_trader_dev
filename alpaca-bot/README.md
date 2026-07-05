@@ -363,73 +363,84 @@ python -m bot.lab --strategies regime_leverage_rp --regime-indicator vix \
 
 The strongest, most validated result of this entire project. Two DIFFERENT
 strategies have each independently been shown to beat buy-and-hold's Sharpe on
-their own: `inverse_vol` risk parity and the `trend_exposure` 200-day filter.
-Blending them (fixed 50/50 capital split, chosen before running anything) tests
-whether their moderate (~0.7) correlation is low enough for real diversification
-benefit — unlike blending in the FX/commodity trend book above, whose own weak
-standalone Sharpe (0.22) meant *any* meaningful allocation to it just dragged the
-combination down despite its low (0.11) correlation. The lesson: correlation
-alone isn't enough for a diversification benefit — the components need standalone
-quality too.
+their own: a risk-based portfolio (`--rp-strategy {min_var, inverse_vol}`, default
+`min_var`) and the `trend_exposure` 200-day filter. Blending them (fixed 50/50
+capital split, chosen before running anything) tests whether their moderate
+(~0.7) correlation is low enough for real diversification benefit — unlike
+blending in the FX/commodity trend book above, whose own weak standalone Sharpe
+(0.22) meant *any* meaningful allocation to it just dragged the combination down
+despite its low (0.11) correlation. The lesson: correlation alone isn't enough
+for a diversification benefit — the components need standalone quality too.
 
 ```bash
 python -m bot.combo --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.combo --rp-strategy inverse_vol --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 python -m bot.combo --mode walk --folds 5 --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
 ```
 
-**Result, tested on two universes:** the 50/50 blend's full-window Sharpe beat
-**both** pure components in **both** universes —
+**Result, tested on two universes, both risk-based legs:** the 50/50 blend's
+full-window Sharpe beat **both** pure components in **both** universes, for
+**either** choice of risk-based leg —
 
-| Universe | B&H | pure RP | pure TE | **50/50 blend** |
-|---|---|---|---|---|
-| SPY/QQQ/GLD/TLT | 0.96 | 1.11 | 1.01 | **1.15** |
-| 8-asset broader mix | 0.77 | 0.87 | 0.78 | **0.90** |
+| Universe | B&H | pure min_var | pure inverse_vol | pure TE | blend (min_var+TE) | blend (inverse_vol+TE) |
+|---|---|---|---|---|---|---|
+| SPY/QQQ/GLD/TLT | 0.96 | 1.13 | 1.11 | 1.01 | **1.18** | 1.15 |
+| 8-asset broader mix | 0.77 | 0.88 | 0.87 | 0.78 | **0.99** | 0.90 |
 
-Walk-forward is honest about the limits: the blend beat buy-and-hold in 5/5
-folds on universe 1 but only 3/5 on universe 2 (the first universe's "perfect"
-record was partly universe-specific, exactly what testing a second universe is
-for) — so, like everything else in this project, its edge over B&H is
-regime-dependent, not universal. But it robustly beat pure RP (3/5 and 3/5 folds)
-and especially pure TE (4/5 and 4/5 folds) — i.e., **if choosing between holding
-risk parity alone, trend-exposure alone, or the blend, the blend was the better
-choice in both universes tested, both on average and most of the time regime-by-
-regime.** That's a genuine, validated diversification benefit, not a magic
-"beats B&H everywhere" strategy — none of those exist in this project.
-Research/backtest only; `--rp-weight` lets you try other fixed splits.
+`min_var` is the marginally better risk-based leg (higher full-window Sharpe in
+both universes) and is the default; `inverse_vol` remains available and fully
+validated as the original variant.
 
-**Leverage on the blend (`--leverage`) — tested, and it doesn't help, again.**
-The RP+TE blend starts from the highest Sharpe found in this project (1.15/0.90),
-so it's the best candidate leverage has had — but the same pattern that killed
-every other leverage attempt here repeats: Sharpe degrades monotonically with
-leverage (1.15→0.98→0.90→0.78 at 1×/1.3×/1.5×/2× on universe 1; 0.90→0.65→0.52
-at 1×/1.5×/2× on universe 2, both with the standard 6%/yr borrow cost). At 2× on
-universe 1, raw return finally exceeds buy-and-hold (998% vs 972%) — but only by
-taking on more risk (worse Sharpe, −33% max drawdown), not by adding edge. **Best
-Sharpe in both universes is unlevered.** This is now the fifth base strategy in
-this project (after `trend_exposure`, `vol_target`, `rp_voltarget`,
-`regime_leverage_rp`) where leverage was tried and failed to improve risk-
-adjusted return — about as solid a conclusion as anything here: **you beat
-buy-and-hold by managing risk (diversifying across weakly-correlated, individually
-decent strategies), not by levering up a good one.**
+Walk-forward is honest about the limits: the `min_var`+TE blend beat buy-and-hold
+in 5/5 folds on universe 1 but only 3/5 on universe 2 (the same partly-universe-
+specific pattern found with `inverse_vol`+TE — exactly what testing a second
+universe is for) — so, like everything else in this project, its edge over B&H is
+regime-dependent, not universal. It beat pure TE consistently (4/5 both
+universes) but was less consistent fold-by-fold against its own `min_var` leg
+(2/5 and 3/5) than the `inverse_vol` variant was against its own leg (3/5 and
+3/5) — because `min_var` alone is simply a strong performer in several individual
+folds, so blending in TE doesn't always help THAT fold even though it improves
+the full-window average. **If choosing between holding a risk-based portfolio
+alone, trend-exposure alone, or the blend, the blend was the better choice on
+average and most of the time in both universes tested** — a genuine, validated
+diversification benefit, not a magic "beats B&H everywhere" strategy (none of
+those exist in this project). Research/backtest only; `--rp-weight` lets you try
+other fixed splits.
 
 **Parameter robustness — checked, and it holds.** Varying the underlying
 parameters (RP lookback 10/20/40 days, TE MA period 150/200/250, TE buffer
 1%/2%) on universe 1: the blend beat **both** pure components in **all 5**
 configurations tested. Not fragile to the exact defaults.
 
-**A third universe — and a real limit found.** Tested the SAME RP+TE
-construction on the FX + commodity futures universe (`--clean-outliers`,
-6 FX pairs + 7 commodities). Here it does **not** work: both components are
-individually weak on this asset class (pure RP Sharpe 0.13, pure TE 0.22 — far
-below their equity-universe values of ~1.1 and ~1.0), and the blend (0.20) sits
-*between* them rather than beating both, trailing buy-and-hold's 0.40. Walk-
-forward: only 1/5 vs pure RP, 2/5 vs pure TE, 3/5 vs B&H — much less consistent
-than on either equity-like universe. **Honest scope correction: the RP+TE
-diversification benefit is validated for equity-like universes (broad index/
-bond/gold ETFs), where both ingredients have real standalone edges — it is NOT
-a universal combination technique.** This matches the mechanistic lesson above:
+**A third universe — and a real limit found.** Tested the SAME construction on
+the FX + commodity futures universe (`--clean-outliers`, 6 FX pairs + 7
+commodities). Here it does **not** work: both components are individually weak
+on this asset class (pure RP Sharpe 0.13, pure TE 0.22 — far below their
+equity-universe values of ~1.1 and ~1.0), and the blend (0.20) sits *between*
+them rather than beating both, trailing buy-and-hold's 0.40. Walk-forward: only
+1/5 vs pure RP, 2/5 vs pure TE, 3/5 vs B&H — much less consistent than on either
+equity-like universe. **Honest scope correction: the RP+TE diversification
+benefit is validated for equity-like universes (broad index/bond/gold ETFs),
+where both ingredients have real standalone edges — it is NOT a universal
+combination technique.** This matches the mechanistic lesson above:
 diversification needs component quality, and on FX/commodities neither
 component has much.
+
+**Leverage on the blend (`--leverage`) — tested, and it doesn't help, again.**
+The RP+TE blend starts from the highest Sharpe found in this project (1.15/0.90
+with `inverse_vol`, 1.18/0.99 with `min_var`), so it's the best candidate
+leverage has had — but the same pattern that killed every other leverage attempt
+here repeats: Sharpe degrades monotonically with leverage (1.15→0.98→0.90→0.78
+at 1×/1.3×/1.5×/2× on universe 1; 0.90→0.65→0.52 at 1×/1.5×/2× on universe 2,
+both with the standard 6%/yr borrow cost). At 2× on universe 1, raw return
+finally exceeds buy-and-hold (998% vs 972%) — but only by taking on more risk
+(worse Sharpe, −33% max drawdown), not by adding edge. **Best Sharpe in both
+universes is unlevered.** This is now the fifth base strategy in this project
+(after `trend_exposure`, `vol_target`, `rp_voltarget`, `regime_leverage_rp`)
+where leverage was tried and failed to improve risk-adjusted return — about as
+solid a conclusion as anything here: **you beat
+buy-and-hold by managing risk (diversifying across weakly-correlated, individually
+decent strategies), not by levering up a good one.**
 
 ## Overnight vs. intraday returns (`bot/overnight.py`)
 
