@@ -397,6 +397,21 @@ regime.** That's a genuine, validated diversification benefit, not a magic
 "beats B&H everywhere" strategy — none of those exist in this project.
 Research/backtest only; `--rp-weight` lets you try other fixed splits.
 
+**Leverage on the blend (`--leverage`) — tested, and it doesn't help, again.**
+The RP+TE blend starts from the highest Sharpe found in this project (1.15/0.90),
+so it's the best candidate leverage has had — but the same pattern that killed
+every other leverage attempt here repeats: Sharpe degrades monotonically with
+leverage (1.15→0.98→0.90→0.78 at 1×/1.3×/1.5×/2× on universe 1; 0.90→0.65→0.52
+at 1×/1.5×/2× on universe 2, both with the standard 6%/yr borrow cost). At 2× on
+universe 1, raw return finally exceeds buy-and-hold (998% vs 972%) — but only by
+taking on more risk (worse Sharpe, −33% max drawdown), not by adding edge. **Best
+Sharpe in both universes is unlevered.** This is now the fifth base strategy in
+this project (after `trend_exposure`, `vol_target`, `rp_voltarget`,
+`regime_leverage_rp`) where leverage was tried and failed to improve risk-
+adjusted return — about as solid a conclusion as anything here: **you beat
+buy-and-hold by managing risk (diversifying across weakly-correlated, individually
+decent strategies), not by levering up a good one.**
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,

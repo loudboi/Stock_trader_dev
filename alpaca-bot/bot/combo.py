@@ -21,6 +21,7 @@ holding either single strategy alone. Research/backtest only.
 
     python -m bot.combo --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.combo --mode walk --folds 5 --rp-weight 0.7 --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
+    python -m bot.combo --leverage 1.5 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 """
 
 import argparse
@@ -41,6 +42,19 @@ log = logging.getLogger("combo")
 RP_LOOKBACK = 20
 TE_MA_PERIOD = 200
 TE_BUFFER = 0.01
+_ANNUAL = 252
+
+
+def leverage_returns(returns: pd.Series, leverage: float, borrow_rate: float = 0.06) -> pd.Series:
+    """Apply a CONSTANT leverage multiplier to an already-computed return series,
+    charging annual financing on the borrowed (>1x) portion — the same borrow-cost
+    convention used throughout bot/lab.py. Every single-strategy leverage attempt
+    in this project failed to clear its financing cost (see README); this tests
+    whether starting from the higher-Sharpe RP+TE blend changes that."""
+    if leverage <= 1.0:
+        return returns * leverage
+    financing = (leverage - 1.0) * (borrow_rate / _ANNUAL)
+    return returns * leverage - financing
 
 
 def compute_books(daily_data: dict) -> dict:
@@ -54,8 +68,9 @@ def compute_books(daily_data: dict) -> dict:
     return {"rp": rp, "te": trend}
 
 
-def print_score(daily_data, books, rp_weight, begin_ts, end_ts):
+def print_score(daily_data, books, rp_weight, begin_ts, end_ts, leverage=1.0, borrow_rate=0.06):
     blend = combine_books(books, weights={"rp": rp_weight, "te": 1.0 - rp_weight})
+    levered = leverage_returns(blend, leverage, borrow_rate)
     bh = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
 
     def m(r):
@@ -63,9 +78,11 @@ def print_score(daily_data, books, rp_weight, begin_ts, end_ts):
     rows = [("buy_and_hold", m(bh)), ("pure risk_parity", m(books["rp"])),
             ("pure trend_exposure", m(books["te"])),
             (f"blend ({rp_weight:.0%} RP / {1-rp_weight:.0%} TE)", m(blend))]
+    if leverage != 1.0:
+        rows.append((f"blend @ {leverage:g}x (borrow {borrow_rate:.0%}/yr)", m(levered)))
 
-    print(f"\nRP+TE COMBO  rp_weight={rp_weight:.0%}  (both components independently "
-          f"validated; blend tests the diversification benefit)")
+    print(f"\nRP+TE COMBO  rp_weight={rp_weight:.0%}  leverage={leverage:g}x  (both components "
+          f"independently validated; blend tests the diversification benefit)")
     print("=" * 66)
     print(f"{'':26}{'Return%':>10}{'MaxDD%':>10}{'Sharpe':>9}")
     print("-" * 66)
@@ -80,22 +97,31 @@ def print_score(daily_data, books, rp_weight, begin_ts, end_ts):
           f"({blend_m['sharpe']:.2f} vs {te_m['sharpe']:.2f})")
     print(f"Blend vs buy&hold: {'beats' if blend_m['sharpe'] > bh_m['sharpe'] else 'trails'} "
           f"on Sharpe ({blend_m['sharpe']:.2f} vs {bh_m['sharpe']:.2f})")
+    if leverage != 1.0:
+        lev_m = rows[4][1]
+        beat_ret = "beats" if lev_m["total_return"] > bh_m["total_return"] else "trails"
+        beat_shp = "beats" if lev_m["sharpe"] > bh_m["sharpe"] else "trails"
+        print(f"Levered blend vs buy&hold: {beat_ret} on return "
+              f"({lev_m['total_return']*100:.0f}% vs {bh_m['total_return']*100:.0f}%), "
+              f"{beat_shp} on Sharpe ({lev_m['sharpe']:.2f} vs {bh_m['sharpe']:.2f})")
 
 
-def print_walk(daily_data, books, rp_weight, start_dt, end_dt, folds):
+def print_walk(daily_data, books, rp_weight, start_dt, end_dt, folds, leverage=1.0, borrow_rate=0.06):
     blend = combine_books(books, weights={"rp": rp_weight, "te": 1.0 - rp_weight})
+    active = leverage_returns(blend, leverage, borrow_rate) if leverage != 1.0 else blend
     bh = buy_hold_combined(daily_data, start_dt).pct_change().fillna(0.0)
 
-    print(f"\nRP+TE COMBO WALK-FORWARD  rp_weight={rp_weight:.0%}  {folds} folds")
+    label = "blend" if leverage == 1.0 else f"blend@{leverage:g}x"
+    print(f"\nRP+TE COMBO WALK-FORWARD  rp_weight={rp_weight:.0%}  leverage={leverage:g}x  {folds} folds")
     print("=" * 92)
     print(f"{'Fold':>4}  {'Window':>23}  {'B&H':>7}  {'pure RP':>8}  {'pure TE':>8}  "
-          f"{'blend':>7}  beats")
+          f"{label:>10}  beats")
     print("-" * 92)
     wins_rp = wins_te = wins_bh = 0
     for k, (fs, fe) in enumerate(fold_bounds(start_dt, end_dt, folds)):
         def m(r):
             return compute_metrics([], slice_equity(r, fs, fe))
-        m_bh, m_rp, m_te, m_bl = m(bh), m(books["rp"]), m(books["te"]), m(blend)
+        m_bh, m_rp, m_te, m_bl = m(bh), m(books["rp"]), m(books["te"]), m(active)
         beats = []
         if m_bl["sharpe"] > m_rp["sharpe"]:
             wins_rp += 1
@@ -107,10 +133,10 @@ def print_walk(daily_data, books, rp_weight, start_dt, end_dt, folds):
             wins_bh += 1
             beats.append("BH")
         print(f"{k+1:>4}  {fs.date()}->{fe.date()}  {m_bh['sharpe']:>7.2f}  "
-              f"{m_rp['sharpe']:>8.2f}  {m_te['sharpe']:>8.2f}  {m_bl['sharpe']:>7.2f}  "
+              f"{m_rp['sharpe']:>8.2f}  {m_te['sharpe']:>8.2f}  {m_bl['sharpe']:>10.2f}  "
               f"{','.join(beats) or '-'}")
     print("-" * 92)
-    print(f"Blend beat pure RP in {wins_rp}/{folds}, pure TE in {wins_te}/{folds}, "
+    print(f"{label} beat pure RP in {wins_rp}/{folds}, pure TE in {wins_te}/{folds}, "
           f"B&H in {wins_bh}/{folds} folds.")
     print("=" * 92)
 
@@ -122,6 +148,12 @@ def main():
     ap.add_argument("--rp-weight", type=float, default=0.5,
                     help="Capital fraction in risk parity; remainder goes to "
                          "trend-exposure. Default 50/50, chosen before any result.")
+    ap.add_argument("--leverage", type=float, default=1.0,
+                    help="Constant leverage applied to the blended book (1.0 = "
+                         "unlevered). Every single-strategy leverage attempt in "
+                         "this project failed to clear its financing cost.")
+    ap.add_argument("--borrow-rate", type=float, default=0.06,
+                    help="Annual financing cost on the leveraged (>1x) portion.")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--months", type=int, default=240)
     ap.add_argument("--start", type=str, default=None)
@@ -132,8 +164,8 @@ def main():
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
     start_dt = (_parse_date(args.start) if args.start
                 else end_dt - pd.Timedelta(days=int(args.months * 31)))
-    log.info("Combo window: %s -> %s (%s mode, rp_weight=%.0f%%)",
-             start_dt.date(), end_dt.date(), args.mode, args.rp_weight * 100)
+    log.info("Combo window: %s -> %s (%s mode, rp_weight=%.0f%%, leverage=%gx)",
+             start_dt.date(), end_dt.date(), args.mode, args.rp_weight * 100, args.leverage)
 
     daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt, source=args.data_source)
     if len(daily_data) < 2:
@@ -142,9 +174,11 @@ def main():
 
     books = compute_books(daily_data)
     if args.mode == "walk":
-        print_walk(daily_data, books, args.rp_weight, start_dt, end_dt, args.folds)
+        print_walk(daily_data, books, args.rp_weight, start_dt, end_dt, args.folds,
+                   args.leverage, args.borrow_rate)
     else:
-        print_score(daily_data, books, args.rp_weight, start_dt, end_dt)
+        print_score(daily_data, books, args.rp_weight, start_dt, end_dt,
+                   args.leverage, args.borrow_rate)
     return 0
 
 

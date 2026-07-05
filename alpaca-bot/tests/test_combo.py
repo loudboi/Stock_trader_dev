@@ -53,13 +53,43 @@ def test_print_score_runs_without_error(capsys):
     assert "RP+TE COMBO" in out and "pure risk_parity" in out and "pure trend_exposure" in out
 
 
+def test_leverage_returns_unlevered_is_unchanged():
+    r = pd.Series([0.01, -0.02, 0.005])
+    assert np.allclose(combo.leverage_returns(r, 1.0, 0.06).values, r.values)
+
+
+def test_leverage_returns_scales_and_charges_financing():
+    r = pd.Series([0.01, -0.02, 0.005])
+    levered = combo.leverage_returns(r, 2.0, borrow_rate=0.10)
+    expected_financing = 1.0 * (0.10 / combo._ANNUAL)      # (leverage-1) * rate/252
+    assert np.allclose(levered.values, r.values * 2.0 - expected_financing)
+
+
+def test_leverage_returns_higher_borrow_costs_more():
+    r = pd.Series(np.full(50, 0.001))
+    cheap = combo.leverage_returns(r, 1.5, borrow_rate=0.02)
+    expensive = combo.leverage_returns(r, 1.5, borrow_rate=0.20)
+    assert (1 + expensive).prod() < (1 + cheap).prod()
+
+
+def test_print_score_with_leverage_runs_without_error(capsys):
+    daily_data = _daily_data(seed=5)
+    books = combo.compute_books(daily_data)
+    begin = list(daily_data.values())[0].index[100]
+    end = list(daily_data.values())[0].index[-1]
+    combo.print_score(daily_data, books, rp_weight=0.5, begin_ts=begin, end_ts=end,
+                      leverage=1.5, borrow_rate=0.06)
+    out = capsys.readouterr().out
+    assert "Levered blend vs buy&hold" in out
+
+
 def test_print_walk_runs_without_error(capsys):
     daily_data = _daily_data(n=600, seed=4)
     books = combo.compute_books(daily_data)
     idx = list(daily_data.values())[0].index
     combo.print_walk(daily_data, books, rp_weight=0.5, start_dt=idx[100], end_dt=idx[-1], folds=3)
     out = capsys.readouterr().out
-    assert "WALK-FORWARD" in out and "Blend beat pure RP" in out
+    assert "WALK-FORWARD" in out and "beat pure RP" in out
 
 
 if __name__ == "__main__":
