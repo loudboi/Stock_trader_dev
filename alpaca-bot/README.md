@@ -412,6 +412,69 @@ adjusted return — about as solid a conclusion as anything here: **you beat
 buy-and-hold by managing risk (diversifying across weakly-correlated, individually
 decent strategies), not by levering up a good one.**
 
+**Parameter robustness — checked, and it holds.** Varying the underlying
+parameters (RP lookback 10/20/40 days, TE MA period 150/200/250, TE buffer
+1%/2%) on universe 1: the blend beat **both** pure components in **all 5**
+configurations tested. Not fragile to the exact defaults.
+
+**A third universe — and a real limit found.** Tested the SAME RP+TE
+construction on the FX + commodity futures universe (`--clean-outliers`,
+6 FX pairs + 7 commodities). Here it does **not** work: both components are
+individually weak on this asset class (pure RP Sharpe 0.13, pure TE 0.22 — far
+below their equity-universe values of ~1.1 and ~1.0), and the blend (0.20) sits
+*between* them rather than beating both, trailing buy-and-hold's 0.40. Walk-
+forward: only 1/5 vs pure RP, 2/5 vs pure TE, 3/5 vs B&H — much less consistent
+than on either equity-like universe. **Honest scope correction: the RP+TE
+diversification benefit is validated for equity-like universes (broad index/
+bond/gold ETFs), where both ingredients have real standalone edges — it is NOT
+a universal combination technique.** This matches the mechanistic lesson above:
+diversification needs component quality, and on FX/commodities neither
+component has much.
+
+## Overnight vs. intraday returns (`bot/overnight.py`)
+
+A fundamentally different idea from everything else here — not a directional
+signal, but a question of *when* during the day returns happen. The well-
+documented "overnight effect": historically, most of the stock market's gain has
+come from the close-to-open (overnight) session, with open-to-close (intraday)
+flat or negative. Two mechanical books, each requiring a full round-trip trade
+**every single day** (unlike everything else in this project, which only trades
+on a signal change):
+
+```bash
+python -m bot.overnight --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.overnight --cost-per-side 0.0001 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+**Finding: the raw effect is real and strong, but EXTREMELY cost-sensitive —
+more than anything else in this project, because daily round-trip trading means
+a per-trade cost gets compounded roughly 5,000+ times over the backtest.**
+
+| Cost/side | overnight_only Sharpe | intraday_only Sharpe |
+|---|---|---|
+| $0 (raw signal) | **1.18** (highest pre-cost Sharpe in this project) | 0.39 |
+| 1bp (0.01%, optimistic even for a top-tier liquid ETF) | 0.43 | −0.20 |
+| 5bp (0.05%, this project's standard "infrequent trade" convention) | −2.55 (catastrophic — cost compounds daily for 20 years) | −2.54 |
+
+The project-wide 0.05% slippage convention was calibrated for strategies that
+trade a handful of times a year; applying it to a strategy that round-trips
+*every day* for two decades is a different regime entirely — `(1-0.001)^5469 ≈
+0.4%`, i.e. compounding alone erases the account regardless of any real edge.
+Even a much more optimistic 1bp/side cost — already hard to achieve in practice
+once the bid-ask spread is counted — cuts the raw Sharpe by more than half and
+flips the intraday book negative. On the broader 8-asset universe the effect is
+weaker even before cost (overnight Sharpe 0.73 vs B&H's own 0.77 — barely
+positive pre-cost, then destroyed the same way by cost).
+
+**Honest conclusion: this is a genuine, well-documented market-structure
+anomaly, but it isn't retail-tradeable** — it requires the kind of near-zero,
+often rebate-earning execution costs available to market makers and HFT firms,
+not a normal broker account. It's the single strategy in this project where
+the gap between "paper edge" and "tradeable edge" is starkest — a useful,
+concrete illustration of why "beats B&H in a spreadsheet" and "beats B&H after
+real costs" are very different bars. `--cost-per-side` lets you explore this
+sensitivity directly. Research/backtest only.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,
@@ -434,8 +497,8 @@ and walk-forward it before believing it.
 Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
 the strategy lab (including long/short and macro-regime-conditioned strategies),
-the RP+TE combo tool, the benchmark, and the live runner's order/stop/reconcile
-machinery against fakes:
+the RP+TE combo tool, the overnight/intraday decomposition, the benchmark, and
+the live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt

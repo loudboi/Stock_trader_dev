@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 import bot.trend_exposure as te
+from bot.data import clean_daily_data
 from bot.lab import (build_panel, inverse_vol, combine_books, compute_metrics,
                      slice_equity, fold_bounds)
 from bot.backtest_pullback import fetch_all, buy_hold_combined, _parse_date
@@ -57,12 +58,17 @@ def leverage_returns(returns: pd.Series, leverage: float, borrow_rate: float = 0
     return returns * leverage - financing
 
 
-def compute_books(daily_data: dict) -> dict:
-    """Return {'rp': ..., 'te': ...} full-history return series (unsliced)."""
+def compute_books(daily_data: dict, rp_lookback=RP_LOOKBACK, te_ma_period=TE_MA_PERIOD,
+                  te_buffer=TE_BUFFER) -> dict:
+    """Return {'rp': ..., 'te': ...} full-history return series (unsliced).
+
+    Overrides default to this module's headline (pre-chosen) parameters; they
+    exist for robustness checks (does the diversification benefit survive a
+    different lookback/MA?), not for tuning to a specific backtest result."""
     panel = build_panel(daily_data)
-    rp = inverse_vol(panel, lookback=RP_LOOKBACK)
-    per_symbol = {name: te.strategy_returns(daily, ma_period=TE_MA_PERIOD,
-                                            buffer=TE_BUFFER, leverage=1.0, borrow_rate=0.0)
+    rp = inverse_vol(panel, lookback=rp_lookback)
+    per_symbol = {name: te.strategy_returns(daily, ma_period=te_ma_period,
+                                            buffer=te_buffer, leverage=1.0, borrow_rate=0.0)
                  for name, daily in daily_data.items()}
     trend = pd.concat(per_symbol, axis=1).mean(axis=1, skipna=True)
     return {"rp": rp, "te": trend}
@@ -159,6 +165,13 @@ def main():
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end", type=str, default=None)
     ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca")
+    ap.add_argument("--clean-outliers", action="store_true",
+                    help="Patch implausible single-day price moves (bad ticks, or a "
+                         "real zero-crossing event like WTI's 2020-04-20 negative "
+                         "print) before backtesting. See bot/data.py clean_price_series; "
+                         "recommended for FX (=X) / futures (=F) tickers.")
+    ap.add_argument("--max-abs-return", type=float, default=0.15,
+                    help="Cap used by --clean-outliers (fixed, not a tuning knob).")
     args = ap.parse_args()
 
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
@@ -171,6 +184,9 @@ def main():
     if len(daily_data) < 2:
         log.error("Need >= 2 symbols with data; got %d.", len(daily_data))
         return 1
+    if args.clean_outliers:
+        daily_data = clean_daily_data(daily_data, args.max_abs_return)
+        log.info("Cleaned implausible single-day moves (cap %.0f%%).", args.max_abs_return * 100)
 
     books = compute_books(daily_data)
     if args.mode == "walk":
