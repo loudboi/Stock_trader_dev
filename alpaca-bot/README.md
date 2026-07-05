@@ -665,15 +665,29 @@ clears the 15-year exemption and stays at 0.94 untouched — same story on the
 trend-exposure's turnover (MA periods up to 800 days) narrows the gap but never
 closes it.
 
-**But a core-satellite split beats after-tax buy-and-hold, on both universes.**
-Putting 50–90% of capital in a real, untouched buy-and-hold core and the rest in
-the active min_var+TE blend as a satellite comes out ahead of pure buy-and-hold's
-after-tax Sharpe — e.g. 0.947 vs. 0.938 (4-asset) and 0.799 vs. 0.744 (8-asset)
-at a 70/30 or wider split. This is the **first result in this project's history
-to beat buy-and-hold after realistic tax treatment.** The intuition: the core's
-gains stay fully tax-deferred exactly like pure buy-and-hold, while the small
-taxed satellite still contributes enough diversification/edge to lift the blend's
-risk-adjusted return above what the untouched core alone delivers.
+**But a core-satellite split beats after-tax buy-and-hold, on 3 of 4 universes
+tested.** Putting 50–90% of capital in a real, untouched buy-and-hold core and
+the rest in the active min_var+TE blend as a satellite comes out ahead of pure
+buy-and-hold's after-tax Sharpe — 0.947 vs. 0.938 (4-asset), 0.799 vs. 0.744
+(8-asset), and 0.613 vs. 0.544 (15-asset US+international mega-universe, where
+it keeps improving all the way to the widest satellite weight tested). This is
+the **first construction in this project's history to beat buy-and-hold after
+realistic tax treatment.** The intuition: the core's gains stay fully
+tax-deferred exactly like pure buy-and-hold, while the taxed satellite still
+contributes enough diversification/edge to lift the blend's risk-adjusted
+return above what the untouched core alone delivers.
+
+**A real scope limit found on the 4th universe (11 international-country ETFs):
+core-satellite does NOT beat pure buy-and-hold there** (every core/satellite
+split tested came out slightly below pure B&H, 0.42–0.43 vs. 0.430). This
+universe's pre-tax active edge over B&H is thin to begin with (blend 0.52 vs.
+B&H 0.43 pre-tax — a much smaller premium than the ~25–60% relative edge seen on
+the other 3 universes), so 25% annual tax on the satellite's gains eats the
+entire premium even at a small allocation. **Refined rule: core-satellite only
+helps when the underlying active strategy's PRE-TAX edge over buy-and-hold is
+large enough to survive the tax drag at minority weight — a thin edge isn't
+worth the tax cost of any satellite allocation at all**, in which case pure,
+literal buy-and-hold is simply the better answer.
 
 **Checked for robustness with `--mode checkpoints`**, since a core-satellite
 structure can't be walk-forward-folded in the usual sense (the core's tax
@@ -681,8 +695,18 @@ treatment depends on one continuous multi-decade hold, not independent
 periods). Instead this measures the SAME continuous hold's after-tax Sharpe at
 several different end dates (10, 12, 15, 18, 21 years in). A 70% core / 30%
 satellite split beat pure buy-and-hold at **every checkpoint tested, on both
-universes (10/10)** — including well before the core itself reaches the 15-year
-exemption, where naive intuition might expect the tax drag to look worse.
+primary (4-asset and 8-asset) universes (10/10)** — including well before the
+core itself reaches the 15-year exemption, where naive intuition might expect
+the tax drag to look worse.
+
+**Also tested: a slower, less-taxed satellite doesn't help.** Swapping the
+satellite from the daily-rebalanced min_var+TE blend to pure trend-exposure
+alone (taxed only at actual exits via `after_tax_exposure_based`, not
+blanket-annual) sounded like it should reduce tax drag further — but it
+underperforms the blend satellite on both primary universes anyway (e.g. 0.943
+vs. 0.947 on the 4-asset universe at 70% core). The blend's stronger standalone
+edge matters more than its less-favorable tax timing; don't swap to a
+"tax-efficient but weaker" satellite hoping the timing advantage wins out.
 
 **Honest caveats:** the annual-realization model approximates real per-trade
 tax-lot accounting (exact holding periods and cost basis per trade aren't
