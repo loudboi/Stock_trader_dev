@@ -475,6 +475,35 @@ concrete illustration of why "beats B&H in a spreadsheet" and "beats B&H after
 real costs" are very different bars. `--cost-per-side` lets you explore this
 sensitivity directly. Research/backtest only.
 
+## Turn-of-month effect (`bot/seasonality.py`)
+
+Another fresh idea, and a fully calendar-driven one: the classic "turn-of-month"
+effect (Ariel 1987; Lakonishok & Smidt 1988) — historically, equity returns
+cluster disproportionately around month boundaries, attributed to systematic
+flows (payroll/401k contributions, pension rebalancing). Fixed, literature-
+standard window (chosen before backtesting): invested on the last 1 trading day
+of a month through the first 3 of the next; cash otherwise (turnover-costed like
+everything in `bot/lab.py`, not a daily round-trip like `bot/overnight.py`).
+
+```bash
+python -m bot.seasonality --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+**Result: a clean negative finding at two levels.** As a strategy, it badly
+trails buy-and-hold (Sharpe 0.23 vs 0.96 on universe 1; 0.12 vs 0.77 on universe
+2) — invested only 19% of the time, it simply forgoes most of a persistently
+rising market's gains. But the deeper, more important check is whether the
+underlying anomaly still exists at all: comparing average daily returns on
+turn-of-month days vs. all other days directly, there's a small elevation
+(1.12× on universe 1, 1.41× on universe 2) in the historically-expected
+direction — but a Welch's t-test puts both nowhere near significance (t≈0.23
+and t≈0.53; ~2.0 would be needed). **The classic effect, once dramatic enough in
+older studies to explain nearly all of the market's historical gain, shows no
+statistically distinguishable signal in this modern (2005–2026), liquid,
+closely-arbitraged ETF data.** This is consistent with "anomaly decay" — a
+well-documented phenomenon where publishing an anomaly lets systematic funds
+arbitrage it away (see McLean & Pontiff 2016). Research/backtest only.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,
@@ -497,7 +526,8 @@ and walk-forward it before believing it.
 Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
 the strategy lab (including long/short and macro-regime-conditioned strategies),
-the RP+TE combo tool, the overnight/intraday decomposition, the benchmark, and
+the RP+TE combo tool, the overnight/intraday decomposition, the turn-of-month
+effect, the benchmark, and
 the live runner's order/stop/reconcile machinery against fakes:
 
 ```bash
