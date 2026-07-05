@@ -37,6 +37,21 @@ Strategies:
                   allowed to short) instead of equal-weighted — so a low-vol FX
                   pair and a high-vol commodity don't get equal dollar weight.
 
+Macro-regime-conditioned (need --regime-indicator {vix,curve,credit}; see
+bot/regime.py for the classification — VIX 15/25, yield-curve sign, credit-vs-
+Treasury sign, all fixed conventional thresholds):
+  regime_gated_rp      Inverse-vol risk parity, de-risked to `deleverage_to`
+                  exposure whenever the regime signals stress.
+  regime_leverage_rp   Inverse-vol risk parity, LEVERED UP in a calm regime and
+                  delevered in a stressed one (an external, often forward-
+                  looking signal timing leverage instead of the book's own
+                  trailing realized vol).
+  regime_gated_trend_ls  Same long/short trend signal as trend_ls, but SHORTS
+                  are only allowed when the regime signals stress — testing
+                  whether gating shorts to a genuine macro-stress window fixes
+                  trend_ls's core problem (shorting an asset with persistent
+                  structural drift, which fights that drift most of the time).
+
 All new strategies (erc, min_var, rp_voltarget, trend_ls, xsmom_ls) use FIXED,
 standard textbook parameters (60-day covariance, monthly rebalance, 10-15% vol
 target, 12-1 momentum) — chosen before looking at results, not swept for the best
@@ -54,6 +69,7 @@ average) — with no per-fold parameter fitting, since there's nothing to fit.
     python -m bot.lab --strategies trend_vol ensemble --target-vol 0.12
     python -m bot.lab --mode walk --folds 5 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.lab --strategies trend_ls xsmom_ls --symbols SPY QQQ GLD TLT IWM EFA --data-source yahoo --start 2005-01-01
+    python -m bot.lab --strategies regime_leverage_rp --regime-indicator vix --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
 """
 
 import argparse
@@ -64,6 +80,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from bot import regime as rg
 from bot.data import clean_daily_data
 from bot.momentum_rotation import build_panel, momentum, _DAYS_PER_MONTH
 from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
@@ -288,6 +305,73 @@ def managed_futures_ls(panel, ma_period=200, vol_lookback=20, short_borrow=0.01)
     return gross - financing - _turn_cost(w)
 
 
+# --- macro-regime-conditioned strategies --------------------------------------- #
+# `regime` is a pre-classified macro series (+1 calm/risk-on, -1 elevated/stress,
+# 0 neutral — see bot/regime.py) with ITS OWN (macro) calendar; each function
+# forward-fills it onto the panel's trading calendar via rg.align_to_panel. Which
+# macro indicator (VIX / yield curve / credit spread) is fed in as `regime` is a
+# CLI choice (--regime-indicator), not something these functions hardcode — the
+# same construction is tested against three independent macro signals.
+def regime_gated_rp(panel, regime, deleverage_to=0.0, vol_lookback=20) -> pd.Series:
+    """Inverse-vol risk parity, scaled down to `deleverage_to` exposure whenever
+    the macro regime signals stress (-1) — an early-warning de-risk overlay on
+    top of the one construction (inverse_vol) already shown to beat B&H
+    risk-adjusted. Tests whether a macro signal improves on that further, or just
+    adds whipsaw."""
+    rets = daily_returns(panel)
+    inv = (1.0 / realized_vol(rets, vol_lookback)).replace([np.inf, -np.inf], np.nan)
+    base_w = inv.div(inv.sum(axis=1), axis=0).fillna(0.0)
+    aligned = rg.align_to_panel(regime, panel.index).fillna(0)
+    exposure = pd.Series(1.0, index=panel.index)
+    exposure[aligned == -1] = deleverage_to
+    w = base_w.mul(exposure, axis=0).shift(1).fillna(0.0)
+    return (w * rets).sum(axis=1) - _turn_cost(w)
+
+
+def regime_leverage_rp(panel, regime, calm_leverage=1.5, normal_leverage=1.0,
+                       elevated_leverage=0.3, vol_lookback=20, borrow_rate=0.06) -> pd.Series:
+    """Inverse-vol risk parity, LEVERED UP in a calm macro regime and delevered in
+    a stressed one. Tests whether an external, often forward-looking signal (e.g.
+    VIX, which is option-implied) times leverage better than the book's own
+    trailing realized vol — vol_target/rp_voltarget already tried the latter and
+    financing costs ate the edge; this is a genuinely different mechanism."""
+    rets = daily_returns(panel)
+    inv = (1.0 / realized_vol(rets, vol_lookback)).replace([np.inf, -np.inf], np.nan)
+    base_w = inv.div(inv.sum(axis=1), axis=0).fillna(0.0)
+    aligned = rg.align_to_panel(regime, panel.index).fillna(0)
+    exposure = pd.Series(normal_leverage, index=panel.index)
+    exposure[aligned == 1] = calm_leverage
+    exposure[aligned == -1] = elevated_leverage
+    w = base_w.mul(exposure, axis=0).shift(1).fillna(0.0)
+    exposure_shifted = exposure.shift(1).fillna(normal_leverage)
+    financing = (exposure_shifted - 1.0).clip(lower=0) * (borrow_rate / _ANNUAL)
+    return (w * rets).sum(axis=1) - financing - _turn_cost(w)
+
+
+def regime_gated_trend_ls(panel, regime, ma_period=200, short_borrow=0.01) -> pd.Series:
+    """Same long/short trend signal as trend_ls (long above the MA, short below),
+    but SHORTS are only allowed when the macro regime signals stress (-1) — e.g.
+    an inverted yield curve or credit-spread widening. Long signals are always
+    allowed. Tests whether gating shorts to a genuine macro-stress window fixes
+    trend_ls's core problem (found in round 1/2): shorting an asset with
+    persistent structural drift fights that drift most of the time."""
+    rets = daily_returns(panel)
+    ma = panel.rolling(ma_period, min_periods=ma_period).mean()
+    signal = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    signal[panel > ma] = 1.0
+    signal[panel < ma] = -1.0
+    aligned = rg.align_to_panel(regime, panel.index).fillna(1)   # unknown -> no shorts
+    stress_day = (aligned == -1)
+    allow_short = pd.DataFrame({c: stress_day for c in signal.columns})
+    gated = signal.where((signal >= 0) | allow_short, 0.0)
+    active = gated.abs().sum(axis=1).replace(0, np.nan)
+    w = gated.div(active, axis=0).fillna(0.0).shift(1).fillna(0.0)
+    gross = (w * rets).sum(axis=1)
+    short_notional = w.clip(upper=0).abs().sum(axis=1)
+    financing = short_notional * (short_borrow / _ANNUAL)
+    return gross - financing - _turn_cost(w)
+
+
 def xsmom_weights(panel, lookback_months=12, skip_months=1, top_frac=0.3) -> pd.DataFrame:
     """Pre-shift target weights for the cross-sectional momentum long/short book:
     monthly rebalance, long the top `top_frac` and short the bottom `top_frac` of
@@ -335,6 +419,28 @@ def ensemble(components: dict) -> pd.Series:
     return pd.concat(components.values(), axis=1).mean(axis=1)
 
 
+def combine_books(book_returns: dict, weights: dict = None) -> pd.Series:
+    """Blend several already-computed strategy return series into ONE combined-
+    capital book, each possibly from a DIFFERENT universe/trading calendar (e.g.
+    an equity risk-parity book + an FX/commodity trend book). `weights` are fixed
+    CAPITAL ALLOCATIONS (must sum to ~1); default is equal-weight.
+
+    Unlike ensemble() (which averages and silently reweights on any day a series
+    is missing, via pandas' default skip-NaN mean), a day one sub-book has no data
+    (e.g. a holiday on that market) contributes its allocated weight x 0 return —
+    the correct behavior for a real multi-market capital split, since that
+    capital is sitting idle that day, not reallocated to the other book."""
+    if weights is None:
+        n = len(book_returns)
+        weights = {k: 1.0 / n for k in book_returns}
+    total_w = sum(weights.values())
+    if abs(total_w - 1.0) > 1e-6:
+        log.warning("combine_books weights sum to %.4f, not 1.0.", total_w)
+    aligned = pd.concat(book_returns, axis=1).fillna(0.0)
+    w = pd.Series(weights)
+    return (aligned * w).sum(axis=1)
+
+
 _STRATEGIES = {
     "vol_target": vol_target,
     "inverse_vol": inverse_vol,
@@ -349,6 +455,16 @@ _STRATEGIES = {
     "managed_futures_ls": managed_futures_ls,
 }
 
+# Regime-conditioned strategies: require a --regime-indicator (they take a
+# `regime` kwarg with no default). Kept in a separate dict so plain `_STRATEGIES`
+# usage (walk-forward, existing CLIs) is unaffected; main() merges them in only
+# when the user opts into a regime indicator.
+_REGIME_STRATEGIES = {
+    "regime_gated_rp": regime_gated_rp,
+    "regime_leverage_rp": regime_leverage_rp,
+    "regime_gated_trend_ls": regime_gated_trend_ls,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Runner / reporting
@@ -358,15 +474,16 @@ def compute_strategy_returns(daily_data, names, params) -> dict:
     by whatever period they need (a single window, or per-fold for walk-forward) —
     the return series itself is computed ONCE, with no per-period refitting, so
     slicing it later can't introduce any lookahead or parameter-selection bias."""
+    all_strategies = {**_STRATEGIES, **_REGIME_STRATEGIES}
     panel = build_panel(daily_data)
     comp_returns = {}
     for name in names:
-        fn = _STRATEGIES[name]
+        fn = all_strategies[name]
         kw = {k: v for k, v in params.items() if k in fn.__code__.co_varnames}
         comp_returns[name] = fn(panel, **kw)
     if params.get("with_ensemble"):
         comp_returns["ensemble"] = ensemble(
-            {k: v for k, v in comp_returns.items() if k in _STRATEGIES})
+            {k: v for k, v in comp_returns.items() if k in all_strategies})
     return comp_returns
 
 
@@ -501,7 +618,14 @@ def main():
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--strategies", nargs="+",
                     default=list(_STRATEGIES) + ["ensemble"],
-                    choices=list(_STRATEGIES) + ["ensemble"])
+                    choices=list(_STRATEGIES) + list(_REGIME_STRATEGIES) + ["ensemble"])
+    ap.add_argument("--regime-indicator", choices=["none", "vix", "curve", "credit"],
+                    default="none",
+                    help="Macro regime signal for regime_gated_rp/regime_leverage_rp/"
+                         "regime_gated_trend_ls (bot/regime.py). Fixed, conventional "
+                         "thresholds (VIX 15/25, curve sign, credit-vs-Treasury sign) "
+                         "-- chosen before backtesting, not tuned per run. 'credit' "
+                         "needs HYG, which only exists from 2007-04-11.")
     ap.add_argument("--ma-period", type=int, default=200)
     ap.add_argument("--target-vol", type=float, default=0.15)
     ap.add_argument("--vol-lookback", type=int, default=20)
@@ -541,12 +665,31 @@ def main():
         daily_data = clean_daily_data(daily_data, args.max_abs_return)
         log.info("Cleaned implausible single-day moves (cap %.0f%%).", args.max_abs_return * 100)
 
-    names = [s for s in args.strategies if s in _STRATEGIES]
+    all_strategies = {**_STRATEGIES, **_REGIME_STRATEGIES}
+    names = [s for s in args.strategies if s in all_strategies]
+    needs_regime = any(n in _REGIME_STRATEGIES for n in names)
+    if needs_regime and args.regime_indicator == "none":
+        log.error("Requested a regime-conditioned strategy but --regime-indicator "
+                  "is 'none'. Pass --regime-indicator {vix,curve,credit}.")
+        return 1
+
     params = dict(ma_period=args.ma_period, target_vol=args.target_vol,
                   vol_lookback=args.vol_lookback, max_leverage=args.max_leverage,
                   borrow_rate=args.borrow_rate, short_borrow=args.short_borrow,
                   top_frac=args.top_frac,
                   with_ensemble="ensemble" in args.strategies)
+
+    if needs_regime:
+        macro_start = start_dt - pd.Timedelta(days=120)   # lead for e.g. credit's 60d lookback
+        if args.regime_indicator == "vix":
+            params["regime"] = rg.vix_regime(rg.fetch_vix(macro_start, end_dt))
+        elif args.regime_indicator == "curve":
+            params["regime"] = rg.curve_regime(rg.fetch_curve(macro_start, end_dt))
+        elif args.regime_indicator == "credit":
+            params["regime"] = rg.credit_regime(rg.fetch_credit(macro_start, end_dt))
+        n_stress = int((params["regime"] == -1).sum())
+        log.info("Regime indicator: %s (%d/%d days classified 'stress').",
+                 args.regime_indicator, n_stress, len(params["regime"]))
 
     if args.mode == "walk":
         per_fold = run_walk_forward(daily_data, names, params, start_dt, end_dt, args.folds)

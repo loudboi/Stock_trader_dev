@@ -330,6 +330,73 @@ volatility-managed momentum, or a shorter/adaptive trend lookback with its own
 walk-forward validation), not re-tuning these same constructions until one
 number looks good. Research/backtest only.
 
+## Macro-regime-conditioned strategies (`bot/regime.py`)
+
+Free macro indicators (VIX, the 10Y−13-week yield curve, HYG-vs-IEF credit
+spread) with fixed, conventional thresholds (VIX 15/25, curve sign, credit sign
+— chosen from standard industry usage *before* any backtest, not fit to one) used
+to condition/combine the strategies above:
+
+```bash
+python -m bot.lab --strategies regime_leverage_rp --regime-indicator vix \
+    --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
+```
+
+- **`regime_gated_rp`** (de-risk to cash when the regime signals stress) and
+  **`regime_leverage_rp`** (lever up when calm, delever when stressed) — both
+  layered on top of `inverse_vol` risk parity. **Result: consistently WORSE than
+  plain `inverse_vol`, every time** — all 3 indicators × both universes (12/12
+  negative). Adding a tactical macro overlay on top of an already well-diversified
+  systematic strategy mostly adds whipsaw/turnover cost without a compensating
+  benefit — a known result in the broader literature, replicated here.
+- **`regime_gated_trend_ls`** — the `trend_ls` long/short signal, but shorts are
+  only allowed when the regime signals stress (targeting the specific failure
+  found in the long/short section above: shorting a persistently-drifting asset
+  most of the time). **Result: a real, validated improvement to the construction**
+  — VIX-gating beat plain `trend_ls` in **5/5 walk-forward folds** on the
+  FX/commodities universe (mean Sharpe −0.32 → +0.17), but still doesn't reliably
+  beat buy-and-hold on its own (2/5 folds). Gating shorts to genuine stress
+  periods fixes most of the "shorting a drifting asset" problem — just not enough
+  to become an outright market-beater by itself.
+
+## Combining proven strategies (`bot/combo.py`)
+
+The strongest, most validated result of this entire project. Two DIFFERENT
+strategies have each independently been shown to beat buy-and-hold's Sharpe on
+their own: `inverse_vol` risk parity and the `trend_exposure` 200-day filter.
+Blending them (fixed 50/50 capital split, chosen before running anything) tests
+whether their moderate (~0.7) correlation is low enough for real diversification
+benefit — unlike blending in the FX/commodity trend book above, whose own weak
+standalone Sharpe (0.22) meant *any* meaningful allocation to it just dragged the
+combination down despite its low (0.11) correlation. The lesson: correlation
+alone isn't enough for a diversification benefit — the components need standalone
+quality too.
+
+```bash
+python -m bot.combo --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.combo --mode walk --folds 5 --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
+```
+
+**Result, tested on two universes:** the 50/50 blend's full-window Sharpe beat
+**both** pure components in **both** universes —
+
+| Universe | B&H | pure RP | pure TE | **50/50 blend** |
+|---|---|---|---|---|
+| SPY/QQQ/GLD/TLT | 0.96 | 1.11 | 1.01 | **1.15** |
+| 8-asset broader mix | 0.77 | 0.87 | 0.78 | **0.90** |
+
+Walk-forward is honest about the limits: the blend beat buy-and-hold in 5/5
+folds on universe 1 but only 3/5 on universe 2 (the first universe's "perfect"
+record was partly universe-specific, exactly what testing a second universe is
+for) — so, like everything else in this project, its edge over B&H is
+regime-dependent, not universal. But it robustly beat pure RP (3/5 and 3/5 folds)
+and especially pure TE (4/5 and 4/5 folds) — i.e., **if choosing between holding
+risk parity alone, trend-exposure alone, or the blend, the blend was the better
+choice in both universes tested, both on average and most of the time regime-by-
+regime.** That's a genuine, validated diversification benefit, not a magic
+"beats B&H everywhere" strategy — none of those exist in this project.
+Research/backtest only; `--rp-weight` lets you try other fixed splits.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,
@@ -351,7 +418,9 @@ and walk-forward it before believing it.
 
 Offline test suite (no network, no broker) covering the strategy logic, the
 backtesters, the sweep mechanics, the trend-exposure and momentum-rotation models,
-the benchmark, and the live runner's order/stop/reconcile machinery against fakes:
+the strategy lab (including long/short and macro-regime-conditioned strategies),
+the RP+TE combo tool, the benchmark, and the live runner's order/stop/reconcile
+machinery against fakes:
 
 ```bash
 pip install -r requirements-dev.txt

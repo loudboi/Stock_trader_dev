@@ -327,6 +327,100 @@ def test_xsmom_ls_no_lookahead_flat_before_first_rebalance():
 
 
 # --------------------------------------------------------------------------- #
+# Macro-regime-conditioned strategies
+# --------------------------------------------------------------------------- #
+def _regime_series(index, stress_slice):
+    """A +1/-1 regime series on its own (sparser) calendar, stressed only on the
+    given slice of a reference index — mimics a macro series with a different
+    trading calendar than the panel, forcing align_to_panel to actually do work."""
+    macro_idx = index[::2]                      # sparser "macro calendar"
+    r = pd.Series(1, index=macro_idx)
+    stressed_dates = index[stress_slice]
+    r[r.index.isin(stressed_dates)] = -1
+    return r
+
+
+def test_regime_gated_rp_deleverages_during_stress():
+    rng = np.random.default_rng(40)
+    n = 300
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0.0005, 0.01, n)),
+                    "B": 100 * np.cumprod(1 + rng.normal(0.0005, 0.02, n))})
+    regime = _regime_series(panel.index, slice(150, 200))   # stressed for 50 days
+    r = lab.regime_gated_rp(panel, regime, deleverage_to=0.0, vol_lookback=20)
+    # Fully de-risked during the (aligned) stress window -> exactly zero return.
+    aligned = lab.rg.align_to_panel(regime, panel.index).fillna(0)
+    stress_days = panel.index[(aligned == -1).values]
+    # The day AFTER a stress day (weights shift by one) should be flat too, but
+    # checking well inside the stress window avoids edge effects at the boundary.
+    inside = stress_days[2:-2]
+    assert len(inside) > 0
+    assert (r.reindex(inside).dropna() == 0.0).all()
+
+
+def test_regime_leverage_rp_levers_up_when_calm_and_down_when_stressed():
+    rng = np.random.default_rng(41)
+    n = 300
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0.0005, 0.01, n)),
+                    "B": 100 * np.cumprod(1 + rng.normal(0.0005, 0.015, n))})
+    calm_regime = pd.Series(1, index=panel.index[::2])       # always calm
+    stressed_regime = _regime_series(panel.index, slice(100, 250))
+    r_calm = lab.regime_leverage_rp(panel, calm_regime, calm_leverage=2.0,
+                                    normal_leverage=1.0, elevated_leverage=0.2,
+                                    borrow_rate=0.0)
+    r_stress = lab.regime_leverage_rp(panel, stressed_regime, calm_leverage=2.0,
+                                      normal_leverage=1.0, elevated_leverage=0.2,
+                                      borrow_rate=0.0)
+    # A book levered up throughout should have higher realized volatility than one
+    # that's frequently de-levered to 0.2x during the same underlying asset path.
+    assert r_calm.std() > r_stress.std()
+
+
+def test_regime_leverage_rp_borrow_costs_money_when_levered():
+    rng = np.random.default_rng(42)
+    n = 200
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0.0005, 0.01, n))})
+    calm_regime = pd.Series(1, index=panel.index[::2])
+    no_fee = lab.regime_leverage_rp(panel, calm_regime, calm_leverage=2.0,
+                                    borrow_rate=0.0)
+    fee = lab.regime_leverage_rp(panel, calm_regime, calm_leverage=2.0, borrow_rate=0.20)
+    eq_no_fee = (1 + no_fee).cumprod().iloc[-1]
+    eq_fee = (1 + fee).cumprod().iloc[-1]
+    assert eq_fee < eq_no_fee
+
+
+def test_regime_gated_trend_ls_blocks_shorts_outside_stress():
+    # A clear downtrend, but the regime NEVER signals stress -> shorts should be
+    # blocked throughout, so the strategy just sits flat (no gain from the decline).
+    down = np.linspace(150, 80, 250)
+    panel = _panel({"A": down})
+    calm_regime = pd.Series(1, index=panel.index[::2])       # never -1 (never stressed)
+    r = lab.regime_gated_trend_ls(panel, calm_regime, ma_period=20, short_borrow=0.0)
+    eq = (1 + r).cumprod()
+    assert abs(eq.iloc[-1] - 1.0) < 1e-9             # no short taken -> flat, no P&L
+
+
+def test_regime_gated_trend_ls_allows_shorts_during_stress():
+    down = np.linspace(150, 80, 250)
+    panel = _panel({"A": down})
+    always_stressed = pd.Series(-1, index=panel.index[::2])  # always stressed
+    r = lab.regime_gated_trend_ls(panel, always_stressed, ma_period=20, short_borrow=0.0)
+    eq = (1 + r.iloc[25:]).cumprod()
+    assert eq.iloc[-1] > eq.iloc[0]                   # short allowed -> profits from the decline
+
+
+def test_regime_strategies_have_no_lookahead():
+    rng = np.random.default_rng(43)
+    n = 200
+    panel = _panel({"A": 100 * np.cumprod(1 + rng.normal(0, 0.01, n)),
+                    "B": 100 * np.cumprod(1 + rng.normal(0, 0.01, n))})
+    regime = pd.Series(1, index=panel.index[::2])
+    for fn, kw in [(lab.regime_gated_rp, {}), (lab.regime_leverage_rp, {}),
+                  (lab.regime_gated_trend_ls, {"ma_period": 20})]:
+        r = fn(panel, regime, **kw)
+        assert r.iloc[0] == 0.0                        # first bar always flat (shift(1))
+
+
+# --------------------------------------------------------------------------- #
 # Ensemble + run
 # --------------------------------------------------------------------------- #
 def test_ensemble_is_the_mean_of_components():
@@ -335,6 +429,34 @@ def test_ensemble_is_the_mean_of_components():
     b = pd.Series(np.full(10, -0.01), index=idx)
     e = lab.ensemble({"a": a, "b": b})
     assert np.allclose(e.values, 0.005)
+
+
+def test_combine_books_applies_fixed_capital_weights():
+    idx = pd.date_range("2005-01-01", periods=5, freq="B", tz="UTC")
+    a = pd.Series(np.full(5, 0.02), index=idx)
+    b = pd.Series(np.full(5, -0.04), index=idx)
+    combined = lab.combine_books({"a": a, "b": b}, weights={"a": 0.7, "b": 0.3})
+    assert np.allclose(combined.values, 0.7 * 0.02 + 0.3 * -0.04)
+
+
+def test_combine_books_treats_a_missing_day_as_idle_not_reweighted():
+    # b's calendar is missing day index 2 (e.g. a holiday on that market) -- the
+    # combined book on that day should be exactly weight_a * a's return (b
+    # contributes 0, its allocated capital sits idle), NOT a re-normalized
+    # average over just the available book (which is what a plain mean() would do).
+    idx = pd.date_range("2005-01-01", periods=5, freq="B", tz="UTC")
+    a = pd.Series(np.full(5, 0.02), index=idx)
+    b = pd.Series([0.05, 0.05, 0.05, 0.05], index=idx.delete(2))   # missing idx[2]
+    combined = lab.combine_books({"a": a, "b": b}, weights={"a": 0.5, "b": 0.5})
+    assert abs(combined.loc[idx[2]] - 0.5 * 0.02) < 1e-9
+
+
+def test_combine_books_defaults_to_equal_weight():
+    idx = pd.date_range("2005-01-01", periods=3, freq="B", tz="UTC")
+    a = pd.Series(np.full(3, 0.10), index=idx)
+    b = pd.Series(np.full(3, 0.02), index=idx)
+    combined = lab.combine_books({"a": a, "b": b})
+    assert np.allclose(combined.values, 0.06)
 
 
 # --------------------------------------------------------------------------- #
