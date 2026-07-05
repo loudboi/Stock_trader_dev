@@ -663,6 +663,35 @@ assumed permanent. Crypto trading on Alpaca requires the slash-form symbol
 below), which matches this sleeve's construction (long/cash trend-exposure,
 never short).
 
+**Crypto tax changed 2026-01-01 — and it's a completely different regime from
+securities (`--mode aftertax`).** Crypto gains were historically UNTAXED for
+Slovenian individuals; a new law now applies a flat 25% on disposal to FIAT
+(no graduated holding-period discount like securities have), but explicitly
+does NOT tax crypto-to-crypto swaps (including into a stablecoin) — these
+carry forward the original cost basis and acquisition date. In principle that
+lets a trend-following strategy defer ALL tax to one eventual cash-out by
+parking in a stablecoin instead of converting to EUR on every exit signal,
+exactly like buy-and-hold's deferral. **This full-deferral scenario was tried
+and deliberately NOT used as the recommendation**: it requires never
+rebalancing crypto back into the equity/bond legs (any such rebalance needs
+an intermediate fiat conversion), which lets a winning BTC position balloon to
+an undisciplined, unbounded fraction of net worth after a decade of 100x+
+growth — in direct tension with this project's whole risk-managed,
+fixed-allocation philosophy. Instead, `--mode aftertax` models the
+DISCIPLINED scenario: the sleeve held at a constant target weight (rebalanced
+alongside the rest of the book) and taxed annually, the same mechanic already
+used for the equity/bond legs — its flat rate happens to equal the crypto
+rate (both 25%), so no new tax mechanic was even needed in code.
+
+**Even under this realistic, fully-taxed, disciplined scenario, the sleeve
+still meaningfully improves after-tax Sharpe on both universes.** 4-asset
+universe: 0.80 → 0.99 at 15% weight. 8-asset universe: 0.62 → 0.87 at 10–15%
+weight. Max drawdown rises moderately (4-asset: -18.4%→-23.4% at 15%) but
+doesn't offset the Sharpe gain. **Crypto acquired before 2026-01-01 is
+grandfathered — 100% exempt forever, even if sold well after 2026, not just
+gains accrued before the law** — if the user already holds pre-2026 crypto,
+none of this new tax applies to that specific position at all.
+
 ## Slovenian capital-gains tax and EUR currency risk (`bot/taxes.py`, `bot/currency.py`, `bot/aftertax.py`)
 
 Every backtest above this section is **pre-tax**. That's a bad basis for a real

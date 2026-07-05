@@ -30,9 +30,36 @@ rather than assuming it holds forever. Crypto trading (BTC/USD) requires the
 crypto on Alpaca" caveat, which is fine here since this is long-only trend
 exposure, same as everywhere else in this project.
 
+TAX (--mode aftertax, added 2026-07): Slovenia's crypto tax changed 2026-01-01
+-- a flat 25% on disposal to FIAT (no graduated holding-period discount like
+securities have), but crypto-to-crypto swaps (including into a stablecoin)
+are explicitly NOT a taxable event and carry forward the original cost basis.
+In principle that lets a trend-following crypto strategy defer ALL tax to one
+eventual cash-out by parking in a stablecoin instead of literally converting
+to EUR on every "exit" -- exactly like buy-and-hold's deferral. That full-
+deferral scenario was tried and DELIBERATELY NOT used as the headline model
+here: it requires never rebalancing crypto back into the equity/bond legs
+(any such rebalance needs an intermediate fiat conversion), which lets a
+winning BTC position balloon to an undisciplined, unbounded fraction of net
+worth over a decade of 100x+ growth -- in direct tension with this project's
+whole risk-managed, fixed-allocation philosophy. --mode aftertax instead
+models the DISCIPLINED scenario: the BTC sleeve held at a constant target
+weight (rebalanced alongside the rest of the book) and taxed annually, same
+mechanic as everything else active in this project (bot.taxes.after_tax_active
+-- its flat rate already matches CRYPTO_TAX_RATE, since both happen to be
+25%). Finding: even under this realistic, disciplined, fully-taxed scenario,
+the BTC sleeve still meaningfully improves after-tax Sharpe (see README).
+Crypto acquired BEFORE 2026-01-01 is grandfathered -- 100% exempt forever,
+even sold later -- so if the user already holds pre-2026 BTC, none of this
+tax modeling applies to that specific position.
+
+Sources: [CoinDesk -- Slovenia moves to tax crypto profits at 25%](https://www.coindesk.com/policy/2025/04/19/slovenia-moves-to-tax-crypto-profits-at-25),
+[Waltio -- Slovenia crypto tax guide 2026](https://help.waltio.com/en/articles/14739040-slovenia-crypto-tax-guide-2026-the-complete-guide).
+
     python -m bot.crypto_sleeve --symbols SPY QQQ GLD TLT --start 2015-01-01 --data-source yahoo
     python -m bot.crypto_sleeve --mode walk --folds 5 --symbols SPY QQQ IWM EFA EEM TLT IEF GLD \
         --start 2015-01-01 --data-source yahoo
+    python -m bot.crypto_sleeve --mode aftertax --symbols SPY QQQ GLD TLT --start 2015-01-01 --data-source yahoo
 """
 
 import argparse
@@ -41,6 +68,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+import bot.taxes as tx
 import bot.trend_exposure as te
 from bot.combo import compute_books, combine_books
 from bot.lab import fold_bounds, slice_equity
@@ -126,9 +154,46 @@ def print_walk(daily_data, books, btc_daily, start_dt, end_dt, folds, btc_weight
     print("=" * 78)
 
 
+def print_aftertax(daily_data, books, btc_daily, begin_ts, end_ts, tax_rate=tx.CRYPTO_TAX_RATE):
+    """The DISCIPLINED after-tax comparison: the BTC sleeve held at a constant
+    target weight (rebalanced alongside the rest of the book, not left to
+    balloon unbounded) and taxed annually -- see module docstring for why this,
+    not the full-deferral-via-stablecoin-swaps scenario, is the headline
+    model. after_tax_active's flat rate already matches CRYPTO_TAX_RATE (both
+    25%), so this reuses it directly for the blended return series."""
+    blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
+    btc_sleeve = compute_btc_sleeve(btc_daily)
+    common = blend.index.intersection(btc_sleeve.index)
+    common = common[(common >= begin_ts) & (common <= end_ts)]
+    blend, btc_sleeve = blend.loc[common], btc_sleeve.loc[common]
+
+    print(f"\nCRYPTO SLEEVE AFTER-TAX  (disciplined: constant weight, rebalanced + taxed "
+          f"annually at Slovenia's flat {tax_rate:.0%} crypto rate)")
+    print("=" * 74)
+    print(f"{'Book':30}{'Sharpe':>10}{'Return%':>13}{'MaxDD%':>11}{'beats blend?':>13}")
+    print("-" * 74)
+    blend_eq = tx.after_tax_active(blend, tax_rate)
+    m_blend = compute_metrics([], blend_eq)
+    print(f"{'blend (0% BTC), post-tax':30}{m_blend['sharpe']:>10.3f}"
+          f"{m_blend['total_return']*100:>13.1f}{m_blend['max_drawdown']*100:>11.1f}{'':>13}")
+    for w in DEFAULT_WEIGHTS[1:]:
+        mixed = (1 - w) * blend + w * btc_sleeve
+        mixed_eq = tx.after_tax_active(mixed, tax_rate)
+        mm = compute_metrics([], mixed_eq)
+        beat = "YES" if mm["sharpe"] > m_blend["sharpe"] else "no"
+        print(f"{f'blend + {w:.0%} BTC, post-tax':30}{mm['sharpe']:>10.3f}"
+              f"{mm['total_return']*100:>13.1f}{mm['max_drawdown']*100:>11.1f}{beat:>13}")
+    print("-" * 74)
+    print("Note: crypto acquired before 2026-01-01 is grandfathered (0% tax forever,")
+    print("regardless of when sold) -- this table assumes a position acquired now, at")
+    print("the flat post-2026 rate. See module docstring for the full-deferral-via-")
+    print("stablecoin-swap scenario and why it's not modeled as the headline case.")
+    print("=" * 74)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Trend-filtered BTC sleeve blended into the RP+TE combo.")
-    ap.add_argument("--mode", choices=["score", "walk"], default="score")
+    ap.add_argument("--mode", choices=["score", "walk", "aftertax"], default="score")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--btc-weight", type=float, default=0.10,
                     help="Capital fraction in the BTC sleeve for --mode walk (score mode "
@@ -160,6 +225,8 @@ def main():
     if args.mode == "walk":
         print_walk(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt, args.folds,
                    args.btc_weight)
+    elif args.mode == "aftertax":
+        print_aftertax(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt)
     else:
         print_score(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt)
     return 0

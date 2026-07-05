@@ -101,6 +101,40 @@ All of these produce an EQUITY curve (not a return series, since a tax
 payment is a discrete capital deduction, not a percentage return) so they
 plug directly into bot.backtest_pullback.compute_metrics for an honest
 apples-to-apples AFTER-TAX Sharpe/return/drawdown comparison.
+
+CRYPTOCURRENCY IS A COMPLETELY DIFFERENT, SEPARATE REGIME (verified 2026-07,
+directly relevant to bot/crypto_sleeve.py): crypto gains were historically
+UNTAXED for individuals in Slovenia, but a new law took effect 2026-01-01:
+
+  - A FLAT 25% on disposal to FIAT (or spending it / transferring to a third
+    party) -- no graduated holding-period schedule like securities have.
+    CRYPTO_TAX_RATE below happens to equal SLOVENIA_TAX_RATE (both 25%), so
+    after_tax_active() already models this correctly for a crypto leg with no
+    changes needed -- just pass CRYPTO_TAX_RATE for clarity at the call site.
+  - Crypto-to-crypto swaps (INCLUDING into a stablecoin) are explicitly NOT a
+    taxable disposal -- they carry forward the original acquisition date and
+    cost basis. This means a trend-following crypto strategy that parks in a
+    stablecoin instead of cashing out to EUR on every "exit" defers ALL tax
+    to a single eventual fiat cash-out, exactly like buy-and-hold's deferral
+    (model with after_tax_buy_hold using a flat, non-graduated schedule, e.g.
+    schedule=((10**9, 0.25),) -- see bot/crypto_sleeve.py for why this is
+    NOT the model used for the main recommendation there: full deferral
+    requires never rebalancing crypto back into other asset classes [any such
+    rebalance needs an intermediate fiat conversion], which lets a winning
+    crypto position balloon to an undisciplined, unbounded fraction of net
+    worth -- in tension with this project's whole risk-managed-allocation
+    philosophy. The disciplined (periodically rebalanced, annually taxed)
+    scenario is what's actually recommended.
+  - GRANDFATHERING: crypto acquired BEFORE 2026-01-01 is 100% exempt from this
+    tax FOREVER, even if sold well after 2026 -- not just gains accrued before
+    the law, the ENTIRE historical gain. If the user already holds crypto
+    bought before 2026, it is untouched by any of this.
+  - Losses carry forward to future years, same general mechanic as
+    securities (after_tax_active's loss_carryforward already covers this).
+
+Sources: Slovenia's Ministry of Finance / FURS crypto tax reform coverage,
+cross-checked via CoinDesk, Waltio, and TaxRavens' 2026 guides (see
+bot/crypto_sleeve.py's module docstring for direct links).
 """
 
 import logging
@@ -111,6 +145,9 @@ log = logging.getLogger("taxes")
 
 SLOVENIA_TAX_RATE = 0.25                # top/short-term rate (0-5y hold)
 SLOVENIA_EXEMPT_DAYS = 15 * 365         # fully exempt past this many days held
+CRYPTO_TAX_RATE = 0.25                  # flat, NO holding-period discount (unlike securities)
+CRYPTO_LAW_EFFECTIVE_DATE = pd.Timestamp("2026-01-01", tz="UTC")   # crypto acquired
+                                        # before this date is 100% exempt forever (grandfathered)
 
 # Real, graduated cliff schedule: (upper bound in days, rate applied to the
 # WHOLE gain if held that long or less). Anything held longer than the last

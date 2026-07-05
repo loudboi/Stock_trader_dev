@@ -87,6 +87,39 @@ def test_print_walk_higher_weight_changes_result(capsys):
     assert "btc_weight=30%" in out
 
 
+def test_print_aftertax_runs_without_error(capsys):
+    daily_data = _daily_data(n=1200, seed=10)
+    btc = _btc_daily(n=1200, seed=11)
+    books = combo.compute_books(daily_data)
+    idx = list(daily_data.values())[0].index
+    cs.print_aftertax(daily_data, books, btc, begin_ts=idx[250], end_ts=idx[-1])
+    out = capsys.readouterr().out
+    assert "CRYPTO SLEEVE AFTER-TAX" in out
+    assert "grandfathered" in out
+    assert "blend + 10% BTC, post-tax" in out
+
+
+def test_print_aftertax_zero_btc_matches_plain_after_tax_active(capsys):
+    import bot.taxes as tx
+    from bot.combo import combine_books
+    from bot.backtest_pullback import compute_metrics
+
+    daily_data = _daily_data(n=1200, seed=12)
+    btc = _btc_daily(n=1200, seed=13)
+    books = combo.compute_books(daily_data)
+    idx = list(daily_data.values())[0].index
+    cs.print_aftertax(daily_data, books, btc, begin_ts=idx[250], end_ts=idx[-1])
+    out = capsys.readouterr().out
+    printed_sharpe = float([l for l in out.splitlines()
+                           if l.strip().startswith("blend (0% BTC)")][0].split()[-3])
+
+    blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
+    common = blend.index[(blend.index >= idx[250]) & (blend.index <= idx[-1])]
+    expected_eq = tx.after_tax_active(blend.loc[common], tx.CRYPTO_TAX_RATE)
+    expected_sharpe = compute_metrics([], expected_eq)["sharpe"]
+    assert abs(printed_sharpe - expected_sharpe) < 0.001
+
+
 if __name__ == "__main__":
     fns = [(k, v) for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
