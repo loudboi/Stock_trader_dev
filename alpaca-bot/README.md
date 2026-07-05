@@ -475,6 +475,22 @@ folds**, only trailing pure min_var (2/5, since min_var's own edge here is
 weak). **This generalizes the finding correctly: it's not "US equities/bonds/
 gold only" — it's equities broadly (US or international), vs. FX/commodities
 specifically**, which lack the structural risk premia both components rely on.
+Also parameter-robust on this universe: varying `min_var`'s covariance lookback
+(30/60/90 days) and the trend filter's MA/buffer, the blend beat buy-and-hold in
+**all 5** configurations tested (Sharpe 0.50–0.56 vs B&H's 0.44).
+
+**A fifth universe — combining everything, and the SECOND perfect walk-forward
+record found in this project.** Merged US and international into one 15-asset
+mega-universe (SPY/QQQ/GLD/TLT + all 11 country ETFs). Here `min_var` alone is
+strong (Sharpe 0.87 — a bigger, broader book gives risk parity more to diversify
+across), so the blend (0.86) essentially ties pure `min_var` full-window while
+clearly beating pure TE (0.67) and buy-and-hold (0.56). **Walk-forward is where
+this shines: the blend beat buy-and-hold in 5/5 folds** — matching the best
+record in the whole project — **and beat pure TE in 4/5 folds.** The pattern is
+consistent across every equity-like universe tested: whichever component is
+individually stronger on a given universe, the blend tracks close to it while
+still meaningfully beating the weaker component and buy-and-hold — and broader
+diversification (more assets, more countries) only strengthens this further.
 
 **Leverage on the blend (`--leverage`) — tested, and it doesn't help, again.**
 The RP+TE blend starts from the highest Sharpe found in this project (1.15/0.90
