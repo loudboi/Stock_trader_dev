@@ -3,51 +3,103 @@ bot/taxes.py
 ============
 Models Slovenian capital-gains tax on trading, because it changes the entire
 "beat buy-and-hold" question. Every backtest in this project so far has been
-PRE-TAX. Slovenia's capital-gains tax on securities is a massive structural
-advantage for true buy-and-hold: 25% on realized gains by default, decreasing
-with holding period, reaching 0% once a position has been held more than 15
-years (i.e. from day 15*365+1). [User-provided figures for the current schedule;
-if Slovenia's intermediate brackets (commonly cited historically as declining
-step-downs at 5/10/15-year marks) differ from a flat 25% below the exemption,
-adjust SLOVENIA_TAX_RATE / the schedule below accordingly — see the honest
-simplification note.]
+PRE-TAX.
 
-HONEST SIMPLIFICATION: none of the strategies in this project hold individual
-positions anywhere near 15 years (the longest-lived, trend_exposure, flips
-positions every few months to a few years), so the exact intermediate brackets
-between 0 and 15 years don't matter for them — they all land in the "not yet
-exempt" 25% bucket. The one case where the schedule's shape WOULD matter is a
-literal, never-touched buy-and-hold position, which is exactly the case handled
-separately below (after_tax_buy_hold): it defers all tax to the final sale, so
-if the total holding period exceeds the exemption threshold, it owes 0%.
+THE REAL SCHEDULE (verified 2026-07 against the Financial Administration of
+the Republic of Slovenia, fu.gov.si, "Disposal of securities, other holdings
+or investment coupons"): capital gains tax on securities is a CLIFF based on
+the TOTAL holding period of the specific lot at the time of sale -- not a
+flat rate, and not a marginal/bracket system like income tax (the whole gain
+gets the rate for the bracket the total holding period falls into):
 
-Two models, because the tax mechanics differ fundamentally by trading style:
+    holding period            rate
+    ------------------------  -----
+    0 - 5 years                25%
+    5 - 10 years                20%
+    10 - 15 years               15%
+    more than 15 years           0%   (fully exempt)
 
-  after_tax_active()    For a strategy that rebalances/trades frequently (which
-                        is every strategy in this project except literal
-                        buy-and-hold). Approximates tax as an ANNUAL realization
-                        event: at each calendar year-end, tax 25% of that year's
-                        NET gain (offsetting any carried-forward losses from
-                        prior years — capital losses on securities carry forward
-                        in most EU tax systems, Slovenia included). This is a
-                        simplification of exact per-trade tax-lot accounting
-                        (which would need every individual trade's cost basis
-                        and holding period), but it captures the economically
-                        dominant effect: active/systematic strategies realize
-                        gains constantly and pay the short-term rate on
-                        virtually all of them, every year, compounding the drag.
+This supersedes an earlier, simpler draft of this module that assumed a flat
+25% for anything under 15 years -- that was wrong for anything held 5-15
+years (real rate is 15-20%, not 25%) and mattered a lot for a literal
+buy-and-hold position sold at, say, the 10 or 12 year mark. Losses CAN be
+carried forward to future tax years (confirmed via the Doh-KDVP filing
+instructions -- a taxpayer ticks "carry forward" on the specification list),
+supporting the loss-carryforward mechanic already used below. No evidence of
+a Slovenian wash-sale rule (a restriction on claiming a loss if you rebuy the
+same/similar security shortly after) was found in the sources checked -- see
+the "tax-loss harvesting" section below for where that assumption actually
+matters (or doesn't) in this module.
 
-  after_tax_buy_hold()  For a position bought once and never touched during the
-                        backtest window. No tax is due until the FINAL sale (the
-                        end of the backtest), at which point the schedule is
-                        applied to the total gain based on the total holding
-                        period — 0% if held past the exemption threshold, which
-                        this project's ~20-year backtest windows comfortably
-                        exceed.
+Mechanics, because the tax treatment differs fundamentally by how a position
+is actually held and traded:
 
-Both take a return series and produce an EQUITY curve (not a return series,
-since a tax payment is a discrete capital deduction, not a percentage return) so
-they plug directly into bot.backtest_pullback.compute_metrics for an honest
+  after_tax_active()          For a strategy that rebalances/trades
+                              frequently (every strategy in this project
+                              except literal buy-and-hold and, mostly,
+                              trend-exposure). Approximates tax as an ANNUAL
+                              realization event at each calendar year-end,
+                              taxed at the flat 25% short-term rate (correct,
+                              since an annually-realized gain was held under
+                              5 years -- typically under 1) with loss
+                              carryforward. A simplification of full
+                              per-trade tax-lot accounting, but it captures
+                              the economically dominant effect: strategies
+                              that genuinely re-trade constantly (min_var,
+                              inverse_vol, erc all rebalance daily) realize
+                              gains at the short-term rate almost every year.
+
+  after_tax_buy_hold()        For a position bought once and never touched.
+                              No tax until the FINAL sale, at which point the
+                              REAL graduated schedule above is applied based
+                              on the total holding period -- 0% past 15
+                              years, but also correctly gives 15%/20% credit
+                              for holds in the 10-15y/5-10y bands rather than
+                              assuming a flat 25% until the exemption.
+                              Accepts extra_loss_shelter (see
+                              after_tax_core_satellite's cross_offset_losses)
+                              to shelter part of the gain with an outside
+                              loss at the point of final sale.
+
+  after_tax_exposure_based()  A trade-level version of the schedule for
+                              binary in/out strategies (e.g.
+                              bot.trend_exposure): each contiguous holding
+                              run is taxed, AT EXIT, using the graduated rate
+                              for THAT run's actual holding period (so a
+                              multi-year hold gets the 15%/20% discount, not
+                              a flat 25%), rather than the coarser
+                              all-or-nothing exemption cliff used before this
+                              update.
+
+TAX-LOSS HARVESTING -- WHAT WAS TRIED AND WHY IT'S NOT A SEPARATE FUNCTION:
+the obvious first idea -- "harvest" a loss the moment it occurs intra-year
+(sell and immediately rebuy a similar instrument; no Slovenian wash-sale rule
+was found in the sources checked, so this isn't restricted) instead of only
+netting at year-end -- was implemented and tested, and turned out to be a
+PROVABLE NO-OP given after_tax_active's own annual-netting mechanics: since
+tax already applies to the whole year's NET gain (start-of-year basis to
+year-end NAV) with full loss carryforward, moving the bookkeeping of a
+mid-year dip earlier changes nothing about that final number -- algebraically,
+taxable = nav_end - year_start_basis, always, regardless of how many times
+the running cost basis got reset by an intra-year "harvest" in between. Real
+intra-year timing only matters if you can apply a harvested loss against a
+DIFFERENT tax lot's gain sooner than the annual cycle would allow -- which is
+exactly what cross_offset_losses (below) does; a same-lot "harvest sooner"
+mechanic in isolation does not, and was removed after confirming this by test.
+
+THE REAL LOSS-HARVESTING LEVER FOUND: cross_offset_losses on
+after_tax_core_satellite. Slovenian tax nets capital gains and losses across
+a taxpayer's holdings within the same annual filing (Doh-KDVP) rather than
+isolating each security lot -- so a loss left over in the satellite (banked
+via carryforward but never absorbed by a later satellite gain) can shelter
+part of the CORE's gain when the core is finally sold. This only matters
+before the core reaches its own 0% exemption (past that point there's no tax
+left to shelter), so it shows up in the checkpoint analysis, not the
+headline 21+-year full-window result.
+
+All of these produce an EQUITY curve (not a return series, since a tax
+payment is a discrete capital deduction, not a percentage return) so they
+plug directly into bot.backtest_pullback.compute_metrics for an honest
 apples-to-apples AFTER-TAX Sharpe/return/drawdown comparison.
 """
 
@@ -57,17 +109,37 @@ import pandas as pd
 
 log = logging.getLogger("taxes")
 
-SLOVENIA_TAX_RATE = 0.25
-SLOVENIA_EXEMPT_DAYS = 15 * 365 + 1     # "15 years and a day" per the user
+SLOVENIA_TAX_RATE = 0.25                # top/short-term rate (0-5y hold)
+SLOVENIA_EXEMPT_DAYS = 15 * 365         # fully exempt past this many days held
+
+# Real, graduated cliff schedule: (upper bound in days, rate applied to the
+# WHOLE gain if held that long or less). Anything held longer than the last
+# entry's threshold is fully exempt (0%).
+SLOVENIA_SCHEDULE = (
+    (5 * 365, 0.25),
+    (10 * 365, 0.20),
+    (15 * 365, 0.15),
+)
 
 
-def after_tax_active(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,
-                     initial: float = 100_000.0) -> pd.Series:
-    """Annual realize-and-tax simulation with loss carryforward, for a
-    frequently-rebalanced/traded strategy. See module docstring for the
-    approximation this makes."""
+def slovenia_rate_for_holding(hold_days: float, schedule=SLOVENIA_SCHEDULE) -> float:
+    """The tax rate that applies to a lot's ENTIRE gain given its total
+    holding period in days, per the real Slovenian cliff schedule (not a
+    marginal-bracket system -- the whole gain gets one rate)."""
+    for upper_days, rate in schedule:
+        if hold_days <= upper_days:
+            return rate
+    return 0.0
+
+
+def _after_tax_active_full(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,
+                           initial: float = 100_000.0):
+    """Core of after_tax_active, but also returns the final leftover loss
+    carryforward (banked but never absorbed by a later gain within this lot
+    alone) so after_tax_core_satellite's cross_offset_losses can apply it
+    elsewhere."""
     if returns.empty:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float), 0.0
     equity = pd.Series(index=returns.index, dtype=float)
     nav = initial
     basis = initial                       # NAV as of the last tax event
@@ -89,31 +161,47 @@ def after_tax_active(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,
             else:
                 loss_carryforward = -taxable      # accumulate for future offset
             basis = nav
+    return equity, loss_carryforward
+
+
+def after_tax_active(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,
+                     initial: float = 100_000.0) -> pd.Series:
+    """Annual realize-and-tax simulation with loss carryforward, for a
+    frequently-rebalanced/traded strategy. See module docstring for the
+    approximation this makes (and for why a same-lot "harvest sooner"
+    variant was tried and dropped as a proven no-op)."""
+    equity, _ = _after_tax_active_full(returns, tax_rate, initial)
     return equity
 
 
-def after_tax_buy_hold(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,
-                       exempt_days: int = SLOVENIA_EXEMPT_DAYS,
-                       initial: float = 100_000.0) -> pd.Series:
+def after_tax_buy_hold(returns: pd.Series, schedule=SLOVENIA_SCHEDULE,
+                       initial: float = 100_000.0,
+                       extra_loss_shelter: float = 0.0) -> pd.Series:
     """A position bought once at the start and sold once at the end (or never
     sold, if you'd hold past the backtest window) -- taxed once, at the end,
-    based on total gain and total holding period."""
+    using the REAL graduated rate for the total holding period (0% past 15y,
+    but also 15%/20% credit for 10-15y/5-10y holds rather than a flat 25%).
+    extra_loss_shelter: an outside capital loss (e.g. a satellite's leftover
+    carryforward, see after_tax_core_satellite's cross_offset_losses) that
+    can offset part of this gain at the point of sale, per Slovenia's
+    same-filing netting of gains/losses across a taxpayer's holdings."""
     if returns.empty:
         return pd.Series(dtype=float)
     equity = initial * (1.0 + returns).cumprod()
     hold_days = (equity.index[-1] - equity.index[0]).days
-    if hold_days > exempt_days:
+    rate = slovenia_rate_for_holding(hold_days, schedule)
+    if rate <= 0:
         return equity                     # exempt -- no tax due, ever
     gain = equity.iloc[-1] - initial
-    if gain > 0:
+    taxable = gain - extra_loss_shelter
+    if taxable > 0:
         equity = equity.copy()
-        equity.iloc[-1] -= tax_rate * gain
+        equity.iloc[-1] -= rate * taxable
     return equity
 
 
 def after_tax_exposure_based(close: pd.Series, held: pd.Series,
-                             tax_rate: float = SLOVENIA_TAX_RATE,
-                             exempt_days: int = SLOVENIA_EXEMPT_DAYS,
+                             schedule=SLOVENIA_SCHEDULE,
                              initial: float = 100_000.0) -> pd.Series:
     """A MORE ACCURATE tax model for binary in/out exposure strategies (e.g.
     bot.trend_exposure), which after_tax_active over-penalizes: that blanket
@@ -122,9 +210,9 @@ def after_tax_exposure_based(close: pd.Series, held: pd.Series,
     inverse_vol/erc genuinely churn positions constantly) but wrong for a
     strategy that might hold one uninterrupted position for 1-3+ years without
     a single trade. Here, tax is only realized at the actual EXIT of each
-    contiguous holding period, based on that specific trade's real holding
-    period -- an unrealized (still-open) position accrues NO tax drag, exactly
-    like buy-and-hold's deferral.
+    contiguous holding period, using the REAL graduated rate for that
+    specific run's holding period -- a multi-year hold gets the 15%/20%
+    discount just like buy-and-hold would, not a flat 25%.
 
     `held` is the position series (1 = invested, 0 = cash) already decided with
     no lookahead (e.g. bot.trend_exposure.strategy_returns' internal `held`,
@@ -151,8 +239,9 @@ def after_tax_exposure_based(close: pd.Series, held: pd.Series,
         if prev_held > 0.0 and h == 0.0:                 # exited -- flat as of today
             gain = nav - entry_nav
             hold_days = (idx[i - 1] - entry_date).days if i > 0 else 0
-            if gain > 0 and hold_days <= exempt_days:
-                nav -= tax_rate * gain
+            rate = slovenia_rate_for_holding(hold_days, schedule)
+            if gain > 0 and rate > 0:
+                nav -= rate * gain
             entry_nav = None
             entry_date = None
         equity.iloc[i] = nav
@@ -162,21 +251,36 @@ def after_tax_exposure_based(close: pd.Series, held: pd.Series,
 
 def after_tax_core_satellite(core_returns: pd.Series, satellite_returns: pd.Series,
                              core_weight: float, tax_rate: float = SLOVENIA_TAX_RATE,
-                             exempt_days: int = SLOVENIA_EXEMPT_DAYS,
-                             initial: float = 100_000.0) -> pd.Series:
-    """Blend a true buy-and-hold CORE (never sold -> tax-deferred, 0% if held past
-    exempt_days) with an actively-traded SATELLITE (taxed annually via
-    after_tax_active), at a fixed capital split -- modeled as two SEPARATE tax
-    lots (the core's deferred gain is never mixed with the satellite's annual
-    realizations, which is the correct tax treatment for genuinely distinct
-    holdings). core_weight is the fraction of capital in the untouched core;
-    the rest goes to the satellite."""
-    core_eq = after_tax_buy_hold(core_returns, tax_rate, exempt_days,
-                                 initial=initial * core_weight)
+                             schedule=SLOVENIA_SCHEDULE, initial: float = 100_000.0,
+                             cross_offset_losses: bool = False) -> pd.Series:
+    """Blend a true buy-and-hold CORE (never sold -> tax-deferred, graduated
+    schedule applied at the end) with an actively-traded SATELLITE (taxed
+    annually), at a fixed capital split. core_weight is the fraction of
+    capital in the untouched core; the rest goes to the satellite.
+
+    cross_offset_losses=False (default): core and satellite are two SEPARATE
+    tax lots that never interact -- correct if you want a conservative,
+    lot-isolated estimate.
+
+    cross_offset_losses=True: the satellite's LEFTOVER loss carryforward at
+    the end of the window (banked but never absorbed by a later satellite
+    gain) is applied to shelter part of the CORE's gain at its final sale --
+    Slovenian tax nets capital gains/losses across a taxpayer's holdings
+    within the same annual filing rather than isolating each lot, so this is
+    a real technique, not a modeling convenience. Only matters if the core
+    hasn't yet reached its own 0% exemption (see module docstring)."""
     sat_weight = 1.0 - core_weight
+    if cross_offset_losses and sat_weight > 0:
+        sat_eq, leftover_loss = _after_tax_active_full(satellite_returns, tax_rate,
+                                                        initial=initial * sat_weight)
+        core_eq = after_tax_buy_hold(core_returns, schedule, initial=initial * core_weight,
+                                     extra_loss_shelter=leftover_loss)
+    else:
+        core_eq = after_tax_buy_hold(core_returns, schedule, initial=initial * core_weight)
+        sat_eq = (after_tax_active(satellite_returns, tax_rate, initial=initial * sat_weight)
+                  if sat_weight > 0 else None)
     if sat_weight <= 0:
         return core_eq
-    sat_eq = after_tax_active(satellite_returns, tax_rate, initial=initial * sat_weight)
     return core_eq.add(sat_eq, fill_value=0.0)
 
 
@@ -187,5 +291,5 @@ def compare_after_tax(strategies: dict, buy_hold_returns: pd.Series,
     same initial capital, ready for compute_metrics()."""
     from bot.backtest_pullback import INITIAL_EQUITY
     out = {name: after_tax_active(r, tax_rate, INITIAL_EQUITY) for name, r in strategies.items()}
-    out["buy_and_hold"] = after_tax_buy_hold(buy_hold_returns, tax_rate, initial=INITIAL_EQUITY)
+    out["buy_and_hold"] = after_tax_buy_hold(buy_hold_returns, initial=INITIAL_EQUITY)
     return out

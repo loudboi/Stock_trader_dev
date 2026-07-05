@@ -3,21 +3,27 @@ bot/aftertax.py
 ================
 The honest, after-tax version of "does anything beat buy-and-hold?" — because
 every backtest elsewhere in this project is PRE-TAX, and Slovenian capital-gains
-tax is a massive structural advantage for true buy-and-hold: 25% on realized
-gains by default, 0% once a position has been held more than 15 years (see
-bot/taxes.py for the model and its honest simplifications).
+tax is a massive structural advantage for true buy-and-hold: a graduated
+schedule (25% under 5y, 20% 5-10y, 15% 10-15y, 0% past 15y — verified against
+fu.gov.si; see bot/taxes.py for the model, its sources, and its honest
+simplifications) that no actively-traded strategy can fully escape.
 
 THE HEADLINE FINDING (see README): once taxed, the min_var+TE combo (this
 project's best PRE-TAX result) actually LOSES to plain buy-and-hold on Sharpe —
-25%-per-year tax on realized gains erodes a strategy's edge far more than it
-erodes buy-and-hold's, which pays nothing until a single deferred sale. The one
-structure that BEATS after-tax buy-and-hold: a CORE-SATELLITE split — most of
-the capital in a true, untouched buy-and-hold core (tax-deferred), a minority in
-the active combo as a satellite (taxed annually). Modeled as two separate tax
-lots (--core-weight, default 0.7).
+annual tax on realized gains erodes a strategy's edge far more than it erodes
+buy-and-hold's, which pays nothing until a single deferred sale (and even then
+at a discounted rate if held 5+ years). The one structure that BEATS after-tax
+buy-and-hold: a CORE-SATELLITE split — most of the capital in a true, untouched
+buy-and-hold core (tax-deferred), a minority in the active combo as a satellite
+(taxed annually). --mode checkpoints also reports --cross-offset: letting a
+leftover satellite loss shelter part of the core's eventual sale gain, which
+only matters before the core itself reaches its 0% exemption (see bot/taxes.py
+for why an intra-year "harvest sooner" variant was tried and dropped as a
+proven no-op).
 
     python -m bot.aftertax --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
-    python -m bot.aftertax --mode checkpoints --core-weight 0.7 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+    python -m bot.aftertax --mode checkpoints --core-weight 0.7 \
+        --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
 """
 
 import argparse
@@ -55,15 +61,15 @@ def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RA
         return compute_metrics([], eq)
 
     hold_years = (bh_ret.index[-1] - bh_ret.index[0]).days / 365.0
-    print(f"\nAFTER-TAX COMPARISON  (Slovenia: {tax_rate:.0%} on realized gains, 0% "
-          f"past {tx.SLOVENIA_EXEMPT_DAYS/365:.0f}y; window covers {hold_years:.1f}y)")
+    print(f"\nAFTER-TAX COMPARISON  (Slovenia: {tax_rate:.0%} under 5y, 20% 5-10y, 15% "
+          f"10-15y, 0% past 15y; window covers {hold_years:.1f}y)")
     print("=" * 70)
     print(f"{'Strategy':22}{'Pre-tax Shp':>13}{'Post-tax Shp':>14}{'Post-tax Ret%':>15}")
     print("-" * 70)
     rows = [("pure risk-based", rp, tx.after_tax_active(rp, tax_rate)),
             ("pure trend_exposure", te, tx.after_tax_active(te, tax_rate)),
             ("min_var+TE blend", blend, tx.after_tax_active(blend, tax_rate)),
-            ("buy_and_hold", bh_ret, tx.after_tax_buy_hold(bh_ret, tax_rate))]
+            ("buy_and_hold", bh_ret, tx.after_tax_buy_hold(bh_ret))]
     bh_post_sharpe = None
     for name, pre_r, post_eq in rows:
         pre_m = pretax_m(pre_r)
@@ -89,7 +95,10 @@ def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RA
     print("-" * 67)
     print(f"Best of the grid above: core_weight={best_w:.1f} -> Sharpe={best_sharpe:.3f} "
           f"(informational only -- this is a scan over a pre-defined grid, not a fit; "
-          f"don't over-read the exact peak, look at the shape of the curve).")
+          f"don't over-read the exact peak, look at the shape of the curve). Note: at "
+          f"this window's {hold_years:.1f}y length the core is already past its 15y "
+          f"exemption, so --cross-offset (--mode checkpoints) makes no difference here "
+          f"-- it only matters before the core's own tax reaches 0%.")
     print("=" * 70)
 
 
@@ -101,7 +110,10 @@ def print_checkpoints(daily_data, books, begin_ts, core_weight, tax_rate=tx.SLOV
     stress test is to look at several DIFFERENT END DATES along that SAME
     continuous hold and see whether the core-satellite's after-tax Sharpe
     advantage over pure buy-and-hold holds up at each checkpoint, not just the
-    specific end date the full backtest happens to stop at."""
+    specific end date the full backtest happens to stop at. Also reports the
+    cross_offset_losses variant (a leftover satellite loss sheltering part of
+    the core's gain), which only bites before the core reaches its own 0%
+    exemption -- so it's most visible at the earlier checkpoints here."""
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
     bh_ret_full = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
     bh_ret_full = bh_ret_full[bh_ret_full.index >= begin_ts]
@@ -109,9 +121,10 @@ def print_checkpoints(daily_data, books, begin_ts, core_weight, tax_rate=tx.SLOV
 
     print(f"\nCORE-SATELLITE CHECKPOINTS  core_weight={core_weight:.0%}  "
           f"(same continuous hold from {begin_ts.date()}, measured at several end dates)")
-    print("=" * 70)
-    print(f"{'End date':12}{'Years held':>11}{'pure B&H Shp':>14}{'core-sat Shp':>14}{'beats?':>8}")
-    print("-" * 70)
+    print("=" * 78)
+    print(f"{'End date':12}{'Years held':>11}{'pure B&H Shp':>14}{'core-sat Shp':>14}"
+          f"{'+crossoffst':>13}{'beats?':>8}")
+    print("-" * 78)
     wins = 0
     checks = 0
     for years in checkpoint_years:
@@ -120,17 +133,21 @@ def print_checkpoints(daily_data, books, begin_ts, core_weight, tax_rate=tx.SLOV
             continue
         bh_slice = bh_ret_full[bh_ret_full.index <= end_ts]
         blend_slice = blend_full[blend_full.index <= end_ts]
-        bh_eq = tx.after_tax_buy_hold(bh_slice, tax_rate)
+        bh_eq = tx.after_tax_buy_hold(bh_slice)
         cs_eq = tx.after_tax_core_satellite(bh_slice, blend_slice, core_weight, tax_rate)
-        m_bh, m_cs = compute_metrics([], bh_eq), compute_metrics([], cs_eq)
-        beat = m_cs["sharpe"] > m_bh["sharpe"]
+        cs_eq_x = tx.after_tax_core_satellite(bh_slice, blend_slice, core_weight, tax_rate,
+                                              cross_offset_losses=True)
+        m_bh, m_cs, m_cs_x = (compute_metrics([], bh_eq), compute_metrics([], cs_eq),
+                              compute_metrics([], cs_eq_x))
+        beat = m_cs_x["sharpe"] > m_bh["sharpe"]
         wins += int(beat)
         checks += 1
         print(f"{end_ts.date()!s:12}{years:>11}{m_bh['sharpe']:>14.3f}{m_cs['sharpe']:>14.3f}"
-              f"{'YES' if beat else 'no':>8}")
-    print("-" * 70)
-    print(f"Core-satellite beat pure buy-and-hold in {wins}/{checks} checkpoints.")
-    print("=" * 70)
+              f"{m_cs_x['sharpe']:>13.3f}{'YES' if beat else 'no':>8}")
+    print("-" * 78)
+    print(f"Core-satellite (+cross-offset column) beat pure buy-and-hold in {wins}/{checks} "
+          f"checkpoints.")
+    print("=" * 78)
 
 
 def main():

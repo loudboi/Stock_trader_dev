@@ -629,27 +629,46 @@ and walk-forward it before believing it.
 ## Slovenian capital-gains tax (`bot/taxes.py`, `bot/aftertax.py`)
 
 Every backtest above this section is **pre-tax**. That's a bad basis for a real
-decision if you're a Slovenian taxpayer: Slovenia taxes realized securities
-gains at **25%** by default, but that rate steps down with holding period and
-hits **0%** once a single position has been held more than **15 years and a
-day**. That's not a minor tax-drag footnote — it's a structural moat around
-literal, untouched buy-and-hold that no actively-traded strategy in this
-project can cross, because every one of them (including the best pre-tax
-result, the `min_var`+trend-exposure combo) realizes gains constantly and pays
-25% on virtually all of them, every year.
+decision if you're a Slovenian taxpayer. Verified against the Financial
+Administration of the Republic of Slovenia (fu.gov.si): capital gains on
+securities are **not a flat rate** — it's a graduated CLIFF based on the total
+holding period of the lot at sale (the whole gain gets one rate, not a
+marginal/bracket split):
 
-`bot/taxes.py` models this with two mechanics, since active and passive
-holdings are taxed completely differently:
+| Holding period | Rate |
+|---|---|
+| 0–5 years | 25% |
+| 5–10 years | 20% |
+| 10–15 years | 15% |
+| more than 15 years | 0% (fully exempt) |
+
+That's not a minor tax-drag footnote — it's a structural moat around literal,
+untouched buy-and-hold that no actively-traded strategy in this project can
+cross, because every one of them (including the best pre-tax result, the
+`min_var`+trend-exposure combo) realizes gains at the top 25% short-term rate
+almost every year. Losses **do carry forward** to future tax years (confirmed
+via the official Doh-KDVP filing instructions), and no Slovenian wash-sale
+rule (a restriction on claiming a loss if you immediately rebuy the same
+security) was found in the sources checked.
+
+`bot/taxes.py` models this with mechanics that differ by how a position is
+actually held and traded:
 
 - `after_tax_active()` — an annual realize-and-tax simulation (with loss
-  carryforward) for anything that rebalances or flips exposure regularly.
-- `after_tax_buy_hold()` — tax deferred to a single final sale, so a holding
-  period past the 15-year exemption owes nothing, ever.
-- `after_tax_exposure_based()` — a more precise trade-level version of the above
-  for binary in/out strategies like trend-exposure, taxing only at actual exits.
+  carryforward) for anything that rebalances or flips exposure regularly. Uses
+  the flat 25% top rate, correctly, since an annual realization is always held
+  under 5 years.
+- `after_tax_buy_hold()` — tax deferred to a single final sale, at which point
+  the real graduated schedule above applies (0% past 15y, but also the
+  correct 15%/20% discount for a 10–15y/5–10y hold rather than a flat 25%).
+- `after_tax_exposure_based()` — a trade-level version of the schedule for
+  binary in/out strategies like trend-exposure: each holding run is taxed, at
+  exit, using the graduated rate for *that run's* actual holding period.
 - `after_tax_core_satellite()` — splits capital between an untouched
   buy-and-hold **core** (tax-deferred) and an actively-traded **satellite**
-  (taxed annually), as two separate tax lots.
+  (taxed annually), as two separate tax lots by default, or with
+  `cross_offset_losses=True` letting a leftover satellite loss shelter part of
+  the core's eventual sale gain (see the tax-loss-harvesting section below).
 
 ```bash
 python -m bot.aftertax --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
@@ -693,11 +712,35 @@ literal buy-and-hold is simply the better answer.
 structure can't be walk-forward-folded in the usual sense (the core's tax
 treatment depends on one continuous multi-decade hold, not independent
 periods). Instead this measures the SAME continuous hold's after-tax Sharpe at
-several different end dates (10, 12, 15, 18, 21 years in). A 70% core / 30%
-satellite split beat pure buy-and-hold at **every checkpoint tested, on both
-primary (4-asset and 8-asset) universes (10/10)** — including well before the
-core itself reaches the 15-year exemption, where naive intuition might expect
-the tax drag to look worse.
+several different end dates (10, 12, 15, 18, 21 years in, each correctly taxed
+at the graduated rate for THAT holding period — e.g. buy-and-hold sold at the
+10-year mark owes 20%, not a flat 25%). A 70% core / 30% satellite split beat
+pure buy-and-hold at **every checkpoint tested, on both primary (4-asset and
+8-asset) universes (10/10)** — including well before the core itself reaches
+the 15-year exemption, where naive intuition might expect the tax drag to look
+worse.
+
+**Tax-loss harvesting on the satellite — tried, and the obvious version is a
+proven no-op; the real lever is narrower than it sounds.** The first idea —
+harvest a loss the moment it occurs during the year (sell and immediately
+rebuy a similar instrument, unrestricted since no wash-sale rule was found)
+instead of only netting at year-end — was implemented and tested, then
+DISPROVEN by algebra and a direct test: since `after_tax_active` already taxes
+the whole year's NET gain with full loss carryforward, moving the bookkeeping
+of a mid-year dip earlier changes nothing about the year-end number (taxable
+gain is always `nav_end − year_start_basis`, regardless of how many times the
+cost basis got reset in between). The one place intra-year loss timing
+genuinely matters — Slovenian tax nets gains/losses across a taxpayer's
+holdings within the same filing, not per security lot — is letting a
+**leftover satellite loss** (banked via carryforward but never absorbed by a
+later satellite gain) shelter part of the **core's** gain when the core is
+finally sold (`cross_offset_losses=True`, shown as the `+crossoffst` column in
+`--mode checkpoints`). Even this real, legally-grounded lever turned out to
+provide **zero measurable benefit for the actual min_var+TE satellite** on
+both primary universes at every checkpoint tested (10/10 identical with and
+without it) — the satellite is simply too consistently profitable to carry a
+persistent unused loss into a later year. A weaker or more volatile satellite
+strategy might see a real effect here; this one doesn't.
 
 **Widened the grid (0–100% core in 10% steps) — there is no single universal
 split, it depends on how large the active edge is.** The optimum shifts by
@@ -725,16 +768,22 @@ edge matters more than its less-favorable tax timing; don't swap to a
 "tax-efficient but weaker" satellite hoping the timing advantage wins out.
 
 **Honest caveats:** the annual-realization model approximates real per-trade
-tax-lot accounting (exact holding periods and cost basis per trade aren't
-tracked) — the economically dominant effect, that active strategies pay tax
-almost every year and buy-and-hold doesn't, holds regardless. The exact
-Slovenian bracket schedule below the 15-year exemption is assumed flat at 25%;
-none of the strategies here hold individual positions anywhere near that
-threshold, so intermediate step-downs (if any) wouldn't change which bucket
-they land in — the one case where the schedule's shape matters (a literal
-never-touched position) is exactly what `after_tax_buy_hold` handles correctly.
-This is a personal-finance model, not tax advice — verify current rates and
-rules before acting on them.
+tax-lot accounting (exact holding periods and cost basis per individual trade
+aren't tracked) — the economically dominant effect, that active strategies pay
+tax almost every year and buy-and-hold doesn't, holds regardless. The
+graduated schedule is applied as a cliff on the WHOLE gain based on total
+holding period, matching the official description ("reduced after every five
+years") rather than a marginal-bracket split — if that's ever clarified
+otherwise, `slovenia_rate_for_holding`/`SLOVENIA_SCHEDULE` is the one place to
+fix it. No Slovenian wash-sale rule was found in the sources checked, so
+loss-harvest-and-immediately-rebuy is treated as unrestricted — if one exists
+and is later confirmed, it would remove `cross_offset_losses`' (already
+empirically negligible) benefit entirely. This is a personal-finance model,
+not tax advice — verify current rates and rules before acting on them.
+
+Sources: [Financial Administration of the Republic of Slovenia — disposal of
+securities](https://www.fu.gov.si/en/life_events_individuals/disposal_of_securities_other_holdings_or_investment_coupons),
+[Tax Foundation Europe — capital gains tax rates](https://taxfoundation.org/data/all/eu/capital-gains-tax-rates-europe/).
 
 ## Testing
 
