@@ -515,6 +515,23 @@ closely-arbitraged ETF data.** This is consistent with "anomaly decay" — a
 well-documented phenomenon where publishing an anomaly lets systematic funds
 arbitrage it away (see McLean & Pontiff 2016). Research/backtest only.
 
+**Day-of-week ("Monday effect") — same pattern, checked directly (`--mode weekday`):**
+
+```bash
+python -m bot.seasonality --mode weekday --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+```
+
+A purely descriptive comparison (not a backtested strategy — holding only
+specific weekdays hits the same daily-round-trip cost wall documented under
+Overnight vs. Intraday above). Monday is the weakest day in both universes —
+directionally consistent with the classic "weekend effect" (French 1980) — but
+again nowhere near significant (t≈−0.84 and −1.22 vs. the rest of the week;
+~2.0 needed). Same conclusion as turn-of-month: a historically-documented
+calendar effect, present in direction but not in statistical substance, in this
+modern data. Two-for-two on "anomaly decay" — don't expect a different result
+from testing other classical calendar effects (e.g. "Sell in May") on these same
+liquid, heavily-arbitraged ETF universes.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,

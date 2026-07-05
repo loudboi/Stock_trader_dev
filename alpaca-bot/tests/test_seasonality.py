@@ -62,6 +62,39 @@ def test_turn_of_month_no_lookahead():
     assert r.iloc[0] == 0.0          # shift(1) -> first bar always flat
 
 
+def test_weekday_stats_groups_by_day_of_week():
+    idx = pd.date_range("2024-01-01", periods=50, freq="B")     # Mon-Fri business days
+    close = 100 * np.cumprod(1 + np.linspace(0.001, -0.001, 50))
+    panel = pd.DataFrame({"A": close}, index=idx)
+    by_day = sea.weekday_stats(panel)
+    assert set(by_day) == {"Mon", "Tue", "Wed", "Thu", "Fri"}
+    for name, r in by_day.items():
+        assert (r.index.dayofweek == sea._WEEKDAY_NAMES.index(name)).all()
+    total_n = sum(len(r) for r in by_day.values())
+    assert total_n == len(panel)     # fillna(0.0) keeps every row, including day 1
+
+
+def test_weekday_stats_respects_begin_ts():
+    idx = pd.date_range("2024-01-01", periods=50, freq="B")
+    close = 100 * np.cumprod(1 + np.full(50, 0.001))
+    panel = pd.DataFrame({"A": close}, index=idx)
+    begin = idx[20]
+    by_day = sea.weekday_stats(panel, begin_ts=begin)
+    for r in by_day.values():
+        assert (r.index >= begin).all()
+
+
+def test_print_weekday_stats_runs_without_error(capsys):
+    rng = np.random.default_rng(4)
+    idx = pd.date_range("2020-01-01", periods=300, freq="B", tz="UTC")
+    close = 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, 300))
+    daily_data = {"A": pd.DataFrame({"open": close, "high": close, "low": close,
+                                    "close": close, "volume": np.ones(300)}, index=idx)}
+    sea.print_weekday_stats(daily_data, begin_ts=idx[50])
+    out = capsys.readouterr().out
+    assert "DAY-OF-WEEK EFFECT" in out and "Best day" in out
+
+
 def test_run_smoke_end_to_end():
     rng = np.random.default_rng(3)
     idx = pd.date_range("2020-01-01", periods=500, freq="B", tz="UTC")
