@@ -868,6 +868,35 @@ Sources: [Financial Administration of the Republic of Slovenia — disposal of
 securities](https://www.fu.gov.si/en/life_events_individuals/disposal_of_securities_other_holdings_or_investment_coupons),
 [Tax Foundation Europe — capital gains tax rates](https://taxfoundation.org/data/all/eu/capital-gains-tax-rates-europe/).
 
+## Volatility risk premium (tested, negative)
+
+A different, well-documented risk premium not tried anywhere else in this
+project: systematically selling volatility (short-VIX-futures products earn a
+persistent premium historically, since implied vol tends to run above realized
+vol). Tested with `SVXY` (ProShares Short VIX Short-Term Futures, real
+tradeable history since Oct 2011), blended into the min_var+TE combo at small
+weights (5–20%).
+
+**Standalone, SVXY looks decent on Sharpe alone (0.57) but has catastrophic
+tail risk** — a -95% max drawdown and a single day (2018-02-06, the
+"Volpocalypse") that lost 83% of its value. **Blended into the existing
+min_var+TE book, it makes things WORSE almost everywhere**: Sharpe declines
+monotonically as SVXY weight increases on the 4-asset universe (1.168 → 1.124
+→ 1.044 → 0.965 → 0.898 at 0/5/10/15/20%), and max drawdown roughly doubles by
+20% weight (-16%→-32%). The 8-asset universe shows a marginal improvement at
+5% (0.906→0.924) but the same clear degradation by 10–15% — inconsistent
+enough between universes to distrust the small win, and dominated anyway by
+the standalone tail risk.
+
+**Why it fails the project's established diversification rule** (a good
+diversifier needs BOTH low correlation AND standalone quality/safety — see the
+RP+TE combo section): short-vol strategies crash exactly when equity markets
+crash, which is precisely when risk-parity/trend-following are earning their
+keep by NOT crashing — the correlation is bad in exactly the way that matters
+most. **Conclusion: don't pursue volatility-risk-premium harvesting as a
+diversifier for this project's existing books — the tail-risk correlation
+structure works against it, not with it.**
+
 ## Testing
 
 Offline test suite (no network, no broker) covering the strategy logic, the
