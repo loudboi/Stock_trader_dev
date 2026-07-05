@@ -699,6 +699,22 @@ primary (4-asset and 8-asset) universes (10/10)** — including well before the
 core itself reaches the 15-year exemption, where naive intuition might expect
 the tax drag to look worse.
 
+**Widened the grid (0–100% core in 10% steps) — there is no single universal
+split, it depends on how large the active edge is.** The optimum shifts by
+universe: 4-asset peaks near 60% core (Sharpe 0.948), 8-asset peaks near
+20–30% core (0.799, a much more aggressive satellite weight), and on the
+mega-universe the peak is 0% core — i.e. **going fully active (no B&H core at
+all) is the best after-tax choice there**, because that universe's active edge
+is so large (pre-tax blend 0.85 vs. B&H's pre-tax 0.54) that paying 25% tax on
+it every year still beats any blend with buy-and-hold. Practical rule: the
+bigger the strategy's pre-tax edge over buy-and-hold, the MORE weight the
+satellite deserves — up to and including 100% on a strong enough edge; on a
+thin edge (the international universe), the correct satellite weight is 0%.
+Don't treat any single ratio (e.g. 70/30) as a universal recommendation —
+`--mode score` prints the full curve so you can see where your own universe
+falls, and picking a round default (50%) before looking is safer than chasing
+the exact per-universe peak.
+
 **Also tested: a slower, less-taxed satellite doesn't help.** Swapping the
 satellite from the daily-rebalanced min_var+TE blend to pure trend-exposure
 alone (taxed only at actual exits via `after_tax_exposure_based`, not

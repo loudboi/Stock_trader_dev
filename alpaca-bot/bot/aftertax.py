@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s")
 log = logging.getLogger("aftertax")
 
-DEFAULT_CORE_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.5, 0.3]
+DEFAULT_CORE_WEIGHTS = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
 
 
 def _slice(r, begin_ts, end_ts):
@@ -77,12 +77,19 @@ def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RA
     print(f"\nCORE-SATELLITE  (core_weight in true buy-and-hold, rest in the active blend)")
     print(f"{'core/satellite':18}{'post-tax Sharpe':>17}{'post-tax Ret%':>15}{'beats pure B&H?':>17}")
     print("-" * 67)
+    best_w, best_sharpe = None, -1e9
     for core_w in DEFAULT_CORE_WEIGHTS:
         eq = tx.after_tax_core_satellite(bh_ret, blend, core_w, tax_rate)
         m = compute_metrics([], eq)
         beat = "YES" if m["sharpe"] > bh_post_sharpe else "no"
         print(f"{core_w:.1f}/{1-core_w:.1f}            {m['sharpe']:>17.3f}"
               f"{m['total_return']*100:>15.1f}{beat:>17}")
+        if m["sharpe"] > best_sharpe:
+            best_w, best_sharpe = core_w, m["sharpe"]
+    print("-" * 67)
+    print(f"Best of the grid above: core_weight={best_w:.1f} -> Sharpe={best_sharpe:.3f} "
+          f"(informational only -- this is a scan over a pre-defined grid, not a fit; "
+          f"don't over-read the exact peak, look at the shape of the curve).")
     print("=" * 70)
 
 
