@@ -25,11 +25,22 @@ Strategies:
   ensemble        Equal blend of the daily returns of the above (diversify across
                   strategies — the one real free lunch).
 
-All new strategies (erc, min_var, rp_voltarget) use FIXED, standard textbook
-parameters (60-day covariance, monthly rebalance, 10-15% vol target) — chosen
-before looking at results, not swept for the best backtest number. Costs modelled:
-0.05% slippage on turnover, and a borrow rate on leverage >1×. All signals act on
-the NEXT day (shift by one), so there is no lookahead.
+  trend_ls        Time-series trend, LONG AND SHORT: long an asset above its
+                  long MA, short it below (instead of going to cash) — the
+                  classic managed-futures/CTA construction.
+  xsmom_ls        Cross-sectional momentum, LONG AND SHORT: each month, long the
+                  strongest-momentum assets and short the weakest, equal dollar
+                  amounts (market-neutral) — the classic academic momentum factor
+                  (12-1 lookback, Jegadeesh & Titman-style).
+
+All new strategies (erc, min_var, rp_voltarget, trend_ls, xsmom_ls) use FIXED,
+standard textbook parameters (60-day covariance, monthly rebalance, 10-15% vol
+target, 12-1 momentum) — chosen before looking at results, not swept for the best
+backtest number. Costs modelled: 0.05% slippage on turnover, a borrow rate on
+leverage >1×, and a separate --short-borrow rate charged on short notional (default
+1%/yr, a liquid-ETF assumption — hard-to-borrow single names can cost far more or
+be unborrowable; see the module note on trend_ls/xsmom_ls). All signals act on the
+NEXT day (shift by one), so there is no lookahead.
 
 --mode walk splits the full window into sequential folds and checks whether each
 strategy's edge over buy-and-hold is CONSISTENT across time (not just a good
@@ -38,6 +49,7 @@ average) — with no per-fold parameter fitting, since there's nothing to fit.
     python -m bot.lab --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
     python -m bot.lab --strategies trend_vol ensemble --target-vol 0.12
     python -m bot.lab --mode walk --folds 5 --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+    python -m bot.lab --strategies trend_ls xsmom_ls --symbols SPY QQQ GLD TLT IWM EFA --data-source yahoo --start 2005-01-01
 """
 
 import argparse
@@ -48,7 +60,7 @@ import numpy as np
 import pandas as pd
 
 import config
-from bot.momentum_rotation import build_panel
+from bot.momentum_rotation import build_panel, momentum, _DAYS_PER_MONTH
 from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
                                    plot_equity, _parse_date, INITIAL_EQUITY, SLIPPAGE)
 
@@ -224,6 +236,73 @@ def min_var(panel, cov_lookback=60) -> pd.Series:
     return _monthly_cov_strategy(panel, cov_lookback, _minvar_weights)
 
 
+# --- long/short strategies ----------------------------------------------------- #
+# HONEST NOTE on short_borrow: this charges an annual cost on short notional
+# (like the leverage borrow_rate, but economically distinct — it's a securities-
+# lending fee, not margin interest). The 1%/yr default assumes cheap, liquid,
+# easy-to-borrow names (broad index/sector ETFs). Real single stocks — especially
+# heavily-shorted or small-cap ones — can cost far more (double digits) or simply
+# not be borrowable, and a broker can recall shares/force-cover at the worst time.
+# Treat any result here as an upper bound on a real short book's performance.
+def trend_ls(panel, ma_period=200, short_borrow=0.01) -> pd.Series:
+    """Time-series trend, long AND short: long an asset above its long MA, short
+    it below (instead of sitting in cash) — the classic managed-futures/CTA
+    construction. Equal-weighted across every asset with an active signal."""
+    rets = daily_returns(panel)
+    ma = panel.rolling(ma_period, min_periods=ma_period).mean()
+    signal = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    signal[panel > ma] = 1.0
+    signal[panel < ma] = -1.0
+    active = signal.abs().sum(axis=1).replace(0, np.nan)
+    w = signal.div(active, axis=0).fillna(0.0).shift(1).fillna(0.0)
+    gross = (w * rets).sum(axis=1)
+    short_notional = w.clip(upper=0).abs().sum(axis=1)
+    financing = short_notional * (short_borrow / _ANNUAL)
+    return gross - financing - _turn_cost(w)
+
+
+def xsmom_weights(panel, lookback_months=12, skip_months=1, top_frac=0.3) -> pd.DataFrame:
+    """Pre-shift target weights for the cross-sectional momentum long/short book:
+    monthly rebalance, long the top `top_frac` and short the bottom `top_frac` of
+    the universe by trailing (skip-adjusted) momentum, 0.5 notional a side (net
+    zero -> dollar-neutral). Exposed separately from xsmom_ls so the weight
+    construction (neutrality, ranking) is directly testable."""
+    lookback = lookback_months * _DAYS_PER_MONTH
+    skip = skip_months * _DAYS_PER_MONTH
+    n = len(panel.columns)
+    k = max(1, int(round(n * top_frac)))
+    weights = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    cur = pd.Series(0.0, index=panel.columns)
+    last_period = None
+    for i, ts in enumerate(panel.index):
+        period = (ts.year, ts.month)
+        if last_period is not None and period != last_period:
+            scores = momentum(panel, i - 1, lookback, skip)
+            if scores is not None:
+                ranked = scores.sort_values(ascending=False)
+                w = pd.Series(0.0, index=panel.columns)
+                w[ranked.index[:k]] = 0.5 / k
+                w[ranked.index[-k:]] = -0.5 / k
+                cur = w
+        weights.iloc[i] = cur.values
+        last_period = period
+    return weights
+
+
+def xsmom_ls(panel, lookback_months=12, skip_months=1, top_frac=0.3,
+            short_borrow=0.01) -> pd.Series:
+    """Classic cross-sectional momentum factor (12-1, Jegadeesh & Titman-style):
+    each month, rank assets by trailing (skip-adjusted) momentum, go long the top
+    `top_frac` and short the bottom `top_frac`, each equal-weighted and matched to
+    0.5 notional a side — a market-neutral (dollar-neutral) long/short book."""
+    rets = daily_returns(panel)
+    weights = xsmom_weights(panel, lookback_months, skip_months, top_frac).shift(1).fillna(0.0)
+    gross = (weights * rets).sum(axis=1)
+    short_notional = weights.clip(upper=0).abs().sum(axis=1)
+    financing = short_notional * (short_borrow / _ANNUAL)
+    return gross - financing - _turn_cost(weights)
+
+
 def ensemble(components: dict) -> pd.Series:
     """Equal-weight blend of several strategies' daily return series."""
     return pd.concat(components.values(), axis=1).mean(axis=1)
@@ -238,6 +317,8 @@ _STRATEGIES = {
     "managed_futures": managed_futures,
     "mean_reversion": mean_reversion,
     "trend_vol": trend_vol,
+    "trend_ls": trend_ls,
+    "xsmom_ls": xsmom_ls,
 }
 
 
@@ -398,6 +479,12 @@ def main():
     ap.add_argument("--vol-lookback", type=int, default=20)
     ap.add_argument("--max-leverage", type=float, default=2.0)
     ap.add_argument("--borrow-rate", type=float, default=0.06)
+    ap.add_argument("--short-borrow", type=float, default=0.01,
+                    help="Annual securities-lending cost on short notional (trend_ls, "
+                         "xsmom_ls). Default 1%%/yr assumes cheap, liquid, easy-to-borrow "
+                         "names — real single stocks can cost far more or be unborrowable.")
+    ap.add_argument("--top-frac", type=float, default=0.3,
+                    help="xsmom_ls: fraction of the universe held long / short each side.")
     ap.add_argument("--months", type=int, default=240)
     ap.add_argument("--start", type=str, default=None)
     ap.add_argument("--end", type=str, default=None)
@@ -417,7 +504,8 @@ def main():
     names = [s for s in args.strategies if s in _STRATEGIES]
     params = dict(ma_period=args.ma_period, target_vol=args.target_vol,
                   vol_lookback=args.vol_lookback, max_leverage=args.max_leverage,
-                  borrow_rate=args.borrow_rate,
+                  borrow_rate=args.borrow_rate, short_borrow=args.short_borrow,
+                  top_frac=args.top_frac,
                   with_ensemble="ensemble" in args.strategies)
 
     if args.mode == "walk":

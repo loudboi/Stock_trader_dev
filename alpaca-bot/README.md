@@ -255,6 +255,48 @@ in crises, roughly even the rest of the time" — a real, explainable pattern, n
 noise, but a more modest claim than the single full-window number implies.**
 Research/backtest only.
 
+### Long/short strategies (`trend_ls`, `xsmom_ls`) — tried, and they don't work here
+
+Every strategy above is long-or-cash. Two long/short extensions were added and
+tested the same disciplined way (fixed textbook parameters, no tuning, two
+universes, full-window AND walk-forward):
+
+- **`trend_ls`** — the same 200-day MA filter as `trend_vol`/`managed_futures`, but
+  SHORTS below the MA instead of moving to cash (the classic managed-futures/CTA
+  construction).
+- **`xsmom_ls`** — the classic academic cross-sectional momentum factor: monthly,
+  long the strongest-momentum assets and short the weakest, equal dollar amounts
+  each side (market-neutral), 12-1 lookback.
+
+Both charge a `--short-borrow` cost (default 1%/yr) on short notional, separate
+from the leverage `--borrow-rate` — see the honest caveat on that assumption in the
+module docstring (real single-name borrow costs can be far higher or unavailable).
+
+**Result: neither beat buy-and-hold in either universe, on the full-window average
+OR in a single walk-forward fold (0/5 in both cases for both strategies).**
+`xsmom_ls` went outright negative on the broader universe (Sharpe −0.13, −60.8%
+max drawdown). This is not a tuning problem — the causes are structural, and worth
+understanding rather than parameter-chasing away:
+
+1. **Every asset here (SPY, QQQ, GLD, TLT, IWM, EFA, EEM, IEF) has had persistent,
+   structural positive drift over 2005–2026.** Shorting any of them — even
+   temporarily, in `trend_ls`'s downtrend legs — systematically fights that drift.
+   This is the standard reason "don't short a rising asset class" is conventional
+   wisdom, and it's exactly what the backtest shows.
+2. **`xsmom_ls` needs genuine breadth to work.** The academic momentum factor is
+   built and validated on hundreds of individual stocks, where the long/short
+   split captures real relative winners/losers while the broad market factor
+   mostly cancels out. With only 4–8 broad, correlated ASSET-CLASS ETFs, there's
+   barely a cross-section — the long and short legs are thin, concentrated, and
+   whipsaw hard, which is exactly the huge drawdowns observed.
+
+**If you want a fair test of long/short, this project's current universes are the
+wrong instrument for it** — it would need either a broad basket of many individual
+stocks (for `xsmom_ls` to have real breadth) or instruments without persistent
+one-directional drift, like currencies or individual commodities (for `trend_ls`
+to have a genuine two-sided market to trade). Neither is set up here yet.
+Research/backtest only.
+
 ## Momentum rotation (`bot/momentum_rotation.py`)
 
 Dual-momentum rotation: each month, hold the top-`k` assets by trailing return,

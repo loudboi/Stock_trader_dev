@@ -187,6 +187,107 @@ def test_rp_voltarget_scales_toward_target_vol():
 
 
 # --------------------------------------------------------------------------- #
+# Long/short: time-series trend (trend_ls)
+# --------------------------------------------------------------------------- #
+def test_trend_ls_flat_during_ma_warmup():
+    panel = _panel({"A": np.linspace(100, 150, 40)})
+    r = lab.trend_ls(panel, ma_period=20, short_borrow=0.0)
+    assert (r.iloc[:20] == 0.0).all()          # no MA yet -> no signal -> flat
+
+
+def test_trend_ls_profits_from_a_downtrend_via_shorting():
+    # A steady decline below its own MA -> the strategy should be short and
+    # therefore make money as price falls (the whole point of allowing shorts).
+    down = np.linspace(150, 80, 250)
+    panel = _panel({"A": down})
+    r = lab.trend_ls(panel, ma_period=20, short_borrow=0.0)
+    eq = (1 + r.iloc[25:]).cumprod()
+    assert eq.iloc[-1] > eq.iloc[0]             # net gain while shorting the decline
+
+
+def test_trend_ls_short_borrow_costs_money_when_short():
+    down = np.linspace(150, 80, 250)
+    panel = _panel({"A": down})
+    no_fee = lab.trend_ls(panel, ma_period=20, short_borrow=0.0)
+    fee = lab.trend_ls(panel, ma_period=20, short_borrow=0.20)   # steep cost, easy to see
+    eq_no_fee = (1 + no_fee).cumprod().iloc[-1]
+    eq_fee = (1 + fee).cumprod().iloc[-1]
+    assert eq_fee < eq_no_fee
+
+
+def test_trend_ls_equal_weights_long_and_short_sides():
+    # Two assets, one clearly up (long) and one clearly down (short): the strategy
+    # should hold both sides (unlike a long-only/cash trend filter, which would
+    # only hold the winner and sit the loser out in cash).
+    up = np.linspace(100, 200, 250)
+    down = np.linspace(100, 50, 250)
+    panel = _panel({"UP": up, "DOWN": down})
+    ma = panel.rolling(20, min_periods=20).mean()
+    signal = pd.DataFrame(0.0, index=panel.index, columns=panel.columns)
+    signal[panel > ma] = 1.0
+    signal[panel < ma] = -1.0
+    last = signal.iloc[-1]
+    assert last["UP"] > 0 and last["DOWN"] < 0
+
+
+# --------------------------------------------------------------------------- #
+# Long/short: cross-sectional momentum (xsmom_ls)
+# --------------------------------------------------------------------------- #
+def test_xsmom_weights_are_dollar_neutral_after_a_rebalance():
+    rng = np.random.default_rng(20)
+    n = 400
+    panel = _panel({s: 100 * np.cumprod(1 + rng.normal(d, 0.01, n))
+                    for s, d in zip("ABCD", [0.001, 0.0005, -0.0005, -0.001])})
+    w = lab.xsmom_weights(panel, lookback_months=3, skip_months=0, top_frac=0.3)
+    active_rows = w[(w != 0).any(axis=1)]
+    assert len(active_rows) > 0
+    # Long book (0.5) == short book (0.5) every time a position is active -> net
+    # notional is exactly zero (market-neutral), and the long/short legs balance.
+    assert np.allclose(active_rows.sum(axis=1).values, 0.0)
+    assert np.allclose(active_rows.clip(lower=0).sum(axis=1).values, 0.5)
+    assert np.allclose(active_rows.clip(upper=0).sum(axis=1).values, -0.5)
+
+
+def test_xsmom_ls_longs_the_winner_shorts_the_loser():
+    rng = np.random.default_rng(21)
+    n = 300
+    # Four assets with a clear, persistent momentum ranking.
+    panel = _panel({
+        "WINNER": 100 * np.cumprod(1 + rng.normal(0.002, 0.005, n)),
+        "MID_HIGH": 100 * np.cumprod(1 + rng.normal(0.0005, 0.005, n)),
+        "MID_LOW": 100 * np.cumprod(1 + rng.normal(-0.0005, 0.005, n)),
+        "LOSER": 100 * np.cumprod(1 + rng.normal(-0.002, 0.005, n)),
+    })
+    lookback, skip = 3 * lab._DAYS_PER_MONTH, 0
+    base_i = 200
+    scores = lab.momentum(panel, base_i, lookback, skip)
+    assert scores["WINNER"] > scores["MID_HIGH"] > scores["MID_LOW"] > scores["LOSER"]
+
+
+def test_xsmom_ls_short_borrow_costs_money():
+    rng = np.random.default_rng(22)
+    n = 300
+    panel = _panel({s: 100 * np.cumprod(1 + rng.normal(d, 0.008, n))
+                    for s, d in zip("ABCD", [0.0015, 0.0005, -0.0005, -0.0015])})
+    no_fee = lab.xsmom_ls(panel, lookback_months=3, skip_months=0, short_borrow=0.0)
+    fee = lab.xsmom_ls(panel, lookback_months=3, skip_months=0, short_borrow=0.20)
+    eq_no_fee = (1 + no_fee).cumprod().iloc[-1]
+    eq_fee = (1 + fee).cumprod().iloc[-1]
+    assert eq_fee < eq_no_fee
+
+
+def test_xsmom_ls_no_lookahead_flat_before_first_rebalance():
+    rng = np.random.default_rng(23)
+    n = 200
+    panel = _panel({s: 100 * np.cumprod(1 + rng.normal(0, 0.01, n)) for s in "ABCD"})
+    r = lab.xsmom_ls(panel, lookback_months=3, skip_months=0, short_borrow=0.0)
+    # No momentum score can exist before 3 months (63 trading days) of history, so
+    # a conservative early prefix (well short of that, regardless of exactly where
+    # a calendar-month boundary falls in business days) must be exactly flat.
+    assert (r.iloc[:40] == 0.0).all()
+
+
+# --------------------------------------------------------------------------- #
 # Ensemble + run
 # --------------------------------------------------------------------------- #
 def test_ensemble_is_the_mean_of_components():
