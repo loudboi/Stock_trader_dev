@@ -772,29 +772,47 @@ market downturns via trend-exposure also happens to dodge some USD downside
 days) — but it isn't enough:
 
 **Combined with tax, unhedged currency risk REVERSES the core-satellite
-finding — plain buy-and-hold becomes the single best choice, beating every
-core-satellite split, on both primary universes, under BOTH exposure models.**
-4-asset universe (`eur_naive`): buy-and-hold's after-tax-after-FX Sharpe is
-0.826, and the core-satellite Sharpe falls MONOTONICALLY as satellite weight
-increases (0.818 at 90/10, all the way down to 0.615 at 0/100) — every single
-split underperforms pure buy-and-hold. Same shape holds for `eur_smart` (0.826
-vs. a monotonic decline to 0.659) and on the 8-asset universe under both
-models. The core-satellite edge found in the tax-only analysis above was real
-but was implicitly relying on a USD-based investor; once real currency risk is
-priced in for the user's actual EUR base currency, it evaporates.
+finding on the two moderate-edge universes — plain buy-and-hold becomes the
+best choice there, beating every core-satellite split, under BOTH exposure
+models.** 4-asset universe (`eur_naive`): buy-and-hold's after-tax-after-FX
+Sharpe is 0.826, and the core-satellite Sharpe falls MONOTONICALLY as
+satellite weight increases (0.818 at 90/10, all the way down to 0.615 at
+0/100) — every single split underperforms pure buy-and-hold. Same shape holds
+for `eur_smart` (0.826 vs. a monotonic decline to 0.659) and on the 8-asset
+universe under both models. The core-satellite edge found in the tax-only
+analysis above was real but was implicitly relying on a USD-based investor;
+once real currency risk is priced in for the user's actual EUR base currency,
+it evaporates on these two universes.
+
+**But this isn't universal — it tracks the same "edge size" rule already
+found for tax alone.** Re-checked on the other 2 universes under `eur_naive`:
+on the 15-asset mega-universe (the LARGEST pre-tax edge found anywhere in this
+project), core-satellite still narrowly beats buy-and-hold even with unhedged
+currency risk (0.579 vs. 0.571 at 50% core) — its edge is simply too large for
+tax + currency combined to fully erase. On the international-11 universe
+(already the thinnest edge, and already a loser under tax alone), it remains a
+loser under currency too (0.463 best vs. 0.466 for pure B&H). **Refined rule:
+whether core-satellite survives BOTH tax and unhedged currency risk depends on
+the same edge-size threshold as the tax-only analysis — thin/moderate edges
+(4-asset, 8-asset, international) don't survive, but a large enough edge
+(mega-universe) still does.**
 
 **Currency-hedging (`--currency eur_hedged`, a fixed 1.5%/yr cost drag
 approximating the historical USD-EUR short-rate differential via covered
-interest rate parity) partially restores the core-satellite edge, but much
-thinner than the tax-only picture suggested.** 4-asset universe: core-satellite
-peaks at 0.820 (60–70% core) vs. pure buy-and-hold's 0.817 — a real but tiny
-margin, not the 0.948-vs-0.938 gap found pre-currency. 8-asset universe: peaks
-at 0.649 (50% core) vs. 0.634 — similarly thin. **Practical conclusion: for
-this user's actual situation (Slovenian, EUR-based), core-satellite is only
-worth pursuing at all if currency-hedged (e.g. EUR-hedged ETF share classes, a
-real, commercially available product in Europe) — left unhedged, plain,
-literal buy-and-hold is simply the better, simpler answer once both tax and
-currency are honestly accounted for.**
+interest rate parity) partially restores the core-satellite edge on the two
+universes where unhedged currency reversed it, but much thinner than the
+tax-only picture suggested.** 4-asset universe: core-satellite peaks at 0.820
+(60–70% core) vs. pure buy-and-hold's 0.817 — a real but tiny margin, not the
+0.948-vs-0.938 gap found pre-currency. 8-asset universe: peaks at 0.649 (50%
+core) vs. 0.634 — similarly thin. **Practical conclusion: for this user's
+actual situation (Slovenian, EUR-based) trading the 4-asset or 8-asset
+universe, core-satellite is only worth pursuing at all if currency-hedged
+(e.g. EUR-hedged ETF share classes, a real, commercially available product in
+Europe) — left unhedged, plain, literal buy-and-hold is simply the better,
+simpler answer there. On a large-enough-edge universe (the mega-universe),
+core-satellite is worth it even unhedged, though a real implementation would
+still be safer hedged given how much currency volatility eats into the
+margin.**
 
 **Honest caveats on the currency model:** the 1.5%/yr hedging cost is a fixed,
 illustrative approximation (matching this project's existing convention for
