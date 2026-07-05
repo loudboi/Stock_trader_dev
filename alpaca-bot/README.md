@@ -359,6 +359,41 @@ python -m bot.lab --strategies regime_leverage_rp --regime-indicator vix \
   periods fixes most of the "shorting a drifting asset" problem — just not enough
   to become an outright market-beater by itself.
 
+### Dynamic allocation between the two good strategies (`bot/dynamic_combo.py`)
+
+A genuinely different mechanism from the macro overlays above: instead of
+gating/levering ONE strategy on a macro signal (which failed 12/12), use a
+real-time, causal signal to shift the CAPITAL SPLIT between the RP+TE combo's
+two already-good ingredients. Two signals, fixed thresholds chosen before any
+result — **importantly, neither uses hindsight; both are the kind of
+information a real trader would have had in real time, with no hardcoded
+historical event dates**:
+
+- **`breadth`** — the fraction of a *reference* universe (9 SPDR sector ETFs,
+  independent of the traded assets, avoiding a self-referential signal) trading
+  above its own 200-day MA. Below 40% → lean risk-based (0.7/0.3); above 60% →
+  lean trend-following (0.3/0.7); else the validated 50/50.
+- **`vix_term`** — the VIX/VIX3M term-structure ratio (backwardation vs.
+  contango — a different dimension from the VIX *level* check above).
+
+```bash
+python -m bot.dynamic_combo --signal breadth --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+python -m bot.dynamic_combo --mode walk --signal breadth --symbols SPY QQQ GLD TLT --data-source yahoo --start 2005-01-01
+```
+
+**Result: another clean negative — dynamic allocation never beat the static
+50/50 blend, in any test.** Full-window: breadth-based allocation trailed on
+both universes (1.11 vs 1.18 on universe 1; 0.86 vs 0.99 on universe 2), and
+VIX-term-based allocation also trailed (1.06 vs 1.18). Walk-forward: **0/5
+folds** beaten. This is actually informative, not just another dead end: it
+means the static 50/50 split is already close to the efficient allocation
+between these two ingredients given their relative quality and correlation —
+timing *when* to favor one over the other adds turnover cost without a
+compensating edge, consistent with the well-documented difficulty of tactical
+asset allocation relative to static diversification (e.g. Ibbotson & Kaplan).
+**The practical takeaway: don't try to time the RP/TE mix — the fixed 50/50
+blend is the strategy.** Research/backtest only.
+
 ## Combining proven strategies (`bot/combo.py`)
 
 The strongest, most validated result of this entire project. Two DIFFERENT

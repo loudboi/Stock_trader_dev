@@ -4,17 +4,21 @@ bot/regime.py
 Free macro-regime indicators, for conditioning/combining strategies in bot/lab.py
 on the broader macro backdrop (not just price action of the traded universe).
 
-Three indicators, each with FIXED, CONVENTIONAL thresholds chosen from standard
+Four indicators, each with FIXED, CONVENTIONAL thresholds chosen from standard
 industry/academic usage — decided before running any backtest, not fit to make
 one look good:
 
-  vix_regime()     VIX level: "calm" < 15, "elevated" > 25 (widely-cited industry
-                   cutoffs; VIX's own long-run median is ~17-19).
-  curve_regime()   10Y minus 13-week Treasury yield (^TNX - ^IRX). Negative =
-                   inverted, the classic (NY Fed-documented) recession signal.
-  credit_regime()  HYG (high-yield) relative performance vs IEF (duration-matched
-                   Treasury) over a trailing window — a "flight to quality"/credit-
-                   spread-widening proxy. HYG only exists from 2007-04-11.
+  vix_regime()      VIX level: "calm" < 15, "elevated" > 25 (widely-cited industry
+                    cutoffs; VIX's own long-run median is ~17-19).
+  curve_regime()    10Y minus 13-week Treasury yield (^TNX - ^IRX). Negative =
+                    inverted, the classic (NY Fed-documented) recession signal.
+  credit_regime()   HYG (high-yield) relative performance vs IEF (duration-matched
+                    Treasury) over a trailing window — a "flight to quality"/credit-
+                    spread-widening proxy. HYG only exists from 2007-04-11.
+  vix_term_regime() VIX / VIX3M ratio: > 1.0 is backwardation (near-term fear
+                    exceeds the 3-month view — a well-documented stress signal
+                    distinct from the VIX LEVEL check above), < 1.0 is the normal
+                    contango state. ^VIX3M only exists from 2007-01-03.
 
 All fetched via bot.data.load_yahoo (free, daily). Pure classification functions
 operate on a price/yield Series so they're unit-testable without network.
@@ -58,6 +62,14 @@ def fetch_credit(start, end) -> pd.Series:
     return rel.rename("credit")
 
 
+def fetch_vix_term_ratio(start, end) -> pd.Series:
+    """VIX / VIX3M. ^VIX3M only exists from 2007-01-03."""
+    vix = load_yahoo("^VIX", start, end)["close"]
+    vix3m = load_yahoo("^VIX3M", start, end)["close"]
+    df = pd.concat([vix.rename("vix"), vix3m.rename("vix3m")], axis=1).ffill().dropna()
+    return (df["vix"] / df["vix3m"]).rename("vix_term")
+
+
 # --------------------------------------------------------------------------- #
 # Pure classifiers (testable offline)
 # --------------------------------------------------------------------------- #
@@ -77,6 +89,13 @@ def curve_regime(curve: pd.Series) -> pd.Series:
 def credit_regime(credit: pd.Series, threshold=0.0) -> pd.Series:
     """+1 credit outperforming Treasuries (risk-on), -1 credit stress (risk-off)."""
     return pd.Series(np.where(credit >= threshold, 1, -1), index=credit.index)
+
+
+def vix_term_regime(ratio: pd.Series, backwardation=1.0) -> pd.Series:
+    """-1 backwardation (ratio > 1.0, stress -- near-term fear exceeds the 3-month
+    view), +1 contango (normal/calm). A structural signal, distinct from the VIX
+    LEVEL check in vix_regime()."""
+    return pd.Series(np.where(ratio > backwardation, -1, 1), index=ratio.index)
 
 
 def align_to_panel(regime: pd.Series, panel_index: pd.DatetimeIndex) -> pd.Series:

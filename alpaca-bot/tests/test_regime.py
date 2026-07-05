@@ -32,6 +32,12 @@ def test_credit_regime_threshold():
     assert list(out.values) == [1, -1, 1, -1]
 
 
+def test_vix_term_regime_backwardation_vs_contango():
+    ratio = pd.Series([0.85, 0.95, 1.0, 1.01, 1.20], index=_idx(5))
+    out = rg.vix_term_regime(ratio, backwardation=1.0)
+    assert list(out.values) == [1, 1, 1, -1, -1]     # only STRICTLY > 1.0 is stress
+
+
 def test_align_to_panel_forward_fills_across_gaps():
     macro_idx = pd.date_range("2020-01-01", periods=3, freq="3B")   # sparser calendar
     regime = pd.Series([1, -1, 1], index=macro_idx)
