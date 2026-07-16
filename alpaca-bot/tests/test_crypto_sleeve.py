@@ -87,6 +87,23 @@ def test_print_walk_higher_weight_changes_result(capsys):
     assert "btc_weight=30%" in out
 
 
+def test_print_score_bh_row_uses_same_window_when_btc_starts_later(capsys):
+    # BTC history starting AFTER the equities must shrink EVERY row's window to
+    # the common overlap -- including buy_and_hold's, or the table compares a
+    # long B&H window against short blend windows (apples to oranges).
+    daily_data = _daily_data(n=800, seed=20)
+    btc_full = _btc_daily(n=800, seed=21)
+    btc_late = btc_full.iloc[400:]               # BTC data starts 400 bars later
+    books = combo.compute_books(daily_data)
+    idx = list(daily_data.values())[0].index
+    cs.print_score(daily_data, books, btc_late, begin_ts=idx[0], end_ts=idx[-1])
+    out = capsys.readouterr().out
+    # The printed window must start at BTC's (late) start, not the equity start.
+    window_line = [l for l in out.splitlines() if "window:" in l][0]
+    assert str(btc_late.index[0].date()) in window_line
+    assert str(idx[0].date()) not in window_line
+
+
 def test_print_aftertax_runs_without_error(capsys):
     daily_data = _daily_data(n=1200, seed=10)
     btc = _btc_daily(n=1200, seed=11)

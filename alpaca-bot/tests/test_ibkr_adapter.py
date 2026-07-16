@@ -156,6 +156,25 @@ def test_market_hours():
     print("market_open_from_hours OK")
 
 
+def test_exchange_now_resolves_exchange_timezone():
+    # IBKR expresses liquidHours in the exchange's own timezone (timeZoneId),
+    # so the "now" we compare against must be exchange-local wall time, not
+    # server-local -- on a UTC VPS trading a CET exchange these differ by 1-2h.
+    from datetime import timezone as _tz
+    now_utc = datetime.now(_tz.utc)
+    now_est = pix.exchange_now("US/Eastern")
+    assert now_est.tzinfo is not None
+    assert abs((now_est - now_utc).total_seconds()) < 5   # same instant, EST wall clock
+
+
+def test_exchange_now_falls_back_to_local_on_bad_or_missing_tz():
+    for tz_id in ("", None, "Not/AZone"):
+        got = pix.exchange_now(tz_id)
+        assert got.tzinfo is None            # naive local time, same as before the fix
+        assert abs((got - datetime.now()).total_seconds()) < 5
+    print("exchange_now OK")
+
+
 # --------------------------------------------------------------------------- #
 # Adapter methods (against FakeIB)
 # --------------------------------------------------------------------------- #

@@ -4,3 +4,4 @@
 #   pip install -r requirements.txt -r requirements-ibkr.txt
 #
 ib_async>=2.0
+tzdata>=2024.1     # zoneinfo data for exchange_now() on systems without a tz db (Windows)

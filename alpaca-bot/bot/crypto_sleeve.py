@@ -99,7 +99,10 @@ def print_score(daily_data, books, btc_daily, begin_ts, end_ts):
     common = blend.index.intersection(btc_sleeve.index)
     common = common[(common >= begin_ts) & (common <= end_ts)]
     blend, btc_sleeve = blend.loc[common], btc_sleeve.loc[common]
-    bh_ret = bh_ret[(bh_ret.index >= begin_ts) & (bh_ret.index <= end_ts)]
+    # Same window for the buy-and-hold row: if BTC's history starts after
+    # begin_ts, every row must cover the SAME (BTC-limited) period or the
+    # comparison is apples-to-oranges.
+    bh_ret = bh_ret[(bh_ret.index >= common[0]) & (bh_ret.index <= common[-1])]
 
     corr = blend.corr(btc_sleeve)
 
@@ -140,10 +143,11 @@ def print_walk(daily_data, books, btc_daily, start_dt, end_dt, folds, btc_weight
     wins = 0
     checks = 0
     for k, (fs, fe) in enumerate(fold_bounds(start_dt, end_dt, folds)):
-        m_pure = compute_metrics([], slice_equity(blend, fs, fe))
-        m_mix = compute_metrics([], slice_equity(mixed, fs, fe))
-        if not len(slice_equity(blend, fs, fe)):
+        pure_eq = slice_equity(blend, fs, fe)
+        if not len(pure_eq):
             continue
+        m_pure = compute_metrics([], pure_eq)
+        m_mix = compute_metrics([], slice_equity(mixed, fs, fe))
         beat = m_mix["sharpe"] > m_pure["sharpe"]
         wins += int(beat)
         checks += 1

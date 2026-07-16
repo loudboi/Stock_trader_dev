@@ -121,12 +121,30 @@ def duration_str(start, end) -> str:
     return f"{years} Y"
 
 
+def exchange_now(tz_id: str):
+    """Current wall-clock time at the exchange whose ContractDetails.timeZoneId
+    is `tz_id` — IBKR's liquidHours/tradingHours strings are expressed in THAT
+    timezone, not the server's. Falls back to naive local time if the id is
+    missing or can't be resolved (matching the parser's best-effort contract:
+    a wrong-but-close answer near open/close beats refusing to trade all day)."""
+    if tz_id:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tz_id))
+        except Exception:  # noqa: BLE001 - unknown/legacy tz id, missing tzdata
+            log.warning("Could not resolve exchange timezone %r; using local time.",
+                        tz_id)
+    return datetime.now()
+
+
 def market_open_from_hours(hours_str: str, now_local) -> bool | None:
     """Best-effort parse of an IBKR liquidHours/tradingHours string.
 
     Format examples (semicolon-separated days):
         "20260625:0900-20260625:1730;20260626:CLOSED"
         "20260625:0900-1730;20260626:CLOSED"
+    `now_local` must be the current time IN THE EXCHANGE'S OWN TIMEZONE (see
+    exchange_now) — the hours string is written in exchange-local wall time.
     Returns True/False, or None if it can't be determined (caller should then
     fall back to allowing the trade rather than silently blocking).
     """
@@ -267,12 +285,13 @@ class IBKRPortfolio:
                 details = self.ib.reqContractDetails(c)
                 if details:
                     d = details[0]
-                    self._hours[inst.name] = (getattr(d, "liquidHours", "") or
-                                              getattr(d, "tradingHours", ""))
+                    self._hours[inst.name] = (
+                        getattr(d, "liquidHours", "") or getattr(d, "tradingHours", ""),
+                        getattr(d, "timeZoneId", "") or "")
                 else:
-                    self._hours[inst.name] = ""
-            hours = self._hours[inst.name]
-            verdict = market_open_from_hours(hours, datetime.now())
+                    self._hours[inst.name] = ("", "")
+            hours, tz_id = self._hours[inst.name]
+            verdict = market_open_from_hours(hours, exchange_now(tz_id))
             # None == couldn't determine → allow (don't silently block trading);
             # IBKR will reject/queue an order if the market is genuinely closed.
             return True if verdict is None else verdict
