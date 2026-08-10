@@ -51,11 +51,15 @@ def test_stop1_close_below_ntrans():
 
 
 def test_same_bar_target_and_price_stop_uses_adverse_stop():
-    df = _df([99, 101, 100, 89], opens=[99, 100, 100, 100],
-             high=[99, 101, 111, 111], low=[99, 100, 85, 85])
+    # Day 1 close confirms the crossing. Day 2 opens the trade, trades through the
+    # +GEX target intraday, but also closes below nTrans. OHLC cannot establish a
+    # favorable target-first sequence, so the adverse stop outcome must be used.
+    df = _df([99, 101, 89], opens=[99, 100, 100],
+             high=[99, 101, 111], low=[99, 100, 85])
     trades = bt.simulate(df)
     assert len(trades) == 1
     assert trades[0]["reason"].startswith("ambiguous target/stop")
+    assert trades[0]["entry"] == 100
     assert trades[0]["exit"] == 89
 
 
@@ -113,7 +117,6 @@ def test_load_real_levels_are_timezone_safe_and_never_used_same_snapshot_date(tm
     loader = lambda ticker, start, end: px
     panel = bt.load_real(str(tmp_path), price_loader=loader, max_level_age_days=4)
     df = panel["X"]
-    # Jan 5 snapshot must NOT be usable on Jan 5; it starts Jan 6.
     assert pd.isna(df.loc[pd.Timestamp("2026-01-05", tz="UTC"), "ptrans"])
     assert df.loc[pd.Timestamp("2026-01-06", tz="UTC"), "ptrans"] == 100
     assert df.loc[pd.Timestamp("2026-01-07", tz="UTC"), "ptrans"] == 101
