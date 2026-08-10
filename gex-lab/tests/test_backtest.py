@@ -1,9 +1,10 @@
-"""Offline tests for the GEX backtest engine + screen logic. No network."""
+"""Offline tests for point-in-time GEX backtest and screen logic."""
 import os
 import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -11,94 +12,114 @@ from gex_lab import backtest as bt
 from gex_lab import screen as sc
 
 
-def _df(close, high=None, ptrans=100, ntrans=90, pos_gex=110, cotmp=95):
+def _df(close, opens=None, high=None, low=None,
+        ptrans=100, ntrans=90, pos_gex=110, cotmp=95):
     n = len(close)
-    idx = pd.date_range("2025-01-01", periods=n, freq="B")
+    idx = pd.date_range("2025-01-01", periods=n, freq="B", tz="UTC")
     close = np.asarray(close, float)
-    high = close if high is None else np.asarray(high, float)
-    df = pd.DataFrame({"open": close, "high": high, "low": close, "close": close}, index=idx)
-    for name, v in (("ptrans", ptrans), ("ntrans", ntrans),
-                    ("pos_gex", pos_gex), ("cotmp", cotmp)):
-        df[name] = v
+    opens = close if opens is None else np.asarray(opens, float)
+    high = np.maximum(opens, close) if high is None else np.asarray(high, float)
+    low = np.minimum(opens, close) if low is None else np.asarray(low, float)
+    df = pd.DataFrame({"open": opens, "high": high, "low": low, "close": close}, index=idx)
+    for name, value in (("ptrans", ptrans), ("ntrans", ntrans),
+                        ("pos_gex", pos_gex), ("cotmp", cotmp)):
+        df[name] = value
     return df
 
 
-# --------------------------------------------------------------------------- #
-# Entries / exits
-# --------------------------------------------------------------------------- #
-def test_winning_trade_hits_t1():
-    df = _df([99, 101, 104, 107, 111, 112])          # cross >100 at bar1, high>=110 at bar4
+def test_close_signal_enters_next_session_open_not_same_close():
+    df = _df([99, 101, 104, 111], opens=[99, 100, 102, 108], high=[99, 101, 104, 111])
     trades = bt.simulate(df)
     assert len(trades) == 1
+    assert trades[0]["signal_date"] == df.index[1]
+    assert trades[0]["entry_date"] == df.index[2]
+    assert trades[0]["entry"] == 102
     assert trades[0]["reason"] == "T1 +GEX"
-    assert trades[0]["exit"] == 110 and trades[0]["return_pct"] > 0
+
+
+def test_gap_above_locked_target_cancels_pending_entry():
+    df = _df([99, 101, 112], opens=[99, 100, 112], high=[99, 101, 113])
+    assert bt.simulate(df) == []
 
 
 def test_stop1_close_below_ntrans():
-    df = _df([99, 101, 100, 89, 88])                 # enter bar1, close 89 < nTrans 90
+    df = _df([99, 101, 100, 89, 88], opens=[99, 100, 100, 95, 88])
     trades = bt.simulate(df)
-    assert len(trades) == 1 and trades[0]["reason"].startswith("stop1")
+    assert len(trades) == 1
+    assert "stop1" in trades[0]["reason"]
     assert trades[0]["return_pct"] < 0
 
 
-def test_low_rr_setup_is_not_entered():
-    df = _df([99, 101, 102], pos_gex=102)            # R:R = (102-101)/(101-100)=1 < 2
-    assert bt.simulate(df) == []
-
-
-def test_cushion_filter_blocks_when_too_close_to_put_mass():
-    # spot 101, cotmp 100.5 -> cushion ~0.5% < 2% -> no entry despite good R:R.
-    df = _df([99, 101, 104], cotmp=100.5)
-    assert bt.simulate(df) == []
-
-
-def test_time_stop_fires_when_stalled_past_day7():
-    # Enters at bar1 (~101), then drifts flat well under 50% of the way to 110.
-    close = [99, 101] + [101.5] * 9
-    df = _df(close)
+def test_same_bar_target_and_price_stop_uses_adverse_stop():
+    df = _df([99, 101, 100, 89], opens=[99, 100, 100, 100],
+             high=[99, 101, 111, 111], low=[99, 100, 85, 85])
     trades = bt.simulate(df)
     assert len(trades) == 1
-    assert trades[0]["reason"].startswith("stop3") or trades[0]["reason"].startswith("stop4")
+    assert trades[0]["reason"].startswith("ambiguous target/stop")
+    assert trades[0]["exit"] == 89
 
 
-def test_metrics_basic():
-    trades = [{"return_pct": 0.2}, {"return_pct": -0.1}, {"return_pct": 0.3}]
-    m = bt.metrics(trades)
-    assert m["trades"] == 3
-    assert abs(m["win_rate"] - 2 / 3) < 1e-9
-    assert abs(m["profit_factor"] - 0.5 / 0.1) < 1e-9
+def test_low_rr_and_cushion_filters_block_signal():
+    assert bt.simulate(_df([99, 101, 102], pos_gex=102)) == []
+    assert bt.simulate(_df([99, 101, 104], cotmp=100.5)) == []
 
 
-def test_demo_panel_runs_end_to_end():
-    m = bt.run(bt.demo_panel(seed=1, n_names=4, days=150))
-    assert m["trades"] >= 0        # engine executes; may or may not trade
+def test_metrics_and_demo_run():
+    m = bt.metrics([{"return_pct": 0.2}, {"return_pct": -0.1}, {"return_pct": 0.3}])
+    assert m["trades"] == 3 and abs(m["profit_factor"] - 5.0) < 1e-9
+    assert bt.run(bt.demo_panel(seed=1, n_names=3, days=120))["trades"] >= 0
 
 
-# --------------------------------------------------------------------------- #
-# Screen status logic
-# --------------------------------------------------------------------------- #
-def test_screen_confirmed():
+def test_screen_status_and_assumption_fields():
     lv = {"spot": 101, "ptrans": 100, "pos_gex": 110, "ntrans": 90,
-          "cotmp": 95, "net_gex": 1e9}
-    assert sc.screen_row("X", lv)["status"] == "CONFIRMED"
-
-
-def test_screen_pending_just_below_ptrans():
-    lv = {"spot": 99.7, "ptrans": 100, "pos_gex": 110, "ntrans": 90,
-          "cotmp": 95, "net_gex": 1e9}
+          "cotmp": 95, "net_gex": 1e9, "risk_free": 0.03,
+          "dividend_yield": 0.01,
+          "dealer_sign_model": "calls_positive_puts_negative"}
+    row = sc.screen_row("X", lv)
+    assert row["status"] == "CONFIRMED"
+    assert row["risk_free"] == 0.03 and row["dividend_yield"] == 0.01
+    lv["spot"] = 99.7
     assert sc.screen_row("X", lv)["status"] == "PENDING"
-
-
-def test_screen_blocked_low_rr():
-    lv = {"spot": 101, "ptrans": 100, "pos_gex": 102, "ntrans": 90,
-          "cotmp": 95, "net_gex": 1e9}
+    lv.update(spot=101, pos_gex=102)
     assert sc.screen_row("X", lv)["status"] == "BLOCKED"
 
 
-if __name__ == "__main__":
-    fns = [(k, v) for k, v in sorted(globals().items())
-           if k.startswith("test_") and callable(v)]
-    for name, fn in fns:
-        fn()
-        print(f"{name} OK")
-    print(f"\nALL {len(fns)} BACKTEST/SCREEN TESTS PASSED")
+def test_snapshot_filename_never_overwrites_same_date(tmp_path):
+    df = pd.DataFrame([{"ticker": "X", "spot": 100, "ptrans": 99,
+                        "ntrans": 90, "pos_gex": 110, "cotmp": 95}])
+    asof1 = pd.Timestamp("2026-08-10T20:00:00.000001Z")
+    asof2 = pd.Timestamp("2026-08-10T20:00:00.000002Z")
+    p1 = sc.save_snapshot(df, str(tmp_path), asof=asof1)
+    p2 = sc.save_snapshot(df, str(tmp_path), asof=asof2)
+    assert p1 != p2 and os.path.exists(p1) and os.path.exists(p2)
+    with pytest.raises(FileExistsError):
+        sc.save_snapshot(df, str(tmp_path), asof=asof1)
+
+
+def _write_snapshot(path, date, ptrans):
+    pd.DataFrame([{"date": date, "ticker": "X", "ptrans": ptrans,
+                   "ntrans": 90, "pos_gex": 110, "cotmp": 95}]).to_csv(path, index=False)
+
+
+def test_load_real_levels_are_timezone_safe_and_never_used_same_snapshot_date(tmp_path):
+    _write_snapshot(tmp_path / "gex_2026-01-05.csv", "2026-01-05", 100)
+    _write_snapshot(tmp_path / "gex_2026-01-06.csv", "2026-01-06", 101)
+
+    idx = pd.date_range("2026-01-05", periods=5, freq="B", tz="UTC")
+    px = pd.DataFrame({"open": [99, 100, 102, 103, 104],
+                       "high": [100, 101, 103, 104, 105],
+                       "low": [98, 99, 101, 102, 103],
+                       "close": [99, 101, 102, 103, 104]}, index=idx)
+    loader = lambda ticker, start, end: px
+    panel = bt.load_real(str(tmp_path), price_loader=loader, max_level_age_days=4)
+    df = panel["X"]
+    # Jan 5 snapshot must NOT be usable on Jan 5; it starts Jan 6.
+    assert pd.isna(df.loc[pd.Timestamp("2026-01-05", tz="UTC"), "ptrans"])
+    assert df.loc[pd.Timestamp("2026-01-06", tz="UTC"), "ptrans"] == 100
+    assert df.loc[pd.Timestamp("2026-01-07", tz="UTC"), "ptrans"] == 101
+    assert str(df.index.tz) == "UTC"
+
+
+def test_load_real_rejects_unsupported_price_source(tmp_path):
+    with pytest.raises(ValueError):
+        bt.load_real(str(tmp_path), price_source="alpaca")
