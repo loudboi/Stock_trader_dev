@@ -7,7 +7,9 @@ The adapter fails closed on ambiguous account currency, contract, market-hours,
 or stale-data states. Market submissions return broker order identifiers and the
 shared live trader confirms broker position changes before mutating strategy
 state. Equity positions use real GTC stop orders at IBKR, so protection survives
-bot/Gateway process interruptions after IBKR has accepted the stop.
+bot/Gateway process interruptions after IBKR has accepted the stop. Cancellation
+success means IBKR has reported a cancellation state, not merely that cancelOrder
+was called successfully.
 """
 
 import logging
@@ -17,6 +19,9 @@ from datetime import datetime, timezone
 import pandas as pd
 
 log = logging.getLogger("portfolio_ibkr")
+_CANCEL_CONFIRM_POLLS = 12
+_CANCEL_POLL_SECONDS = 0.25
+_IBKR_CANCEL_CONFIRMED = {"cancelled", "apicancelled"}
 
 
 def contract_kwargs(spec: dict) -> dict:
@@ -345,7 +350,9 @@ class IBKRPortfolio:
                     "status": status,
                     "filled_qty": filled,
                     "qty": filled + remaining,
-                    "terminal": status in {"filled", "cancelled", "apicancelled", "inactive"},
+                    # Inactive is deliberately not terminal here: IB documents
+                    # multiple causes, including states that may later be released.
+                    "terminal": status in {"filled", "cancelled", "apicancelled"},
                 }
         except Exception as e:  # noqa: BLE001
             log.warning("Could not read IBKR order status %s: %s", order_id, e)
@@ -380,28 +387,55 @@ class IBKRPortfolio:
             return None
 
     def cancel_order(self, order_id) -> bool:
+        """Request cancellation and return True only after IBKR confirms it."""
         if not order_id:
             return True
         self._ensure()
-        order = self._strategy_orders.get(str(order_id))
+        wanted = str(order_id)
+        current = self.order_status(wanted)
+        if current:
+            if current["status"] in _IBKR_CANCEL_CONFIRMED:
+                self._strategy_orders.pop(wanted, None)
+                return True
+            if current["status"] == "filled":
+                self._strategy_orders.pop(wanted, None)
+                return False
+
+        order = self._strategy_orders.get(wanted)
         if order is None:
             # Recover the Order object after a process restart when possible.
             for trade in self.ib.openTrades():
                 candidate = getattr(trade, "order", None)
-                if candidate is not None and str(getattr(candidate, "orderId", "")) == str(order_id):
+                if candidate is not None and str(getattr(candidate, "orderId", "")) == wanted:
                     order = candidate
                     break
         if order is None:
-            log.warning("Could not find IBKR order %s to confirm cancellation.", order_id)
+            log.warning("Could not find IBKR order %s to request cancellation.", order_id)
             return False
         try:
             self.ib.cancelOrder(order)
-            self.ib.sleep(0.25)
-            self._strategy_orders.pop(str(order_id), None)
-            return True
         except Exception as e:  # noqa: BLE001
-            log.warning("IBKR cancel %s failed: %s", order_id, e)
+            latest = self.order_status(wanted)
+            if latest and latest["status"] in _IBKR_CANCEL_CONFIRMED:
+                self._strategy_orders.pop(wanted, None)
+                return True
+            log.warning("IBKR cancel request %s failed/unconfirmed: %s", order_id, e)
             return False
+
+        for _ in range(_CANCEL_CONFIRM_POLLS):
+            self.ib.sleep(_CANCEL_POLL_SECONDS)
+            status = self.order_status(wanted)
+            if not status:
+                continue
+            if status["status"] in _IBKR_CANCEL_CONFIRMED:
+                self._strategy_orders.pop(wanted, None)
+                return True
+            if status["status"] == "filled":
+                self._strategy_orders.pop(wanted, None)
+                log.warning("IBKR order %s filled before cancellation was confirmed.", order_id)
+                return False
+        log.warning("IBKR cancel request %s was not terminally confirmed.", order_id)
+        return False
 
     def recent_fill_price(self, inst, side: str, order_id=None, since=None):
         try:
