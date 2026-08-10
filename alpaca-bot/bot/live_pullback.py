@@ -12,6 +12,8 @@ Safety invariants:
   * untracked broker longs require explicit --adopt-existing consent;
   * externally/manual-adjusted managed positions are frozen as fully built because
     tranche intent cannot be reconstructed safely from broker quantity alone;
+  * unknown broker fill prices are logged as unknown and are never booked as
+    estimated realized P&L;
   * per-position sizing is additionally bounded by managed-book stop-risk and
     gross-exposure limits from config.py.
 """
@@ -249,14 +251,20 @@ class PullbackLiveTrader:
         sold = max(0.0, float(original["qty"]) - broker["qty"])
         if sold <= 1e-9:
             return False
-        exit_px = (self.pf.recent_fill_price(inst, "sell", pending["order_id"]) or
-                   pending["requested_exit_price"])
+        exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
         partial_pos = dict(original)
         partial_pos["qty"] = sold
-        pnl = (exit_px - original["avg_entry"]) * sold
-        self._log_trade(name, partial_pos, exit_px, pnl,
-                        pending["reason"] + " (terminal partial close)", pending["order_id"])
-        self._accrue_daily(pnl)
+        if exit_px is None:
+            pnl = None
+            self._log_trade(
+                name, partial_pos, None, None,
+                pending["reason"] + " (terminal partial close; fill unavailable; PnL not accrued)",
+                pending["order_id"])
+        else:
+            pnl = (exit_px - original["avg_entry"]) * sold
+            self._log_trade(name, partial_pos, exit_px, pnl,
+                            pending["reason"] + " (terminal partial close)", pending["order_id"])
+            self._accrue_daily(pnl)
         pos = self.state["positions"].get(name) or dict(original)
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
         pos["tranches"] = len(self.params.tranches)
@@ -266,7 +274,8 @@ class PullbackLiveTrader:
         self.state["pending"].pop(name, None)
         protected = self._place_stop(name, inst, pos)
         self.save_state()
-        self.notify(f"PARTIAL CLOSE {name}: sold {sold}, {broker['qty']} remains; "
+        detail = f"realized pnl={pnl:.2f}" if pnl is not None else "fill/PnL unavailable; reconcile statement"
+        self.notify(f"PARTIAL CLOSE {name}: sold {sold}, {broker['qty']} remains; {detail}; "
                     "remainder frozen as fully built" +
                     ("." if protected else " [protective stop unavailable]."))
         return True
@@ -451,15 +460,23 @@ class PullbackLiveTrader:
             if broker is None:
                 pos = pending["position"]
                 exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
-                exit_px = exit_px or pending["requested_exit_price"]
-                pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
-                self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])
-                self._accrue_daily(pnl)
+                if exit_px is None:
+                    self._log_trade(
+                        name, pos, None, None,
+                        pending["reason"] + " (fill unavailable; PnL not accrued)",
+                        pending["order_id"])
+                else:
+                    pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
+                    self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])
+                    self._accrue_daily(pnl)
                 self.state["positions"].pop(name, None)
                 self.state["intents"].pop(name, None)
                 self.state["pending"].pop(name, None)
                 self.save_state()
-                self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")
+                if exit_px is None:
+                    self.notify(f"CLOSE {name}: broker is flat but fill/PnL unavailable; reconcile statement ({pending['reason']}).")
+                else:
+                    self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")
                 return True
 
             original_qty = float(pending["position"]["qty"])
@@ -534,28 +551,35 @@ class PullbackLiveTrader:
 
     def _finalize_external_close(self, name, inst, pos):
         exit_px = self.pf.recent_fill_price(inst, "sell", since=pos.get("entry_time"))
-        if exit_px is None:
-            exit_px = pos["avg_entry"] * (1 - pos.get("stop_dist", self.params.min_stop))
         if pos.get("stop_order_id"):
             self.pf.cancel_order(pos["stop_order_id"])
-        pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
-        self._log_trade(name, pos, exit_px, pnl, "broker stop / external close", None)
-        self._accrue_daily(pnl)
+        if exit_px is None:
+            self._log_trade(name, pos, None, None,
+                            "broker stop / external close (fill unavailable; PnL not accrued)", None)
+        else:
+            pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
+            self._log_trade(name, pos, exit_px, pnl, "broker stop / external close", None)
+            self._accrue_daily(pnl)
         for bucket in ("positions", "intents", "pending"):
             self.state[bucket].pop(name, None)
         self.save_state()
-        self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} (broker stop/external)")
+        if exit_px is None:
+            self.notify(f"CLOSE {name}: broker is flat but fill/PnL unavailable; reconcile statement (broker stop/external).")
+        else:
+            self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} (broker stop/external)")
 
     def _log_trade(self, name, pos, exit_price, pnl, reason, exit_order_id=None):
         new = not os.path.exists(PULLBACK_TRADES_CSV)
         fields = ["timestamp", "instrument", "direction", "entry_price", "exit_price", "pnl",
                   "position_size", "tranches", "reason", "entry_orders_json", "exit_order_id"]
+        exit_value = "" if exit_price is None else round(exit_price, 4)
+        pnl_value = "" if pnl is None else round(pnl, 2)
         with open(PULLBACK_TRADES_CSV, "a", newline="") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(fields)
             w.writerow([datetime.now(timezone.utc).isoformat(), name, "long",
-                        round(pos["avg_entry"], 4), round(exit_price, 4), round(pnl, 2),
+                        round(pos["avg_entry"], 4), exit_value, pnl_value,
                         pos["qty"], pos.get("tranches", 0), reason,
                         json.dumps(pos.get("entry_orders", []), separators=(",", ":")),
                         exit_order_id or ""])
