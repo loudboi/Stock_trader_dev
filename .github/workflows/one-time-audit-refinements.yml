@@ -1,0 +1,93 @@
+name: One-time audit refinements
+
+on:
+  push:
+    branches: [agent/fix-repo-audit]
+    paths: [.github/workflows/one-time-audit-refinements.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/fix-repo-audit
+          fetch-depth: 0
+      - name: Apply exact audited replacements
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if new in s:
+                  return
+              if old not in s:
+                  raise SystemExit(f"Expected block not found in {path}; refusing broad edit")
+              p.write_text(s.replace(old, new, 1))
+
+          # Stale terminology assertion (idempotent with the prior one-shot patch).
+          replace_once(
+              "alpaca-bot/tests/test_lab.py",
+              'assert "WALK-FORWARD" in out and "SUMMARY" in out',
+              'assert "CHRONOLOGICAL CONSISTENCY" in out and "no fitting" in out and "SUMMARY" in out')
+
+          # Max drawdown must include the true starting NAV, not start its running
+          # maximum at an already-loss-making first observation.
+          replace_once(
+              "alpaca-bot/bot/backtest_pullback.py",
+              '''    if len(equity):\n        running_max = equity.cummax()\n        dd = (equity - running_max) / running_max.replace(0, np.nan)\n        max_dd = float(dd.min()) if len(dd) else 0.0\n        initial = _initial_equity(equity)\n        total_return = float(equity.iloc[-1] / initial - 1) if initial else 0.0\n''',
+              '''    if len(equity):\n        initial = _initial_equity(equity)\n        nav = equity.astype(float)\n        if initial != nav.iloc[0]:\n            lead = nav.index[0] - pd.Timedelta(nanoseconds=1)\n            nav = pd.concat([pd.Series([initial], index=[lead]), nav])\n        running_max = nav.cummax()\n        dd = (nav - running_max) / running_max.replace(0, np.nan)\n        max_dd = float(dd.min()) if len(dd) else 0.0\n        total_return = float(equity.iloc[-1] / initial - 1) if initial else 0.0\n''')
+
+          replace_once(
+              "alpaca-bot/tests/test_backtest_pullback.py",
+              '''def test_compute_metrics_risk_free_is_explicit():\n''',
+              '''def test_compute_metrics_drawdown_includes_true_starting_nav():\n    idx = pd.date_range("2025-01-01", periods=3, freq="D", tz="UTC")\n    eq = pd.Series([90_000.0, 92_000.0, 91_000.0], index=idx)\n    eq.attrs["initial_equity"] = 100_000.0\n    m = bp.compute_metrics([], eq)\n    assert abs(m["max_drawdown"] + 0.10) < 1e-12\n\n\ndef test_compute_metrics_risk_free_is_explicit():\n''')
+
+          # Gross exposure should not be understated after a managed position rises.
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''            gross += qty * entry\n            risk += qty * entry * dist\n''',
+              '''            mark = max(entry, float(p.get("last_price", entry) or entry))\n            gross += qty * mark\n            risk += qty * entry * dist\n''')
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n        pos["tranches"] = len(self.params.tranches)\n''',
+              '''        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n        pos["last_price"] = broker["avg_entry"]\n        pos["tranches"] = len(self.params.tranches)\n''')
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''            pos["last_add_price"] = fill_px\n            pos.setdefault("entry_orders", []).append({\n''',
+              '''            pos["last_add_price"] = fill_px\n            pos["last_price"] = fill_px\n            pos.setdefault("entry_orders", []).append({\n''')
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''        if pos and latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):\n''',
+              '''        if pos:\n            pos["last_price"] = latest\n        if pos and latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):\n''')
+
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''def test_manual_broker_position_change_refreshes_stop_and_freezes_further_adds():\n''',
+              '''def test_managed_gross_capacity_uses_latest_known_mark():\n    t = _trader(FakePortfolio())\n    t.state["positions"]["SPY"] = {\n        "qty": 100.0, "avg_entry": 100.0, "last_price": 150.0, "stop_dist": 0.05}\n    room = t._managed_capacity(100_000.0)\n    expected_gross = max(0.0, lp.config.MAX_GROSS_EXPOSURE * 100_000.0 - 15_000.0)\n    assert abs(room["gross_room"] - expected_gross) < 1e-9\n\n\ndef test_manual_broker_position_change_refreshes_stop_and_freezes_further_adds():\n''')
+
+          # Only an actual final business day should count as a completed calendar
+          # year when the caller has not explicitly asked to realize the final row.
+          replace_once(
+              "alpaca-bot/bot/taxes.py",
+              '''    ts = index[i]\n    return ts.month == 12 and ts.day >= 28\n''',
+              '''    ts = index[i]\n    return (ts + pd.offsets.BDay(1)).year != ts.year\n''')
+
+          # Clean up both one-shot workflows in the same commit.
+          for wf in (".github/workflows/one-time-audit-patch.yml",
+                     ".github/workflows/one-time-audit-refinements.yml"):
+              p = Path(wf)
+              if p.exists():
+                  p.unlink()
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Refine audit edge-case metrics and reconciliation"
+          git push origin HEAD:agent/fix-repo-audit
