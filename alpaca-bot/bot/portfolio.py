@@ -6,7 +6,9 @@ Alpaca broker adapter used by the live pullback runner and historical-data tools
 A broker/API failure is never represented as a valid flat position. Position reads
 return None only when Alpaca explicitly reports that the position does not exist.
 Cancellation succeeds only after the broker reports a non-working cancellation
-state; acceptance of a cancel request is not treated as confirmation.
+state; acceptance of a cancel request is not treated as confirmation. Generic
+external-close fill recovery can aggregate all relevant closed sell orders after a
+caller-supplied reconciliation boundary.
 """
 
 import logging
@@ -132,7 +134,6 @@ class Portfolio:
                       .agg({"open": "first", "high": "max", "low": "min",
                             "close": "last", "volume": "sum"}).dropna())
             else:
-                # Resample in New York wall-clock time so 09:30 anchors follow DST.
                 local = df.tz_convert("America/New_York")
                 local = (local.resample(resample, origin="start_day", offset="9h30min",
                                         label="right", closed="right")
@@ -222,9 +223,6 @@ class Portfolio:
         try:
             self.trading.cancel_order_by_id(order_id)
         except APIError as e:
-            # A race can make the DELETE non-cancelable between the read above and
-            # the request. Query once more before deciding; never infer success from
-            # the HTTP response alone.
             latest = self.order_status(order_id)
             if latest and latest["status"] in _CANCEL_CONFIRMED:
                 return True
@@ -244,7 +242,7 @@ class Portfolio:
         return False
 
     def recent_fill_price(self, instrument, side: str, order_id=None, since=None):
-        """Return a fill price for an exact order, or a recent bounded symbol/side fill."""
+        """Return an exact order average, or a bounded external-close weighted average."""
         since_ts = _as_utc(since)
         try:
             if order_id:
@@ -253,15 +251,32 @@ class Portfolio:
                 return float(px) if px else None
             req = GetOrdersRequest(status=QueryOrderStatus.CLOSED,
                                    symbols=[instrument.api_symbol],
-                                   side=OrderSide(side), limit=50, nested=False)
+                                   side=OrderSide(side), limit=500, nested=False)
+            candidates = []
             for o in self.trading.get_orders(filter=req):
                 px = getattr(o, "filled_avg_price", None)
                 if not px:
                     continue
                 filled_at = _as_utc(getattr(o, "filled_at", None))
-                if since_ts is not None and filled_at is not None and filled_at < since_ts:
-                    continue
-                return float(px)
+                if since_ts is not None:
+                    if filled_at is None or filled_at < since_ts:
+                        continue
+                try:
+                    qty = float(getattr(o, "filled_qty", 0) or 0)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                candidates.append({"time": filled_at, "price": float(px),
+                                   "qty": max(0.0, qty)})
+            if not candidates:
+                return None
+            if since_ts is None:
+                with_time = [c for c in candidates if c["time"] is not None]
+                return max(with_time, key=lambda c: c["time"])["price"] if with_time else candidates[0]["price"]
+            total_qty = sum(c["qty"] for c in candidates)
+            if total_qty > 0:
+                return sum(c["price"] * c["qty"] for c in candidates) / total_qty
+            with_time = [c for c in candidates if c["time"] is not None]
+            return max(with_time, key=lambda c: c["time"])["price"] if with_time else candidates[-1]["price"]
         except APIError as e:
             log.debug("recent_fill_price failed for %s: %s", instrument.name, e)
         return None
