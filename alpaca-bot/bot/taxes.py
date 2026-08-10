@@ -175,15 +175,19 @@ def after_tax_binary_strategy(returns: pd.Series, held: pd.Series,
     prev = 0.0
     for i, (ts, ret) in enumerate(r.items()):
         current = float(h.iloc[i])
+        # held[t] earns close[t-1] -> close[t]. A 0->1 or 1->0 transition was
+        # therefore executed at the prior close, not at row t. If the scenario
+        # begins already held, row 0 is the only available acquisition date.
+        trade_date = r.index[i - 1] if i > 0 else ts
         if current > 0 and prev <= 0:
             entry_nav = nav
-            entry_date = ts
+            entry_date = trade_date
         # Always apply the supplied return: an exit row can contain transaction cost
         # even though current exposure is already zero.
         nav *= 1.0 + ret
         if prev > 0 and current <= 0:
             gain = nav - entry_nav
-            rate = slovenia_rate_for_dates(entry_date, ts)
+            rate = slovenia_rate_for_dates(entry_date, trade_date)
             if gain > 0 and rate > 0:
                 nav -= rate * gain
             entry_nav = entry_date = None
