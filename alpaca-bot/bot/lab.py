@@ -440,7 +440,7 @@ def run_walk_forward(daily_data, names, params, start_ts, end_ts, folds=5):
 
 def print_walk_forward(per_fold):
     names = list(per_fold[0]["strategies"]) if per_fold else []
-    print(f"\nCHRONOLOGICAL CONSISTENCY — {len(per_fold)} non-overlapping folds")
+    print(f"\nCHRONOLOGICAL CONSISTENCY — {len(per_fold)} non-overlapping folds; no fitting")
     beat = {n: 0 for n in names}
     for k, row in enumerate(per_fold, 1):
         bits = []
