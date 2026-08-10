@@ -29,14 +29,14 @@ def test_full_usd_exposure_uses_exact_fx_ratio():
     eur = cur.unhedged_eur_equity(usd_ret, fx, invested_frac=1.0)
     expected_factors = pd.Series([
         1.0,
-        (1.10) / (1.10 / 1.20),
+        1.10 / (1.10 / 1.20),
         1.0 / (1.00 / 1.10),
     ], index=usd_ret.index)
     assert np.allclose(eur.values, 100_000 * expected_factors.cumprod().values)
 
 
 def test_partial_exposure_is_exact_mixed_eur_cash_usd_asset_wealth():
-    usd_ret = _series([0.0, 0.05, 0.0])  # whole-portfolio USD contribution; f=0.5 => asset +10%
+    usd_ret = _series([0.0, 0.05, 0.0])
     fx = _series([1.20, 1.10, 1.10])
     frac = _series([0.5, 0.5, 0.5])
     eur = cur.unhedged_eur_equity(usd_ret, fx, invested_frac=frac)
@@ -44,14 +44,21 @@ def test_partial_exposure_is_exact_mixed_eur_cash_usd_asset_wealth():
     assert abs(eur.iloc[1] - 100_000 * day1_factor) < 1e-6
 
 
-def test_zero_exposure_has_no_fx_move_and_requires_zero_usd_return():
+def test_zero_exposure_has_no_fx_move_without_usd_return():
     usd_ret = _series([0.0, 0.0, 0.0])
     fx = _series([1.0, 1.1, 1.2])
     eq = cur.unhedged_eur_equity(usd_ret, fx, invested_frac=0.0)
     assert np.allclose(eq.values, 100_000)
-    bad = _series([0.0, 0.01, 0.0])
-    with pytest.raises(ValueError, match="invested_frac is zero"):
-        cur.unhedged_eur_equity(bad, fx, invested_frac=0.0)
+
+
+def test_zero_exposure_preserves_usd_transaction_cost_contribution():
+    # Example exit row: no remaining market exposure, but a 10bp USD transaction
+    # cost must still reduce EUR wealth instead of being discarded or rejected.
+    usd_ret = _series([0.0, -0.001, 0.0])
+    fx = _series([1.0, 1.1, 1.1])
+    eq = cur.unhedged_eur_equity(usd_ret, fx, invested_frac=0.0)
+    expected_day1_factor = 1.0 + (-0.001) / 1.1
+    assert abs(eq.iloc[1] - 100_000 * expected_day1_factor) < 1e-6
 
 
 def test_fx_is_forward_filled_but_never_backfilled_from_future():
@@ -74,13 +81,15 @@ def test_hedge_cost_is_charged_only_on_exposed_fraction():
     assert np.allclose(cash.values, 100_000)
 
 
-def test_invalid_fraction_and_cost_rejected():
+def test_invalid_fraction_cost_and_initial_rejected():
     r = _series([0.0, 0.0])
     fx = _series([1.1, 1.1])
     with pytest.raises(ValueError):
         cur.unhedged_eur_equity(r, fx, invested_frac=1.2)
     with pytest.raises(ValueError):
         cur.hedged_eur_equity(r, annual_hedge_cost=-0.01)
+    with pytest.raises(ValueError):
+        cur.unhedged_eur_equity(r, fx, initial=0)
 
 
 def test_empty_series():
