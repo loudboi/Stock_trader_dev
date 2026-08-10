@@ -3,14 +3,12 @@ bot/portfolio.py
 ================
 Alpaca broker adapter used by the live pullback runner and historical-data tools.
 
-The important contract is that a broker/API failure is never represented as a
-valid flat position. `get_position_raw()` returns None only when Alpaca explicitly
-reports that the position does not exist; all other API failures are raised so the
-caller can stop/retry instead of corrupting trading state.
+A broker/API failure is never represented as a valid flat position. Position reads
+return None only when Alpaca explicitly reports that the position does not exist.
 """
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 import pandas as pd
 
@@ -38,7 +36,6 @@ _TF_MAP = {
 
 
 def _api_status(exc):
-    """Best-effort HTTP status extraction across alpaca-py APIError versions."""
     for name in ("status_code", "status", "http_status"):
         value = getattr(exc, name, None)
         if value is not None:
@@ -49,48 +46,43 @@ def _api_status(exc):
     return None
 
 
+def _as_utc(value):
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 class Portfolio:
     def __init__(self):
-        paper = "paper" in config.ALPACA_BASE_URL.lower()
-        self.paper = paper
+        self.paper = "paper" in config.ALPACA_BASE_URL.lower()
         self.trading = TradingClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY,
-                                     paper=paper)
+                                     paper=self.paper)
         self.stock_data = StockHistoricalDataClient(config.ALPACA_API_KEY,
                                                     config.ALPACA_SECRET_KEY)
         self.crypto_data = CryptoHistoricalDataClient(config.ALPACA_API_KEY,
                                                       config.ALPACA_SECRET_KEY)
 
-    # ------------------------------------------------------------------ #
-    # Account / positions
-    # ------------------------------------------------------------------ #
     def get_equity(self) -> float:
-        return float(self.trading.get_account().equity)
+        value = float(self.trading.get_account().equity)
+        if value <= 0:
+            raise RuntimeError("Alpaca reported non-positive account equity")
+        return value
 
     @staticmethod
     def _side_str(side) -> str:
         return side.value if hasattr(side, "value") else str(side)
 
     def get_position_raw(self, instrument):
-        """Return one broker position, or None only when Alpaca says it is flat.
-
-        A transient/auth/rate-limit API error must propagate. Treating it as flat
-        can make the live runner log a fake stop-out and drop protection/state.
-        """
         try:
             p = self.trading.get_open_position(instrument.api_symbol)
         except APIError as e:
             if _api_status(e) == 404:
                 return None
             raise
-        return {
-            "side": self._side_str(p.side),
-            "qty": abs(float(p.qty)),
-            "avg_entry": float(p.avg_entry_price),
-        }
+        return {"side": self._side_str(p.side), "qty": abs(float(p.qty)),
+                "avg_entry": float(p.avg_entry_price)}
 
-    # ------------------------------------------------------------------ #
-    # Market hours
-    # ------------------------------------------------------------------ #
     def is_tradable_now(self, instrument) -> bool:
         if instrument.asset_class == "crypto":
             return True
@@ -100,10 +92,9 @@ class Portfolio:
             log.warning("Clock check failed: %s", e)
             return False
 
-    # ------------------------------------------------------------------ #
-    # Bars
-    # ------------------------------------------------------------------ #
     def get_historical_bars(self, instrument, tf_key: str, start, end) -> pd.DataFrame:
+        if tf_key not in _TF_MAP:
+            raise ValueError(f"Unsupported timeframe: {tf_key}")
         tf, resample = _TF_MAP[tf_key]
         try:
             if instrument.asset_class == "crypto":
@@ -118,32 +109,32 @@ class Portfolio:
         except APIError as e:
             log.warning("Bar fetch failed for %s: %s", instrument.name, e)
             return pd.DataFrame()
-
         df = bars.df
         if df is None or df.empty:
             return pd.DataFrame()
         if isinstance(df.index, pd.MultiIndex):
             df = df.droplevel(0)
+        idx = pd.DatetimeIndex(df.index)
+        df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
         df = df.sort_index()
         cols = ["open", "high", "low", "close", "volume"]
         df = df[[c for c in cols if c in df.columns]].copy()
         if resample:
-            # Anchor stock 4-hour bars to the US regular-session open instead of
-            # arbitrary UTC midnight boundaries. Crypto remains UTC-anchored.
-            kwargs = {"label": "right", "closed": "right"}
-            if instrument.asset_class != "crypto":
-                kwargs.update(origin="start_day", offset="14h30min")
-            df = (df.resample(resample, **kwargs)
-                  .agg({"open": "first", "high": "max", "low": "min",
-                        "close": "last", "volume": "sum"})
-                  .dropna())
+            if instrument.asset_class == "crypto":
+                df = (df.resample(resample, origin="start_day", label="right", closed="right")
+                      .agg({"open": "first", "high": "max", "low": "min",
+                            "close": "last", "volume": "sum"}).dropna())
+            else:
+                # Resample in New York wall-clock time so 09:30 anchors follow DST.
+                local = df.tz_convert("America/New_York")
+                local = (local.resample(resample, origin="start_day", offset="9h30min",
+                                        label="right", closed="right")
+                         .agg({"open": "first", "high": "max", "low": "min",
+                               "close": "last", "volume": "sum"}).dropna())
+                df = local.tz_convert("UTC")
         return df
 
-    # ------------------------------------------------------------------ #
-    # Latest price
-    # ------------------------------------------------------------------ #
     def latest_price(self, instrument):
-        """Most recent trade price, or None when live market data is unavailable."""
         try:
             if instrument.asset_class == "crypto":
                 req = CryptoLatestTradeRequest(symbol_or_symbols=instrument.api_symbol)
@@ -153,54 +144,39 @@ class Portfolio:
                 res = self.stock_data.get_stock_latest_trade(req)
             px = float(res[instrument.api_symbol].price)
             return px if px > 0 else None
-        except Exception as e:  # noqa: BLE001 - data outage is represented as no price
+        except Exception as e:  # noqa: BLE001
             log.debug("Latest price failed for %s: %s", instrument.name, e)
             return None
 
-    # ------------------------------------------------------------------ #
-    # Orders
-    # ------------------------------------------------------------------ #
     def submit_market_order(self, instrument, qty: float, side: str):
-        """Submit a market order and return its broker order id, or None on rejection.
-
-        Submission/acceptance is deliberately not called a fill. The live runner
-        confirms the resulting broker position before mutating local state.
-        """
+        if qty <= 0:
+            return None
         tif = TimeInForce.GTC if instrument.asset_class == "crypto" else TimeInForce.DAY
-        order = MarketOrderRequest(symbol=instrument.api_symbol, qty=qty,
-                                   side=OrderSide(side), time_in_force=tif)
+        req = MarketOrderRequest(symbol=instrument.api_symbol, qty=qty,
+                                 side=OrderSide(side), time_in_force=tif)
         try:
-            submitted = self.trading.submit_order(order_data=order)
-            return str(submitted.id)
+            return str(self.trading.submit_order(order_data=req).id)
         except APIError as e:
             log.error("Order failed (%s %s %s): %s", side, qty, instrument.name, e)
             return None
 
     def close_position_raw(self, instrument):
-        """Request a market close and return its order id, or None on rejection."""
         try:
-            submitted = self.trading.close_position(instrument.api_symbol)
-            return str(submitted.id)
+            return str(self.trading.close_position(instrument.api_symbol).id)
         except APIError as e:
             log.error("Close failed for %s: %s", instrument.name, e)
             return None
 
     def submit_stop_order(self, instrument, qty: float, stop_price: float):
-        if instrument.asset_class == "crypto":
-            log.info("%s: broker stop not placed (crypto); in-process stop active.",
-                     instrument.name)
-            return None
-        if qty <= 0 or stop_price <= 0:
+        if instrument.asset_class == "crypto" or qty <= 0 or stop_price <= 0:
             return None
         req = StopOrderRequest(symbol=instrument.api_symbol, qty=qty,
                                side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
                                stop_price=round(stop_price, 2))
         try:
-            order = self.trading.submit_order(order_data=req)
-            return str(order.id)
+            return str(self.trading.submit_order(order_data=req).id)
         except APIError as e:
-            log.warning("Stop order failed for %s: %s (in-process stop active).",
-                        instrument.name, e)
+            log.warning("Stop order failed for %s: %s", instrument.name, e)
             return None
 
     def cancel_order(self, order_id: str) -> bool:
@@ -210,25 +186,28 @@ class Portfolio:
             self.trading.cancel_order_by_id(order_id)
             return True
         except APIError as e:
-            # Alpaca may report not-found/already-final after a race; callers still
-            # need to know cancellation was not positively confirmed.
             log.warning("Cancel order %s was not confirmed: %s", order_id, e)
             return False
 
-    def recent_fill_price(self, instrument, side: str, order_id=None):
-        """Return a fill price, preferring the exact broker order id when known."""
+    def recent_fill_price(self, instrument, side: str, order_id=None, since=None):
+        """Return a fill price for an exact order, or a recent bounded symbol/side fill."""
+        since_ts = _as_utc(since)
         try:
             if order_id:
                 o = self.trading.get_order_by_id(order_id)
-                if getattr(o, "filled_avg_price", None):
-                    return float(o.filled_avg_price)
-                return None
+                px = getattr(o, "filled_avg_price", None)
+                return float(px) if px else None
             req = GetOrdersRequest(status=QueryOrderStatus.CLOSED,
                                    symbols=[instrument.api_symbol],
-                                   side=OrderSide(side), limit=20, nested=False)
+                                   side=OrderSide(side), limit=50, nested=False)
             for o in self.trading.get_orders(filter=req):
-                if getattr(o, "filled_avg_price", None):
-                    return float(o.filled_avg_price)
+                px = getattr(o, "filled_avg_price", None)
+                if not px:
+                    continue
+                filled_at = _as_utc(getattr(o, "filled_at", None))
+                if since_ts is not None and filled_at is not None and filled_at < since_ts:
+                    continue
+                return float(px)
         except APIError as e:
             log.debug("recent_fill_price failed for %s: %s", instrument.name, e)
         return None
