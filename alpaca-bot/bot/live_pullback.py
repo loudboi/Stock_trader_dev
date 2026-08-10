@@ -10,6 +10,8 @@ Safety invariants:
   * missing live prices are data stalls, never stale daily-price substitutes;
   * managed positions cannot silently disappear from the configured symbol set;
   * untracked broker longs require explicit --adopt-existing consent;
+  * externally/manual-adjusted managed positions are frozen as fully built because
+    tranche intent cannot be reconstructed safely from broker quantity alone;
   * per-position sizing is additionally bounded by managed-book stop-risk and
     gross-exposure limits from config.py.
 """
@@ -207,8 +209,39 @@ class PullbackLiveTrader:
         self.notify(f"ADOPTED {name}: existing broker long explicitly taken over as fully built.")
         return pos
 
+    def _apply_external_position_change(self, name, inst, pos, broker):
+        """Reconcile a manual/external broker edit without guessing tranche intent.
+
+        Quantity or average-entry changes outside a known pending strategy order can
+        be a manual buy/sell, transfer, corporate-action adjustment, or another
+        process. Broker truth is adopted for protection, but future pyramiding is
+        disabled by marking the position fully built. This is deliberately safer
+        than trying to infer which strategy tranche a human action represented.
+        """
+        old_qty = float(pos.get("qty", 0) or 0)
+        old_avg = float(pos.get("avg_entry", 0) or 0)
+        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+        pos["tranches"] = len(self.params.tranches)
+        pos["last_add_price"] = broker["avg_entry"]
+        pos["externally_adjusted"] = True
+        pos["external_adjustment_at"] = datetime.now(timezone.utc).isoformat()
+        self.state["intents"].pop(name, None)
+        protected = self._place_stop(name, inst, pos)
+        self.notify(
+            f"EXTERNAL POSITION CHANGE {name}: broker qty/avg {old_qty}@{old_avg:.4f} -> "
+            f"{broker['qty']}@{broker['avg_entry']:.4f}; treating as fully built and "
+            "blocking further strategy adds" +
+            ("." if protected else " [protective stop replacement not confirmed]."))
+        return pos
+
     def reconcile(self):
         for name, inst in self.instruments.items():
+            # A persisted pending order from a crash/restart is strategy-owned. Settle
+            # it before classifying any resulting broker quantity as an external edit.
+            if name in self.state["pending"]:
+                if not self._confirm_pending(name, inst):
+                    log.warning("%s has an unresolved pending broker order; leaving symbol blocked.", name)
+                    continue
             broker = self._broker_position(inst)
             pos = self.state["positions"].get(name)
             if broker:
@@ -217,10 +250,9 @@ class PullbackLiveTrader:
                 else:
                     changed = (abs(float(pos.get("qty", 0)) - broker["qty"]) > 1e-9 or
                                abs(float(pos.get("avg_entry", 0)) - broker["avg_entry"]) > 1e-9)
-                    pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
                     if changed:
-                        log.warning("%s broker position changed externally; refreshing stop.", name)
-                        self._place_stop(name, inst, pos)
+                        log.warning("%s broker position changed outside known strategy orders.", name)
+                        self._apply_external_position_change(name, inst, pos, broker)
             elif pos:
                 self._finalize_external_close(name, inst, pos)
             else:
@@ -477,9 +509,9 @@ class PullbackLiveTrader:
         elif broker and pos:
             changed = (abs(pos["qty"] - broker["qty"]) > 1e-9 or
                        abs(pos["avg_entry"] - broker["avg_entry"]) > 1e-9)
-            pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
             if changed:
-                self._place_stop(name, inst, pos); self.save_state()
+                self._apply_external_position_change(name, inst, pos, broker)
+                self.save_state()
 
         if pos and latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):
             self._close(name, inst, latest, "volatility stop max(5%,2xATR)"); return
