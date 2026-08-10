@@ -449,6 +449,7 @@ def print_walk_forward(per_fold):
             won = shp > row["bh"]["sharpe"]; beat[n] += int(won)
             bits.append(f"{n}={shp:.2f}{'*' if won else ''}")
         print(f"{k}: {row['start'].date()}->{row['end'].date()} B&H={row['bh']['sharpe']:.2f} " + " ".join(bits))
+    print("SUMMARY")
     for n in names:
         print(f"{n}: beat B&H in {beat[n]}/{len(per_fold)} folds")
 
