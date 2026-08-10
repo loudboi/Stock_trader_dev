@@ -17,6 +17,8 @@ Safety invariants:
     tranche intent cannot be reconstructed safely from broker quantity alone;
   * unknown broker fill prices are logged as unknown and are never booked as
     estimated realized P&L;
+  * generic external-fill recovery starts at the latest reconciled quantity-change
+    boundary so an older partial sell is not reused as a later final exit;
   * per-position sizing is additionally bounded by managed-book stop-risk and
     gross-exposure limits from config.py.
 """
@@ -265,6 +267,9 @@ class PullbackLiveTrader:
             return True
 
         if broker is None:
+            # The bot order did fill, but no long exists now. A separate sell/close
+            # happened before reconciliation. Preserve the known entry and record the
+            # unresolved exit rather than resurrecting a position or guessing P&L.
             known_entry = fill_px or pending["signal_price"]
             transient = {
                 "qty": filled_qty, "avg_entry": known_entry,
@@ -315,6 +320,7 @@ class PullbackLiveTrader:
         if exact_overlap:
             pos["external_overlap"] = True
             pos["tranches"] = len(self.params.tranches)
+            pos["fill_search_since"] = datetime.now(timezone.utc).isoformat()
         pos.setdefault("entry_orders", []).append({
             "order_id": pending["order_id"], "requested_qty": requested,
             "filled_qty": filled_qty, "fill_price": resolved_fill,
@@ -359,6 +365,9 @@ class PullbackLiveTrader:
         if filled_qty <= 1e-9:
             self._pop_pending(name)
             if broker is None:
+                # Bot sell did not fill, but the broker position disappeared through
+                # another order/manual action. Attribute it as external, not to the
+                # bot's canceled/rejected close.
                 pos = self.state["positions"].get(name) or dict(original)
                 self._finalize_external_close(name, inst, pos)
                 return True
@@ -389,12 +398,14 @@ class PullbackLiveTrader:
             self.notify(f"CLOSE {name} {detail} ({pending['reason']}).{suffix}")
             return True
 
+        # Terminal partial bot close. Record only the bot order's exact filled qty.
         pnl = self._record_close_piece(
             name, original, filled_qty, exit_px,
             pending["reason"] + " (terminal partial close)", pending["order_id"])
         expected_remaining = max(0.0, original_qty - filled_qty)
         self._pop_pending(name)
         if broker is None:
+            # The bot sold only part, while another action removed the remainder.
             remainder = dict(original)
             remainder["qty"] = expected_remaining
             if expected_remaining > 1e-9:
@@ -412,6 +423,7 @@ class PullbackLiveTrader:
         pos["tranches"] = len(self.params.tranches)
         pos["last_price"] = broker["avg_entry"]
         pos["partial_close_frozen"] = True
+        pos["fill_search_since"] = datetime.now(timezone.utc).isoformat()
         if abs(broker["qty"] - expected_remaining) > 1e-8:
             pos["external_overlap"] = True
         self.state["positions"][name] = pos
@@ -425,12 +437,13 @@ class PullbackLiveTrader:
 
     def _adopt_long(self, name, inst, broker):
         stop_dist = self._current_stop_dist(name, inst, broker["avg_entry"])
+        now = datetime.now(timezone.utc).isoformat()
         pos = {
             "tranches": len(self.params.tranches), "qty": broker["qty"],
             "avg_entry": broker["avg_entry"], "last_add_price": broker["avg_entry"],
             "last_price": broker["avg_entry"],
             "stop_dist": stop_dist, "stop_order_id": None, "stop_level": None,
-            "stop_qty": 0.0, "entry_time": datetime.now(timezone.utc).isoformat(),
+            "stop_qty": 0.0, "entry_time": now, "fill_search_since": now,
             "entry_orders": [], "adopted": True,
         }
         self.state["positions"][name] = pos
@@ -450,12 +463,14 @@ class PullbackLiveTrader:
         """Reconcile a manual/external broker edit without guessing tranche intent."""
         old_qty = float(pos.get("qty", 0) or 0)
         old_avg = float(pos.get("avg_entry", 0) or 0)
+        adjusted_at = datetime.now(timezone.utc).isoformat()
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
         pos["last_price"] = broker["avg_entry"]
         pos["tranches"] = len(self.params.tranches)
         pos["last_add_price"] = broker["avg_entry"]
         pos["externally_adjusted"] = True
-        pos["external_adjustment_at"] = datetime.now(timezone.utc).isoformat()
+        pos["external_adjustment_at"] = adjusted_at
+        pos["fill_search_since"] = adjusted_at
         self.state["intents"].pop(name, None)
         protected = self._place_stop(name, inst, pos)
         self.notify(
@@ -491,9 +506,8 @@ class PullbackLiveTrader:
                 if not self._confirm_pending(name, inst):
                     log.warning("%s has an unresolved pending broker order; leaving symbol blocked.", name)
                     continue
-            self._sync_broker_state(name, inst)
-            if (name not in self.state["positions"] and
-                    self._broker_position(inst) is None):
+            broker, _, _ = self._sync_broker_state(name, inst)
+            if name not in self.state["positions"] and broker is None:
                 self.state["intents"].pop(name, None)
         self.save_state()
 
@@ -557,6 +571,9 @@ class PullbackLiveTrader:
             before = float(pending["before_qty"])
             broker_delta = max(0.0, (broker["qty"] if broker else 0.0) - before)
             if not terminal:
+                # Any observed quantity change while the exact bot order is still
+                # nonterminal is ambiguous: it can be a partial bot fill OR a manual
+                # trade. Cancel the bot order before attributing anything.
                 if broker_delta > 1e-9:
                     self._request_pending_cancel(pending)
                     status = self._order_status(pending["order_id"])
@@ -574,6 +591,9 @@ class PullbackLiveTrader:
             broker_changed = (broker is None or
                               abs(broker_remaining - original_qty) > 1e-9)
             if not terminal:
+                # Flat/partial broker state is not proof that this sell order caused
+                # it. Cancel the still-working bot sell before it can execute later
+                # against an externally changed position and create a short.
                 if broker_changed:
                     self._request_pending_cancel(pending)
                     status = self._order_status(pending["order_id"])
@@ -632,7 +652,8 @@ class PullbackLiveTrader:
         return name not in self.state["pending"]
 
     def _finalize_external_close(self, name, inst, pos):
-        exit_px = self.pf.recent_fill_price(inst, "sell", since=pos.get("entry_time"))
+        since = pos.get("fill_search_since") or pos.get("entry_time")
+        exit_px = self.pf.recent_fill_price(inst, "sell", since=since)
         if pos.get("stop_order_id"):
             self.pf.cancel_order(pos["stop_order_id"])
         if exit_px is None:
