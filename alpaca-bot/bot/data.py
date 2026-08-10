@@ -3,12 +3,18 @@ bot/data.py
 ===========
 Research/backtest data helpers.
 
-Yahoo daily bars are adjusted and are not bar-identical to live Alpaca bars. The
-optional outlier cleaner is deliberately a QUARANTINE, not a price-correction
-model: suspect rows are removed as whole OHLCV bars and their timestamps are
-logged. It never invents a replacement close while leaving incompatible open/high/
-low values behind. Use it only after inspecting the flagged observations; genuine
-market discontinuities are data, not errors.
+Yahoo daily bars are adjusted and are not bar-identical to live Alpaca bars.
+Outlier handling is deliberately conservative:
+
+* `suspect_price_mask` FLAGS non-positive prices and large one-day moves for review.
+* automatic quarantine removes a row only when percentage-return math is invalid
+  (non-positive price) or when a large move immediately reverses and the prices on
+  either side form a normal bridge — strong evidence of an isolated bad tick.
+* genuine large one-way moves are preserved. The cleaner never manufactures a
+  replacement close while leaving incompatible OHLC values behind.
+
+Every quarantine is an entire OHLCV row and both suspect/quarantined timestamps are
+retained in DataFrame attrs for reproducibility.
 """
 
 import logging
@@ -40,37 +46,55 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_index().dropna(how="any")
 
 
-def suspect_price_mask(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
-    """Boolean mask for non-positive prices or jumps beyond the explicit threshold.
-
-    The threshold does not mean the observation is wrong; it means the observation
-    needs review before a strategy that assumes ordinary positive percentage prices
-    consumes it.
-    """
+def _validate_threshold(max_abs_return: float) -> None:
     if not 0 < max_abs_return < 10:
         raise ValueError("max_abs_return must be between 0 and 10")
+
+
+def suspect_price_mask(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Flag observations that require review; do not imply they are erroneous."""
+    _validate_threshold(max_abs_return)
     px = close.astype(float)
     ret = px.pct_change(fill_method=None)
     mask = (~np.isfinite(px)) | (px <= 0) | (ret.abs() > max_abs_return)
     return pd.Series(mask, index=close.index, dtype=bool).fillna(False)
 
 
-def clean_price_series(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
-    """Legacy convenience API: return the price series with suspect rows removed.
+def quarantine_price_mask(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Rows safe to auto-quarantine without erasing plausible market discontinuities.
 
-    This intentionally changes the index instead of manufacturing replacement
-    prices. Call `suspect_price_mask` first if you need the exact audit list.
+    Non-positive/non-finite prices are unusable by percentage-return strategies.
+    A positive large move is auto-quarantined only when it immediately reverses
+    and the previous-to-next price bridge is itself ordinary. This catches an
+    isolated vendor spike without cascading into the following normal observation.
     """
-    mask = suspect_price_mask(close, max_abs_return)
+    _validate_threshold(max_abs_return)
+    px = close.astype(float)
+    mask = pd.Series(False, index=close.index, dtype=bool)
+    invalid = (~np.isfinite(px)) | (px <= 0)
+    mask.loc[invalid] = True
+    for i in range(1, len(px) - 1):
+        prev, cur, nxt = px.iloc[i - 1], px.iloc[i], px.iloc[i + 1]
+        if not (np.isfinite(prev) and np.isfinite(cur) and np.isfinite(nxt)):
+            continue
+        if prev <= 0 or cur <= 0 or nxt <= 0:
+            continue
+        leg_in = abs(cur / prev - 1.0)
+        leg_out = abs(nxt / cur - 1.0)
+        bridge = abs(nxt / prev - 1.0)
+        if leg_in > max_abs_return and leg_out > max_abs_return and bridge <= max_abs_return:
+            mask.iloc[i] = True
+    return mask
+
+
+def clean_price_series(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Legacy convenience API: remove only conservatively quarantinable prices."""
+    mask = quarantine_price_mask(close, max_abs_return)
     return close.loc[~mask].copy()
 
 
 def clean_daily_data(daily_data: dict, max_abs_return: float = 0.15) -> dict:
-    """Quarantine suspect observations by dropping the entire OHLCV row.
-
-    Every removed timestamp is logged. The returned DataFrame also carries
-    `attrs['quarantined_timestamps']` so research output can retain provenance.
-    """
+    """Quarantine entire OHLCV rows while retaining a provenance audit trail."""
     out = {}
     for name, df in daily_data.items():
         if df is None or df.empty:
@@ -78,14 +102,20 @@ def clean_daily_data(daily_data: dict, max_abs_return: float = 0.15) -> dict:
             continue
         if "close" not in df:
             raise ValueError(f"{name}: cannot clean a frame without close")
-        mask = suspect_price_mask(df["close"], max_abs_return)
-        flagged = [pd.Timestamp(ts).isoformat() for ts in df.index[mask]]
-        clean = df.loc[~mask].copy()
+        suspect = suspect_price_mask(df["close"], max_abs_return)
+        quarantine = quarantine_price_mask(df["close"], max_abs_return)
+        suspect_ts = [pd.Timestamp(ts).isoformat() for ts in df.index[suspect]]
+        quarantine_ts = [pd.Timestamp(ts).isoformat() for ts in df.index[quarantine]]
+        clean = df.loc[~quarantine].copy()
         clean.attrs.update(df.attrs)
-        clean.attrs["quarantined_timestamps"] = flagged
-        if flagged:
-            log.warning("%s: quarantined %d suspect OHLCV row(s): %s",
-                        name, len(flagged), ", ".join(flagged))
+        clean.attrs["suspect_timestamps"] = suspect_ts
+        clean.attrs["quarantined_timestamps"] = quarantine_ts
+        if suspect_ts:
+            log.warning("%s: flagged %d suspect price row(s) for review: %s",
+                        name, len(suspect_ts), ", ".join(suspect_ts))
+        if quarantine_ts:
+            log.warning("%s: quarantined %d invalid/isolated-spike OHLCV row(s): %s",
+                        name, len(quarantine_ts), ", ".join(quarantine_ts))
         out[name] = clean
     return out
 
