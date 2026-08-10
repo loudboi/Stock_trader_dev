@@ -1,110 +1,131 @@
 # Strategy 4 on Interactive Brokers (EUR-only)
 
-This is a **parallel** path to the Alpaca setup. It runs Strategy 4 (trend-pullback)
-against IBKR using EUR-denominated instruments, so there's no currency conversion
-and no FX exposure. None of the Alpaca code is touched — you can keep the Alpaca
-bot running while you build and paper-test this.
+This is a parallel broker path for the same long-only pullback executor. Use Python
+3.11/3.12 and paper-test it against IB Gateway/TWS before considering live money.
 
-New files (all separate):
-- `bot/portfolio_ibkr.py` — IBKR adapter (same method surface as the Alpaca Portfolio)
-- `bot/ibkr_universe.py` — the EUR instruments + their IBKR contract specs
-- `bot/live_pullback_ibkr.py` — the runner (reuses the existing trader unchanged)
-- `requirements-ibkr.txt` — adds `ib_async`
-- `tests/test_ibkr_adapter.py` — offline tests (no Gateway needed)
+Key files:
 
-Outputs are separate too: `pullback_ibkr_trades.csv`, `pullback_ibkr_daily_pnl.csv`,
-`pullback_ibkr_state.json`, and a `ibkr_cache/` folder for cached daily bars.
+- `bot/portfolio_ibkr.py` — broker/data adapter
+- `bot/ibkr_universe.py` — EUR instruments and contract metadata
+- `bot/live_pullback_ibkr.py` — IBKR entry point
+- `requirements-ibkr.txt` — `ib_async`/timezone dependencies
+- `tests/test_ibkr_adapter.py` — offline adapter tests
 
----
+Paper and live IBKR runs use separate state/output files from Alpaca and from each
+other.
 
-## 1. The big architectural difference vs Alpaca
+## 1. Gateway/TWS prerequisites
 
-Alpaca is a cloud REST endpoint. **IBKR is not** — your bot talks to a local
-**IB Gateway** (or TWS) that must be running and logged in, and *that* talks to
-IBKR. Everything below follows from this.
+IBKR API trading requires a locally reachable IB Gateway or TWS session.
 
-## 2. Prerequisites
+1. Log in to IB Gateway/TWS.
+2. Enable socket/API clients and configure trusted IPs.
+3. Record the port. Common defaults are:
+   - 4002 Gateway paper
+   - 4001 Gateway live
+   - 7497 TWS paper
+   - 7496 TWS live
+4. Make sure the account has the required market-data permissions/subscriptions for
+   every venue/instrument you intend to use.
+5. Install:
 
-1. **IB Gateway** (lighter) or **TWS**, logged into your IBKR account.
-2. In Gateway/TWS: **Configure → Settings → API → Settings**:
-   - Enable "ActiveX and Socket Clients"
-   - Add the bot's IP (e.g. `127.0.0.1`) to Trusted IPs
-   - Note the port. Defaults: **4002** = Gateway paper, 4001 = Gateway live,
-     7497 = TWS paper, 7496 = TWS live.
-   - Increase Memory Allocation to ~4096 MB (avoids crashes on bulk data).
-3. **Market-data subscriptions** for the European exchanges you'll trade
-   (Xetra/Germany, Euronext). Without them, live prices and historical requests
-   come back delayed or empty.
-4. Install deps: `pip install -r requirements.txt -r requirements-ibkr.txt`
+```bash
+python -m pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
+pytest -q tests/test_ibkr_adapter.py tests/test_live_pullback.py
+```
 
-## 3. Configure the connection (env vars)
+## 2. Connection configuration
+
+Paper Gateway example:
 
 ```bash
 export IBKR_HOST=127.0.0.1
-export IBKR_PORT=4002          # paper Gateway. Live ports (4001/7496) need --live
-export IBKR_CLIENT_ID=17       # any unique integer per API client
+export IBKR_PORT=4002
+export IBKR_CLIENT_ID=17
 ```
 
-## 4. The EUR universe — verify before trading
-
-`bot/ibkr_universe.py` defines the instruments. **The contract codes are sensible
-defaults, not gospel** — IBKR symbols/exchanges are exact, and a wrong one fails
-the order or resolves the wrong instrument. Confirm each in TWS (right-click →
-Contract Details) before trusting it.
-
-Indexes (UCITS ETFs, Xetra, EUR):
-- `STOXX600` — iShares STOXX Europe 600 (broad Europe)
-- `ESTX50`   — iShares EURO STOXX 50 (eurozone blue-chips)
-- `DAX`      — iShares Core DAX (Germany)
-
-Stocks (EUR):
-- `SAP` (Xetra), `ASML` (Amsterdam), `SIE` (Xetra), `MC` (LVMH, Paris), `TTE` (Paris)
-
-To add/remove, edit `IBKR_EUR_UNIVERSE` in that file, or pass `--symbols`.
-
-## 5. Run it (paper)
+Standard ports are classified automatically. For a **non-standard** port, set the
+mode explicitly; the runner refuses to guess:
 
 ```bash
-python -m bot.live_pullback_ibkr                       # default EUR shortlist
+export IBKR_PORT=12345
+export IBKR_MODE=paper        # or live
+```
+
+If mode resolves to live, `--live` is also required. Supplying `--live` while the
+runtime is explicitly paper is treated as an error rather than an ambiguous hint.
+
+## 3. Verify the EUR contracts
+
+`bot/ibkr_universe.py` contains contract symbols, primary exchanges and currencies.
+Treat those as configuration that must be verified in TWS/Contract Details before
+live use. A syntactically valid symbol can still resolve to the wrong security if
+contract metadata is wrong.
+
+Default categories include European UCITS index ETFs and selected EUR-listed
+stocks. Pass `--symbols` to run a subset.
+
+## 4. Paper run
+
+```bash
+python -m bot.live_pullback_ibkr
 python -m bot.live_pullback_ibkr --symbols STOXX600 DAX SAP
 ```
 
-It refuses a live port unless you also pass `--live`. Expect long quiet stretches —
-same daily trend-pullback logic as the Alpaca version, just EUR instruments.
-
-## 6. Verify offline first
+The runner uses the same broker-confirmed order/state semantics as the Alpaca path.
+An accepted order is not recorded as a fill until the position actually changes.
+An existing untracked long requires explicit adoption:
 
 ```bash
-python tests/test_ibkr_adapter.py      # logic tests, no Gateway required
+python -m bot.live_pullback_ibkr --adopt-existing
 ```
 
-## 7. Running on the VPS — what changes from your tmux setup
+Do that only after inspecting the broker position and deciding that this strategy
+should own it.
 
-The bot now needs **IB Gateway running on the VPS** alongside it. Two real
-caveats versus the clean Alpaca deployment:
+## 5. Protective stops
 
-- **Memory.** Gateway is a Java app wanting ~4 GB. Your 4 GB VPS goes from
-  comfortable to tight; consider a size bump.
-- **The reboot story breaks.** Gateway needs **2FA approval on login**, so an
-  unattended reboot won't silently bring it back the way your Alpaca tmux+cron
-  does. Either keep Gateway running for long stretches (avoid restarts) or add a
-  tool like **IBC** to automate Gateway login. The *bot's* auto-restart loop
-  still works, but it depends on Gateway being up underneath it.
+The IBKR adapter now places broker-resident **GTC sell stop orders** for managed
+long positions and tracks/cancels/replaces those orders when position size changes.
+If replacement cancellation cannot be confirmed, the runner does not create a
+second stop. If a close cannot safely cancel the protective stop first, the close is
+blocked rather than risking a double sell.
 
-The bot is self-healing about short drops: every adapter call reconnects if the
-socket dropped, and the run loop sleeps in 1-second steps so the ib_async event
-loop is never blocked for long.
+A broker-resident stop materially improves downtime protection but does not make the
+system fail-proof. Gaps can fill below the stop price, broker/exchange order handling
+can fail, and strategy reconciliation still needs Gateway connectivity.
 
-## 8. Honest limitations
+## 6. Market hours and cached data
 
-- **Tested offline only.** The adapter's translation/caching/order logic is unit-
-  tested against a fake IB, but it has **not** been run against a real Gateway from
-  here. Paper-test it yourself before trusting it, and watch the first orders fill
-  the way you expect.
-- **Market-hours check is best-effort.** It parses IBKR trading hours and, if it
-  can't tell, *allows* the trade (IBKR rejects/queues if truly closed) rather than
-  silently blocking. Verify behavior against your exchanges' hours.
-- **The in-process-stop caveat still applies** — stops are monitored while the bot
-  runs, not resting at the broker. Downtime = unmanaged risk.
-- This isn't financial advice. EUR-only removes FX risk but also removes FX upside
-  and concentrates you in European markets. Keep it on paper until it behaves.
+The adapter reads the exchange timezone and IBKR liquid/trading-hours metadata.
+If the timezone/hours state cannot be determined, it now **fails closed** for new
+trading actions rather than guessing that the market is open.
+
+Historical data is cached to reduce IBKR pacing pressure. When a refresh fails, a
+cache is used only if it is still within the adapter's freshness bound; stale cache
+is not silently treated as current history.
+
+Account equity is required in the configured base currency (EUR by default). A USD
+`NetLiquidation` row is not silently reinterpreted as EUR for risk sizing.
+
+## 7. VPS operation
+
+IB Gateway/TWS must remain logged in alongside the service. Account 2FA and Gateway
+restarts are operational dependencies; a systemd restart of the Python process
+cannot recreate an authenticated Gateway session by itself.
+
+Use `deploy/README.md` for the supported Git clone/systemd layout. Monitor both the
+Python service and Gateway/TWS. A broker stop is an additional protection layer, not
+an excuse to operate without monitoring.
+
+## 8. Live mode
+
+Standard live ports or `IBKR_MODE=live` require:
+
+```bash
+python -m bot.live_pullback_ibkr --live
+```
+
+Paper-test contract resolution, market data, order quantities, fills, GTC stop
+placement/replacement, restart reconciliation, and alerting before adding `--live`
+to an unattended service.
