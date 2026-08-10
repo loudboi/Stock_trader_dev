@@ -552,7 +552,7 @@ def test_print_walk_forward_runs_without_error(capsys):
         start_ts=idx[300], end_ts=idx[-1], folds=3)
     lab.print_walk_forward(per_fold)
     out = capsys.readouterr().out
-    assert "WALK-FORWARD" in out and "SUMMARY" in out
+    assert "CHRONOLOGICAL CONSISTENCY" in out and "no fitting" in out and "SUMMARY" in out
 
 
 def test_run_smoke_scoreboard():
