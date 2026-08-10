@@ -60,7 +60,7 @@ def compute_metrics(trades: list, equity: pd.Series, risk_free_annual: float = 0
     definition. Existing research remains comparable at the default 0%; studies
     that need an excess-return Sharpe can pass an annual rate deliberately.
     """
-    if risk_free_annual < -1:
+    if risk_free_annual <= -1:
         raise ValueError("risk_free_annual must be greater than -100%")
     n = len(trades)
     pnls = np.array([t["pnl"] for t in trades], dtype=float) if n else np.array([])
