@@ -92,7 +92,8 @@ def simulate(df: pd.DataFrame, p: Params = Params()) -> list:
             o = float(row["open"])
             tgt = pending["tgt"]
             ntrans = pending.get("ntrans")
-            if o > 0 and o < tgt and (not _num(ntrans) or o >= float(ntrans)):
+            if (o > pending["ptrans"] and o < tgt and
+                    (not _num(ntrans) or o >= float(ntrans))):
                 pos = {"entry": o, "i0": i, "tgt": tgt,
                        "ptrans": pending["ptrans"], "ntrans": ntrans,
                        "signal_date": pending["signal_date"], "last_prog": 0.0}
