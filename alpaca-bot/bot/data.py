@@ -1,99 +1,101 @@
 """
 bot/data.py
 ===========
-Backtest data sources. Live trading always uses Alpaca (bot/portfolio.py); this
-module exists so the *backtester* can optionally pull decades of free daily
-history from Yahoo, which Alpaca's IEX feed won't go back far enough to provide.
+Research/backtest data helpers.
 
-Fidelity note: Yahoo daily bars are split/dividend-ADJUSTED, while Alpaca returns
-raw prices. Adjusted prices are the right choice for a long backtest (they handle
-splits cleanly), but it does mean a Yahoo backtest is not bar-identical to live
-Alpaca data — treat the deep-history run as a regime study, not a live proxy.
-
-The pure normalizer (`normalize_ohlcv`) is separated from the network fetch so it
-can be unit-tested offline.
+Yahoo daily bars are adjusted and are not bar-identical to live Alpaca bars. The
+optional outlier cleaner is deliberately a QUARANTINE, not a price-correction
+model: suspect rows are removed as whole OHLCV bars and their timestamps are
+logged. It never invents a replacement close while leaving incompatible open/high/
+low values behind. Use it only after inspecting the flagged observations; genuine
+market discontinuities are data, not errors.
 """
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 log = logging.getLogger("data")
-
 _COLMAP = {"Open": "open", "High": "high", "Low": "low",
            "Close": "close", "Adj Close": "close", "Volume": "volume"}
+_REQUIRED = ("open", "high", "low", "close", "volume")
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """A raw vendor frame -> lowercase OHLCV indexed by UTC timestamp (ascending).
-
-    Tolerates yfinance quirks: a (field, ticker) MultiIndex on the columns, mixed
-    capitalization, an 'Adj Close' column, and a tz-naive date index.
-    """
     if df is None or len(df) == 0:
         return pd.DataFrame()
     df = df.copy()
-    # Flatten a column MultiIndex (yfinance returns one for single tickers too).
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.rename(columns=_COLMAP)
-    # If both 'Close' and 'Adj Close' mapped to 'close', keep the last (Adj Close).
     df = df.loc[:, ~df.columns.duplicated(keep="last")]
-    cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+    missing = [c for c in _REQUIRED if c not in df.columns]
+    if missing:
+        log.warning("OHLCV frame missing columns: %s", ", ".join(missing))
+    cols = [c for c in _REQUIRED if c in df.columns]
     df = df[cols]
     idx = pd.DatetimeIndex(df.index)
     df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
     return df.sort_index().dropna(how="any")
 
 
-def clean_price_series(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
-    """Patch implausible single-day moves by carrying forward the prior price.
+def suspect_price_mask(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Boolean mask for non-positive prices or jumps beyond the explicit threshold.
 
-    Free vendor data (especially FX/futures "=X"/"=F" tickers) occasionally has
-    bad ticks, and continuous futures contracts can cross zero on a real event
-    (e.g. WTI crude settled at -$37.63 on 2020-04-20) where a PERCENTAGE return is
-    mathematically undefined, not just large. Either case would otherwise inject a
-    spurious spike into any trend/volatility calculation for weeks around it (a
-    20-day realized-vol window means one bad day contaminates a month of signal).
-
-    `max_abs_return` is a single, conservative, asset-class-agnostic bound chosen
-    BEFORE looking at any backtest result — legitimate daily moves in liquid FX,
-    commodity, or equity markets essentially never exceed 15% outside a handful of
-    well-documented pathological events (which this targets, not conceals: the
-    patched days are still visible by comparing to the raw series). Not a strategy
-    parameter; do not tune this per backtest.
+    The threshold does not mean the observation is wrong; it means the observation
+    needs review before a strategy that assumes ordinary positive percentage prices
+    consumes it.
     """
-    px = close.copy().astype(float)
-    for i in range(1, len(px)):
-        prev = px.iloc[i - 1]
-        cur = px.iloc[i]
-        if prev <= 0 or cur <= 0 or abs(cur / prev - 1.0) > max_abs_return:
-            px.iloc[i] = prev
-    return px
+    if not 0 < max_abs_return < 10:
+        raise ValueError("max_abs_return must be between 0 and 10")
+    px = close.astype(float)
+    ret = px.pct_change(fill_method=None)
+    mask = (~np.isfinite(px)) | (px <= 0) | (ret.abs() > max_abs_return)
+    return pd.Series(mask, index=close.index, dtype=bool).fillna(False)
+
+
+def clean_price_series(close: pd.Series, max_abs_return: float = 0.15) -> pd.Series:
+    """Legacy convenience API: return the price series with suspect rows removed.
+
+    This intentionally changes the index instead of manufacturing replacement
+    prices. Call `suspect_price_mask` first if you need the exact audit list.
+    """
+    mask = suspect_price_mask(close, max_abs_return)
+    return close.loc[~mask].copy()
 
 
 def clean_daily_data(daily_data: dict, max_abs_return: float = 0.15) -> dict:
-    """Apply clean_price_series to the close column of every symbol's OHLCV frame
-    (open/high/low left as-is; only close drives the strategies in bot/lab.py)."""
+    """Quarantine suspect observations by dropping the entire OHLCV row.
+
+    Every removed timestamp is logged. The returned DataFrame also carries
+    `attrs['quarantined_timestamps']` so research output can retain provenance.
+    """
     out = {}
     for name, df in daily_data.items():
-        if df.empty:
+        if df is None or df.empty:
             out[name] = df
             continue
-        clean = df.copy()
-        clean["close"] = clean_price_series(clean["close"], max_abs_return)
+        if "close" not in df:
+            raise ValueError(f"{name}: cannot clean a frame without close")
+        mask = suspect_price_mask(df["close"], max_abs_return)
+        flagged = [pd.Timestamp(ts).isoformat() for ts in df.index[mask]]
+        clean = df.loc[~mask].copy()
+        clean.attrs.update(df.attrs)
+        clean.attrs["quarantined_timestamps"] = flagged
+        if flagged:
+            log.warning("%s: quarantined %d suspect OHLCV row(s): %s",
+                        name, len(flagged), ", ".join(flagged))
         out[name] = clean
     return out
 
 
 def load_yahoo(symbol: str, start, end) -> pd.DataFrame:
-    """Daily OHLCV from Yahoo (lazy import so it's optional)."""
     try:
         import yfinance as yf
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "yfinance is required for --data-source yahoo. Install it with "
-            "`pip install -r requirements-backtest.txt`.") from e
+            "yfinance is required for --data-source yahoo. Install requirements-backtest.txt") from e
     raw = yf.download(symbol, start=pd.Timestamp(start).date(),
                       end=pd.Timestamp(end).date(), interval="1d",
                       auto_adjust=True, progress=False, threads=False)
