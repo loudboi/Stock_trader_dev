@@ -49,6 +49,14 @@ def test_compute_metrics_basic_stats_and_true_initial_nav():
     assert abs(m["total_return"] - 0.0012) < 1e-12
 
 
+def test_compute_metrics_drawdown_includes_true_starting_nav():
+    idx = pd.date_range("2025-01-01", periods=3, freq="D", tz="UTC")
+    eq = pd.Series([90_000.0, 92_000.0, 91_000.0], index=idx)
+    eq.attrs["initial_equity"] = 100_000.0
+    m = bp.compute_metrics([], eq)
+    assert abs(m["max_drawdown"] + 0.10) < 1e-12
+
+
 def test_compute_metrics_risk_free_is_explicit():
     idx = pd.date_range("2025-01-01", periods=100, freq="D", tz="UTC")
     eq = pd.Series(100_000 * 1.001 ** np.arange(1, 101), index=idx)

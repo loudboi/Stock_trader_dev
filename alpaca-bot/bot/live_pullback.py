@@ -169,7 +169,8 @@ class PullbackLiveTrader:
             qty = float(p.get("qty", 0) or 0)
             entry = float(p.get("avg_entry", 0) or 0)
             dist = float(p.get("stop_dist", self.params.min_stop) or self.params.min_stop)
-            gross += qty * entry
+            mark = max(entry, float(p.get("last_price", entry) or entry))
+            gross += qty * mark
             risk += qty * entry * dist
         return {
             "gross_room": max(0.0, config.MAX_GROSS_EXPOSURE * equity - gross),
@@ -221,6 +222,7 @@ class PullbackLiveTrader:
         old_qty = float(pos.get("qty", 0) or 0)
         old_avg = float(pos.get("avg_entry", 0) or 0)
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+        pos["last_price"] = broker["avg_entry"]
         pos["tranches"] = len(self.params.tranches)
         pos["last_add_price"] = broker["avg_entry"]
         pos["externally_adjusted"] = True
@@ -323,6 +325,7 @@ class PullbackLiveTrader:
             fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"])
             fill_px = fill_px or broker["avg_entry"]
             pos["last_add_price"] = fill_px
+            pos["last_price"] = fill_px
             pos.setdefault("entry_orders", []).append({
                 "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],
                 "fill_price": fill_px, "submitted_at": pending["submitted_at"],
@@ -513,6 +516,8 @@ class PullbackLiveTrader:
                 self._apply_external_position_change(name, inst, pos, broker)
                 self.save_state()
 
+        if pos:
+            pos["last_price"] = latest
         if pos and latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):
             self._close(name, inst, latest, "volatility stop max(5%,2xATR)"); return
 

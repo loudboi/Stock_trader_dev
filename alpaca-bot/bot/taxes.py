@@ -87,7 +87,7 @@ def _year_end_event(index: pd.DatetimeIndex, i: int, realize_final: bool) -> boo
     if realize_final:
         return True
     ts = index[i]
-    return ts.month == 12 and ts.day >= 28
+    return (ts + pd.offsets.BDay(1)).year != ts.year
 
 
 def _after_tax_active_full(returns: pd.Series, tax_rate: float = SLOVENIA_TAX_RATE,

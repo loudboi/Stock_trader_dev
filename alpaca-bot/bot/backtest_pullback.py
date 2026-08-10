@@ -70,10 +70,14 @@ def compute_metrics(trades: list, equity: pd.Series, risk_free_annual: float = 0
                      (float("inf") if gross_win > 0 else 0.0))
     max_dd = total_return = sharpe = 0.0
     if len(equity):
-        running_max = equity.cummax()
-        dd = (equity - running_max) / running_max.replace(0, np.nan)
-        max_dd = float(dd.min()) if len(dd) else 0.0
         initial = _initial_equity(equity)
+        nav = equity.astype(float)
+        if initial != nav.iloc[0]:
+            lead = nav.index[0] - pd.Timedelta(nanoseconds=1)
+            nav = pd.concat([pd.Series([initial], index=[lead]), nav])
+        running_max = nav.cummax()
+        dd = (nav - running_max) / running_max.replace(0, np.nan)
+        max_dd = float(dd.min()) if len(dd) else 0.0
         total_return = float(equity.iloc[-1] / initial - 1) if initial else 0.0
     if len(equity) > 2:
         daily = equity.resample("1D").last().dropna()

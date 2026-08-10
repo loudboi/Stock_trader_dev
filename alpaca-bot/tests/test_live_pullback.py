@@ -181,6 +181,15 @@ def test_second_tranche_uses_existing_stop_distance_and_replaces_stop():
     assert abs(stop_price - pos["avg_entry"] * 0.95) < 1e-6
 
 
+def test_managed_gross_capacity_uses_latest_known_mark():
+    t = _trader(FakePortfolio())
+    t.state["positions"]["SPY"] = {
+        "qty": 100.0, "avg_entry": 100.0, "last_price": 150.0, "stop_dist": 0.05}
+    room = t._managed_capacity(100_000.0)
+    expected_gross = max(0.0, lp.config.MAX_GROSS_EXPOSURE * 100_000.0 - 15_000.0)
+    assert abs(room["gross_room"] - expected_gross) < 1e-9
+
+
 def test_manual_broker_position_change_refreshes_stop_and_freezes_further_adds():
     pf = FakePortfolio(); pf.price = 100.0
     t = _trader(pf); inst = t.instruments["SPY"]
