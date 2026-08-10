@@ -5,9 +5,12 @@ Alpaca broker adapter used by the live pullback runner and historical-data tools
 
 A broker/API failure is never represented as a valid flat position. Position reads
 return None only when Alpaca explicitly reports that the position does not exist.
+Cancellation succeeds only after the broker reports a non-working cancellation
+state; acceptance of a cancel request is not treated as confirmation.
 """
 
 import logging
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -33,6 +36,10 @@ _TF_MAP = {
     "4Hour": (TimeFrame(1, TimeFrameUnit.Hour), "4h"),
     "1Day": (TimeFrame.Day, None),
 }
+_CANCEL_CONFIRM_POLLS = 30
+_CANCEL_POLL_SECONDS = 0.1
+_CANCEL_CONFIRMED = {"canceled", "cancelled", "expired", "rejected"}
+_TERMINAL_ORDER_STATES = {"filled", *_CANCEL_CONFIRMED}
 
 
 def _api_status(exc):
@@ -168,19 +175,22 @@ class Portfolio:
             return None
 
     def order_status(self, order_id):
-        """Normalized order state used by live reconciliation."""
+        """Normalized order state used by live reconciliation.
+
+        Only states documented as final/no-further-execution are marked terminal.
+        States such as pending_cancel, stopped, suspended, calculated, done_for_day,
+        and replaced are deliberately not collapsed into terminal success because
+        they can still imply unresolved execution or a successor order.
+        """
         try:
             o = self.trading.get_order_by_id(order_id)
             raw = o.status.value if hasattr(o.status, "value") else str(o.status)
             status = str(raw).lower()
-            terminal = status in {
-                "filled", "canceled", "cancelled", "expired", "rejected",
-                "replaced", "stopped", "suspended", "calculated", "done_for_day"}
             return {
                 "status": status,
                 "filled_qty": float(getattr(o, "filled_qty", 0) or 0),
                 "qty": float(getattr(o, "qty", 0) or 0),
-                "terminal": terminal,
+                "terminal": status in _TERMINAL_ORDER_STATES,
             }
         except APIError as e:
             log.warning("Could not read order status %s: %s", order_id, e)
@@ -199,14 +209,39 @@ class Portfolio:
             return None
 
     def cancel_order(self, order_id: str) -> bool:
+        """Request cancellation and return True only after broker confirmation."""
         if not order_id:
             return True
+
+        current = self.order_status(order_id)
+        if current:
+            if current["status"] in _CANCEL_CONFIRMED:
+                return True
+            if current["status"] == "filled":
+                return False
         try:
             self.trading.cancel_order_by_id(order_id)
-            return True
         except APIError as e:
-            log.warning("Cancel order %s was not confirmed: %s", order_id, e)
+            # A race can make the DELETE non-cancelable between the read above and
+            # the request. Query once more before deciding; never infer success from
+            # the HTTP response alone.
+            latest = self.order_status(order_id)
+            if latest and latest["status"] in _CANCEL_CONFIRMED:
+                return True
+            log.warning("Cancel request for order %s failed/unconfirmed: %s", order_id, e)
             return False
+
+        for _ in range(_CANCEL_CONFIRM_POLLS):
+            status = self.order_status(order_id)
+            if status:
+                if status["status"] in _CANCEL_CONFIRMED:
+                    return True
+                if status["status"] == "filled":
+                    log.warning("Order %s filled before cancellation was confirmed.", order_id)
+                    return False
+            time.sleep(_CANCEL_POLL_SECONDS)
+        log.warning("Cancel request for order %s was accepted but not terminally confirmed.", order_id)
+        return False
 
     def recent_fill_price(self, instrument, side: str, order_id=None, since=None):
         """Return a fill price for an exact order, or a recent bounded symbol/side fill."""
