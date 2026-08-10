@@ -43,7 +43,9 @@ def test_gap_above_locked_target_cancels_pending_entry():
 
 
 def test_stop1_close_below_ntrans():
-    df = _df([99, 101, 100, 89, 88], opens=[99, 100, 100, 95, 88])
+    # The execution open remains above locked pTrans, so the entry is valid before
+    # the later close below nTrans exercises stop1.
+    df = _df([99, 101, 100, 89, 88], opens=[99, 100, 100.5, 95, 88])
     trades = bt.simulate(df)
     assert len(trades) == 1
     assert "stop1" in trades[0]["reason"]
@@ -51,15 +53,15 @@ def test_stop1_close_below_ntrans():
 
 
 def test_same_bar_target_and_price_stop_uses_adverse_stop():
-    # Day 1 close confirms the crossing. Day 2 opens the trade, trades through the
-    # +GEX target intraday, but also closes below nTrans. OHLC cannot establish a
-    # favorable target-first sequence, so the adverse stop outcome must be used.
-    df = _df([99, 101, 89], opens=[99, 100, 100],
+    # Day 1 close confirms the crossing. Day 2 opens above locked pTrans, trades
+    # through the +GEX target intraday, but also closes below nTrans. OHLC cannot
+    # establish a favorable target-first sequence, so the adverse stop is used.
+    df = _df([99, 101, 89], opens=[99, 100, 100.5],
              high=[99, 101, 111], low=[99, 100, 85])
     trades = bt.simulate(df)
     assert len(trades) == 1
     assert trades[0]["reason"].startswith("ambiguous target/stop")
-    assert trades[0]["entry"] == 100
+    assert trades[0]["entry"] == 100.5
     assert trades[0]["exit"] == 89
 
 
