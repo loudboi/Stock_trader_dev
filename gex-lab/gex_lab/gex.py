@@ -1,24 +1,29 @@
 """
 gex_lab/gex.py
 ==============
-The GEX math and level computation. Pure functions operate on a "chain" DataFrame
-(columns: strike, kind ['C'/'P'], oi, iv, T) so they're testable offline; the
-yfinance fetch is separated out.
+GEX math and level construction.
 
-GEX convention (naive, and the single biggest assumption): dealers are LONG calls
-and SHORT puts, so a call strike contributes +gamma·OI and a put strike −gamma·OI.
-Dollar GEX per strike is gamma · OI · 100 · spot² · 0.01 (≈ $ hedging per 1% move).
+The dealer-position sign convention remains a major model assumption: calls are
+assigned positive dealer gamma and puts negative dealer gamma. This is not an
+observable dealer inventory reconstruction.
+
+Black-Scholes gamma assumptions are explicit and configurable. The risk-free rate
+and continuous dividend yield are inputs to every calculation rather than hidden
+inside an unexplained fixed 4% constant.
 """
 
 import logging
-from math import pi, sqrt
+from math import exp, pi, sqrt
 
 import numpy as np
 import pandas as pd
 
 log = logging.getLogger("gex")
 
-RISK_FREE = 0.04
+DEFAULT_RISK_FREE = 0.04
+DEFAULT_DIVIDEND_YIELD = 0.0
+# Compatibility alias used by older callers/tests.
+RISK_FREE = DEFAULT_RISK_FREE
 _CHAIN_COLS = ["strike", "kind", "oi", "iv", "T"]
 
 
@@ -26,99 +31,116 @@ def _norm_pdf(x):
     return np.exp(-x * x / 2.0) / sqrt(2 * pi)
 
 
-def bs_gamma(S, K, T, sigma, r=RISK_FREE):
-    """Black-Scholes gamma (same for calls and puts). 0 for degenerate inputs."""
-    S, K, T, sigma = float(S), float(K), float(T), float(sigma)
+def bs_gamma(S, K, T, sigma, r=DEFAULT_RISK_FREE, q=DEFAULT_DIVIDEND_YIELD):
+    """Black-Scholes-Merton spot gamma with continuous dividend yield ``q``."""
+    S, K, T, sigma, r, q = map(float, (S, K, T, sigma, r, q))
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + sigma * sigma / 2.0) * T) / (sigma * sqrt(T))
-    return float(_norm_pdf(d1) / (S * sigma * sqrt(T)))
+    root_t = sqrt(T)
+    d1 = (np.log(S / K) + (r - q + sigma * sigma / 2.0) * T) / (sigma * root_t)
+    return float(exp(-q * T) * _norm_pdf(d1) / (S * sigma * root_t))
 
 
 def _sign(kind):
-    return 1.0 if kind == "C" else -1.0
+    if kind == "C":
+        return 1.0
+    if kind == "P":
+        return -1.0
+    raise ValueError(f"unknown option kind {kind!r}")
 
 
-def net_gex_by_strike(chain: pd.DataFrame, spot: float, r=RISK_FREE) -> pd.Series:
-    """Dollar GEX per strike at the current spot (calls +, puts −), $ per 1% move."""
+def _validate_chain(chain: pd.DataFrame):
+    missing = [c for c in _CHAIN_COLS if c not in chain.columns]
+    if missing:
+        raise ValueError("chain missing columns: " + ", ".join(missing))
+
+
+def net_gex_by_strike(chain: pd.DataFrame, spot: float,
+                      r=DEFAULT_RISK_FREE, q=DEFAULT_DIVIDEND_YIELD) -> pd.Series:
     if chain.empty:
         return pd.Series(dtype=float)
-    g = chain.apply(lambda x: bs_gamma(spot, x["strike"], x["T"], x["iv"], r), axis=1)
-    gex = g * chain["oi"] * 100.0 * spot * spot * 0.01 * chain["kind"].map(_sign)
+    _validate_chain(chain)
+    if spot <= 0:
+        raise ValueError("spot must be positive")
+    g = chain.apply(lambda x: bs_gamma(spot, x["strike"], x["T"], x["iv"], r, q), axis=1)
+    signs = chain["kind"].map(_sign)
+    gex = g * chain["oi"].astype(float) * 100.0 * spot * spot * 0.01 * signs
     return gex.groupby(chain["strike"]).sum().sort_index()
 
 
-def total_gex_at(chain: pd.DataFrame, S: float, r=RISK_FREE) -> float:
-    """Total dollar GEX if spot were S (gammas recomputed at S). Used for the flip."""
+def total_gex_at(chain: pd.DataFrame, S: float,
+                 r=DEFAULT_RISK_FREE, q=DEFAULT_DIVIDEND_YIELD) -> float:
     if chain.empty:
         return 0.0
-    g = chain.apply(lambda x: bs_gamma(S, x["strike"], x["T"], x["iv"], r), axis=1)
-    return float((g * chain["oi"] * 100.0 * S * S * 0.01 * chain["kind"].map(_sign)).sum())
+    _validate_chain(chain)
+    if S <= 0:
+        raise ValueError("spot must be positive")
+    g = chain.apply(lambda x: bs_gamma(S, x["strike"], x["T"], x["iv"], r, q), axis=1)
+    signs = chain["kind"].map(_sign)
+    return float((g * chain["oi"].astype(float) * 100.0 * S * S * 0.01 * signs).sum())
 
 
-def gamma_flip(chain: pd.DataFrame, spot: float, r=RISK_FREE,
-               lo=0.6, hi=1.4, n=400):
-    """Zero-gamma level: the spot at which total GEX crosses zero (dealers flip
-    from short to long gamma). Returns the crossing nearest spot, or None."""
+def gamma_flip(chain: pd.DataFrame, spot: float, r=DEFAULT_RISK_FREE,
+               q=DEFAULT_DIVIDEND_YIELD, lo=0.6, hi=1.4, n=400):
     if chain.empty:
         return None
+    if spot <= 0 or not (0 < lo < hi) or n < 2:
+        raise ValueError("invalid gamma-flip grid")
     grid = np.linspace(spot * lo, spot * hi, n)
-    tot = np.array([total_gex_at(chain, S, r) for S in grid])
+    tot = np.array([total_gex_at(chain, S, r, q) for S in grid])
     crossings = []
     for i in range(1, len(grid)):
         if tot[i - 1] == 0 or (tot[i - 1] < 0) != (tot[i] < 0):
-            # linear interpolate the zero crossing
             x0, x1, y0, y1 = grid[i - 1], grid[i], tot[i - 1], tot[i]
             crossings.append(x0 if y1 == y0 else x0 - y0 * (x1 - x0) / (y1 - y0))
-    if not crossings:
-        return None
-    return float(min(crossings, key=lambda x: abs(x - spot)))
+    return (float(min(crossings, key=lambda x: abs(x - spot)))
+            if crossings else None)
 
 
 def center_of_mass(chain: pd.DataFrame, kind: str):
-    """Open-interest-weighted average strike for one side ('C' or 'P')."""
+    if kind not in {"C", "P"}:
+        raise ValueError("kind must be C or P")
     side = chain[chain["kind"] == kind]
-    if side.empty or side["oi"].sum() == 0:
+    total = side["oi"].sum() if not side.empty else 0
+    if total <= 0:
         return None
-    return float((side["strike"] * side["oi"]).sum() / side["oi"].sum())
+    return float((side["strike"] * side["oi"]).sum() / total)
 
 
-def compute_levels(chain: pd.DataFrame, spot: float, r=RISK_FREE) -> dict:
-    """The level set the Vol-Desk-style system keys off. Several are best-effort
-    reconstructions of proprietary definitions (see notes)."""
-    by = net_gex_by_strike(chain, spot, r)
+def compute_levels(chain: pd.DataFrame, spot: float, r=DEFAULT_RISK_FREE,
+                   q=DEFAULT_DIVIDEND_YIELD) -> dict:
+    """Best-effort level reconstruction under the documented sign/BSM assumptions."""
+    if spot <= 0:
+        raise ValueError("spot must be positive")
+    by = net_gex_by_strike(chain, spot, r, q)
     above = by[by.index > spot]
-    below = by[by.index < spot]
-    put_oi = chain[chain["kind"] == "P"].groupby("strike")["oi"].sum()
-
-    pos_gex = float(above.idxmax()) if len(above) and above.max() > 0 else None   # +GEX target
-    flip = gamma_flip(chain, spot, r)                                            # zeroGEX
+    put_oi = (chain[chain["kind"] == "P"].groupby("strike")["oi"].sum()
+              if not chain.empty else pd.Series(dtype=float))
+    pos_gex = float(above.idxmax()) if len(above) and above.max() > 0 else None
+    flip = gamma_flip(chain, spot, r, q)
     put_wall = float(put_oi.idxmax()) if len(put_oi) else None
-    cotmp = center_of_mass(chain, "P")                                           # center of put mass
-    cotmc = center_of_mass(chain, "C")                                          # center of call mass
-
+    cotmp = center_of_mass(chain, "P") if not chain.empty else None
+    cotmc = center_of_mass(chain, "C") if not chain.empty else None
     return {
         "spot": float(spot),
         "net_gex": float(by.sum()),
-        "pos_gex": pos_gex,          # +GEX  (call-side gamma magnet above spot)
-        "zero_gex": flip,            # zeroGEX (gamma flip)
-        "cotmp": cotmp,              # Center Of puT Mass (put structural floor)
-        "cotmc": cotmc,              # Center Of call Mass
+        "pos_gex": pos_gex,
+        "zero_gex": flip,
+        "cotmp": cotmp,
+        "cotmc": cotmc,
         "put_wall": put_wall,
-        # Approximations of the proprietary transition levels:
-        #   pTrans ~ the gamma flip (cross into positive-gamma regime)
-        #   nTrans ~ the put wall  (structural break below)
         "ptrans": flip,
         "ntrans": put_wall,
+        "risk_free": float(r),
+        "dividend_yield": float(q),
+        "dealer_sign_model": "calls_positive_puts_negative",
     }
 
 
-# --------------------------------------------------------------------------- #
-# Network fetch (kept separate so the math above is unit-tested offline)
-# --------------------------------------------------------------------------- #
 def fetch_chain(ticker: str, max_days: int = 45):
-    """Aggregate near-dated option chains from yfinance into a chain DataFrame.
-    Returns (chain_df, spot). chain_df has columns strike/kind/oi/iv/T."""
+    """Fetch near-dated yfinance chains; network access is isolated here."""
+    if max_days <= 0:
+        raise ValueError("max_days must be positive")
     import yfinance as yf
     t = yf.Ticker(ticker)
     hist = t.history(period="1d")
