@@ -21,6 +21,10 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s")
 log = logging.getLogger("overnight")
 RESULTS_PNG = "overnight_results.png"
+# Kept as a public module constant because tests/research notebooks historically
+# referenced it. It is the cost of an ACTUAL daily round trip, not a blanket
+# charge applied to rows where no holding interval exists.
+_DAILY_ROUNDTRIP_COST = 2 * SLIPPAGE
 
 
 def overnight_return(daily: pd.DataFrame, cost_per_side: float = SLIPPAGE) -> pd.Series:
