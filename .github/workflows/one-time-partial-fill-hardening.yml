@@ -1,0 +1,117 @@
+name: One-time partial-fill hardening
+
+on:
+  push:
+    branches: [agent/fix-repo-audit]
+    paths: [.github/workflows/one-time-partial-fill-hardening.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/fix-repo-audit
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Apply exact partial-fill hardening
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if new in s:
+                  return
+              if old not in s:
+                  raise SystemExit(f"Expected block not found in {path}; refusing broad edit")
+              p.write_text(s.replace(old, new, 1))
+
+          # Broker adapters expose normalized order state so a position delta is
+          # not incorrectly treated as proof of a complete requested fill.
+          replace_once(
+              "alpaca-bot/bot/portfolio.py",
+              '''    def submit_stop_order(self, instrument, qty: float, stop_price: float):\n''',
+              '''    def order_status(self, order_id):\n        """Normalized order state used by live reconciliation."""\n        try:\n            o = self.trading.get_order_by_id(order_id)\n            raw = o.status.value if hasattr(o.status, "value") else str(o.status)\n            status = str(raw).lower()\n            terminal = status in {\n                "filled", "canceled", "cancelled", "expired", "rejected",\n                "replaced", "stopped", "suspended", "calculated", "done_for_day"}\n            return {\n                "status": status,\n                "filled_qty": float(getattr(o, "filled_qty", 0) or 0),\n                "qty": float(getattr(o, "qty", 0) or 0),\n                "terminal": terminal,\n            }\n        except APIError as e:\n            log.warning("Could not read order status %s: %s", order_id, e)\n            return None\n\n    def submit_stop_order(self, instrument, qty: float, stop_price: float):\n''')
+
+          replace_once(
+              "alpaca-bot/bot/portfolio_ibkr.py",
+              '''    def close_position_raw(self, inst):\n''',
+              '''    def order_status(self, order_id):\n        """Normalized ib_async order state for pending/partial reconciliation."""\n        self._ensure()\n        wanted = str(order_id)\n        try:\n            for trade in self.ib.trades():\n                order = getattr(trade, "order", None)\n                if str(getattr(order, "orderId", "")) != wanted:\n                    continue\n                st = getattr(trade, "orderStatus", None)\n                status = str(getattr(st, "status", "") or "").lower()\n                filled = float(getattr(st, "filled", 0) or 0)\n                remaining = float(getattr(st, "remaining", 0) or 0)\n                return {\n                    "status": status,\n                    "filled_qty": filled,\n                    "qty": filled + remaining,\n                    "terminal": status in {"filled", "cancelled", "apicancelled", "inactive"},\n                }\n        except Exception as e:  # noqa: BLE001\n            log.warning("Could not read IBKR order status %s: %s", order_id, e)\n        return None\n\n    def close_position_raw(self, inst):\n''')
+
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''    def _managed_capacity(self, equity):\n''',
+              '''    def _order_status(self, order_id):\n        fn = getattr(self.pf, "order_status", None)\n        if fn is None:\n            return None\n        try:\n            return fn(order_id)\n        except Exception as e:  # noqa: BLE001\n            log.warning("Could not read broker order status %s: %s", order_id, e)\n            return None\n\n    def _managed_capacity(self, equity):\n''')
+
+          replace_once(
+              "alpaca-bot/bot/live_pullback.py",
+              '''    def _wait_pending(self, name, inst, seconds=ORDER_CONFIRM_SECONDS):\n        deadline = time.monotonic() + seconds\n        while name in self.state["pending"] and time.monotonic() < deadline:\n            if self._confirm_pending(name, inst):\n                return True\n            time.sleep(ORDER_CONFIRM_INTERVAL)\n        if name in self.state["pending"]:\n            self.notify(f"ORDER UNCERTAIN: {name} accepted but not broker-confirmed; blocking symbol.")\n            return False\n        return True\n\n''',
+              '''    def _wait_pending(self, name, inst, seconds=ORDER_CONFIRM_SECONDS):\n        deadline = time.monotonic() + seconds\n        while name in self.state["pending"] and time.monotonic() < deadline:\n            if self._confirm_pending(name, inst):\n                return True\n            time.sleep(ORDER_CONFIRM_INTERVAL)\n        if name not in self.state["pending"]:\n            return True\n\n        # A market order that remains active/ambiguous this long should not be left\n        # outstanding while the symbol is unmanaged. Request cancellation, then use\n        # terminal broker status + broker position truth to settle a partial/no-fill.\n        pending = self.state["pending"][name]\n        status = self._order_status(pending["order_id"])\n        if not (status and status.get("terminal")):\n            if self.pf.cancel_order(pending["order_id"]):\n                cancel_deadline = time.monotonic() + 3.0\n                while name in self.state["pending"] and time.monotonic() < cancel_deadline:\n                    if self._confirm_pending(name, inst):\n                        return True\n                    time.sleep(ORDER_CONFIRM_INTERVAL)\n        if name in self.state["pending"] and self._confirm_pending(name, inst):\n            return True\n        if name in self.state["pending"]:\n            self.notify(f"ORDER UNCERTAIN: {name} could not be terminally reconciled; blocking symbol.")\n            return False\n        return True\n\n    def _settle_partial_buy(self, name, inst, pending, broker):\n        delta = max(0.0, broker["qty"] - float(pending["before_qty"]))\n        if delta <= 1e-9:\n            return False\n        pos = self.state["positions"].get(name)\n        if pos is None:\n            pos = {"tranches": 0, "stop_dist": pending["stop_dist"],\n                   "entry_time": pending["submitted_at"], "stop_order_id": None,\n                   "stop_level": None, "stop_qty": 0.0, "entry_orders": []}\n        fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]\n        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n        pos["tranches"] = len(self.params.tranches)\n        pos["last_add_price"] = fill_px\n        pos["last_price"] = fill_px\n        pos["partial_fill_frozen"] = True\n        pos.setdefault("entry_orders", []).append({\n            "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],\n            "filled_qty": delta, "fill_price": fill_px,\n            "submitted_at": pending["submitted_at"],\n            "tranche": pending["tranche_index"] + 1, "terminal_partial": True})\n        self.state["positions"][name] = pos\n        self.state["pending"].pop(name, None)\n        protected = self._place_stop(name, inst, pos)\n        self.save_state()\n        self.notify(f"PARTIAL BUY {name}: {delta}/{pending['requested_qty']} filled; "\n                    "remainder terminal/cancelled, position frozen as fully built" +\n                    ("." if protected else " [protective stop unavailable]."))\n        return True\n\n    def _settle_partial_close(self, name, inst, pending, broker):\n        original = pending["position"]\n        sold = max(0.0, float(original["qty"]) - broker["qty"])\n        if sold <= 1e-9:\n            return False\n        exit_px = (self.pf.recent_fill_price(inst, "sell", pending["order_id"]) or\n                   pending["requested_exit_price"])\n        partial_pos = dict(original)\n        partial_pos["qty"] = sold\n        pnl = (exit_px - original["avg_entry"]) * sold\n        self._log_trade(name, partial_pos, exit_px, pnl,\n                        pending["reason"] + " (terminal partial close)", pending["order_id"])\n        self._accrue_daily(pnl)\n        pos = self.state["positions"].get(name) or dict(original)\n        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n        pos["tranches"] = len(self.params.tranches)\n        pos["last_price"] = broker["avg_entry"]\n        pos["partial_close_frozen"] = True\n        self.state["positions"][name] = pos\n        self.state["pending"].pop(name, None)\n        protected = self._place_stop(name, inst, pos)\n        self.save_state()\n        self.notify(f"PARTIAL CLOSE {name}: sold {sold}, {broker['qty']} remains; "\n                    "remainder frozen as fully built" +\n                    ("." if protected else " [protective stop unavailable]."))\n        return True\n\n''')
+
+          # Replace only the pending-order reconciliation method. Terminal partials
+          # become protected/frozen; terminal no-fills restore the prior stop.
+          start = '''    def _confirm_pending(self, name, inst):\n'''
+          end = '''    def _place_stop(self, name, inst, pos):\n'''
+          p = Path("alpaca-bot/bot/live_pullback.py")
+          s = p.read_text()
+          i, j = s.index(start), s.index(end, s.index(start))
+          current = s[i:j]
+          replacement = '''    def _confirm_pending(self, name, inst):\n        pending = self.state["pending"].get(name)\n        if not pending:\n            return True\n        broker = self._broker_position(inst)\n        status = self._order_status(pending["order_id"])\n        terminal = bool(status and status.get("terminal"))\n\n        if pending["type"] == "buy":\n            before = float(pending["before_qty"])\n            requested = float(pending["requested_qty"])\n            delta = max(0.0, (broker["qty"] if broker else 0.0) - before)\n            if delta <= 1e-9:\n                if terminal:\n                    self.state["pending"].pop(name, None)\n                    self.save_state()\n                    self.notify(f"BUY ENDED WITHOUT FILL: {name} order {pending['order_id']} ({status['status']}).")\n                    return True\n                return False\n            if delta + 1e-9 < requested:\n                if terminal:\n                    return self._settle_partial_buy(name, inst, pending, broker)\n                # Do not let an incompletely filled market order sit open while the\n                # strategy prepares another tranche. Cancel it and settle only once\n                # broker status becomes terminal.\n                if not pending.get("cancel_requested"):\n                    pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))\n                    self.save_state()\n                status = self._order_status(pending["order_id"])\n                if status and status.get("terminal"):\n                    return self._settle_partial_buy(name, inst, pending, self._broker_position(inst))\n                return False\n\n            pos = self.state["positions"].get(name)\n            if pos is None:\n                pos = {"tranches": 0, "stop_dist": pending["stop_dist"],\n                       "entry_time": pending["submitted_at"], "stop_order_id": None,\n                       "stop_level": None, "stop_qty": 0.0, "entry_orders": []}\n            pos["tranches"] = max(pos.get("tranches", 0), pending["tranche_index"] + 1)\n            pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n            fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]\n            pos["last_add_price"] = fill_px\n            pos["last_price"] = fill_px\n            pos.setdefault("entry_orders", []).append({\n                "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],\n                "filled_qty": delta, "fill_price": fill_px,\n                "submitted_at": pending["submitted_at"],\n                "tranche": pending["tranche_index"] + 1})\n            self.state["positions"][name] = pos\n            self.state["pending"].pop(name, None)\n            protected = self._place_stop(name, inst, pos)\n            self.save_state()\n            self.notify(f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "\n                        f"qty={delta} @~{fill_px:.4f} ({pending['how']})" +\n                        ("" if protected else " [broker stop unavailable]"))\n            return True\n\n        if pending["type"] == "close":\n            if broker is None:\n                pos = pending["position"]\n                exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])\n                exit_px = exit_px or pending["requested_exit_price"]\n                pnl = (exit_px - pos["avg_entry"]) * pos["qty"]\n                self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])\n                self._accrue_daily(pnl)\n                self.state["positions"].pop(name, None)\n                self.state["intents"].pop(name, None)\n                self.state["pending"].pop(name, None)\n                self.save_state()\n                self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")\n                return True\n\n            original_qty = float(pending["position"]["qty"])\n            sold = max(0.0, original_qty - broker["qty"])\n            if terminal:\n                if sold > 1e-9:\n                    return self._settle_partial_close(name, inst, pending, broker)\n                # Terminal close request with zero fill: restore protection and clear\n                # pending instead of leaving the symbol permanently blocked.\n                pos = self.state["positions"].get(name) or dict(pending["position"])\n                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n                self.state["positions"][name] = pos\n                self.state["pending"].pop(name, None)\n                protected = self._place_stop(name, inst, pos)\n                self.save_state()\n                self.notify(f"CLOSE ENDED WITHOUT FILL: {name}; protection restored" +\n                            ("." if protected else " [protective stop unavailable]."))\n                return True\n            if sold > 1e-9 and not pending.get("cancel_requested"):\n                pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))\n                self.save_state()\n            pos = self.state["positions"].get(name)\n            if pos:\n                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]\n            return False\n        raise RuntimeError(f"Unknown pending order type for {name}: {pending['type']}")\n\n'''
+          p.write_text(s[:i] + replacement + s[j:])
+
+          # Fake broker models terminal state and one partial-fill path.
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''        self.position_error = None\n''',
+              '''        self.position_error = None\n        self.order_states = {}\n''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''        self.market_orders.append((oid, side, qty))\n        if side == "buy":\n            self._fill_buy(qty)\n            self.last_buy_fill = self.price\n        return oid\n''',
+              '''        self.market_orders.append((oid, side, qty))\n        if side == "buy":\n            self._fill_buy(qty)\n            self.last_buy_fill = self.price\n        self.order_states[oid] = {"status": "filled", "filled_qty": float(qty),\n                                  "qty": float(qty), "terminal": True}\n        return oid\n''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''        self.last_sell_fill = self.price\n        self.position = None\n        return oid\n''',
+              '''        self.last_sell_fill = self.price\n        filled = self.position["qty"] if self.position else 0.0\n        self.position = None\n        self.order_states[oid] = {"status": "filled", "filled_qty": float(filled),\n                                  "qty": float(filled), "terminal": True}\n        return oid\n''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''    def cancel_order(self, order_id):\n        self.cancelled.append(order_id)\n        if self.fail_cancel:\n            return False\n        self.stops.pop(order_id, None)\n        return True\n\n    def recent_fill_price(self, inst, side, order_id=None, since=None):\n''',
+              '''    def cancel_order(self, order_id):\n        self.cancelled.append(order_id)\n        if self.fail_cancel:\n            return False\n        self.stops.pop(order_id, None)\n        if order_id in self.order_states and not self.order_states[order_id].get("terminal"):\n            self.order_states[order_id]["status"] = "canceled"\n            self.order_states[order_id]["terminal"] = True\n        return True\n\n    def order_status(self, order_id):\n        return dict(self.order_states[order_id]) if order_id in self.order_states else None\n\n    def recent_fill_price(self, inst, side, order_id=None, since=None):\n''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''        self.market_orders.append((oid, side, qty))\n        self._delayed = (qty, side)\n        return oid\n''',
+              '''        self.market_orders.append((oid, side, qty))\n        self._delayed = (qty, side, oid)\n        self.order_states[oid] = {"status": "new", "filled_qty": 0.0,\n                                  "qty": float(qty), "terminal": False}\n        return oid\n''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''        qty, side = self._delayed\n        if side == "buy":\n            self._fill_buy(qty)\n            self.last_buy_fill = self.price\n\n\ndef _trader''',
+              '''        qty, side, oid = self._delayed\n        if side == "buy":\n            self._fill_buy(qty)\n            self.last_buy_fill = self.price\n            self.order_states[oid] = {"status": "filled", "filled_qty": float(qty),\n                                      "qty": float(qty), "terminal": True}\n\n\nclass PartialFillPortfolio(FakePortfolio):\n    def submit_market_order(self, inst, qty, side):\n        oid = f"mkt-{self._next_id}"\n        self._next_id += 1\n        self.market_orders.append((oid, side, qty))\n        partial = min(float(qty), 20.0)\n        if side == "buy":\n            self._fill_buy(partial)\n            self.last_buy_fill = self.price\n        self.order_states[oid] = {"status": "partially_filled",\n                                  "filled_qty": partial, "qty": float(qty),\n                                  "terminal": False}\n        return oid\n\n\ndef _trader''')
+          replace_once(
+              "alpaca-bot/tests/test_live_pullback.py",
+              '''def test_restart_reconcile_settles_strategy_pending_buy_before_adoption_check():\n''',
+              '''def test_terminal_partial_buy_is_frozen_and_protected_not_promoted_to_next_tranche():\n    pf = PartialFillPortfolio(); pf.price = 100.0\n    t = _trader(pf)\n    assert t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")\n    pos = t.state["positions"]["SPY"]\n    assert pos["qty"] == 20.0\n    assert pos["tranches"] == len(t.params.tranches)\n    assert pos["partial_fill_frozen"] is True\n    assert "SPY" not in t.state["pending"]\n    stop_qty, _ = pf.stops[pos["stop_order_id"]]\n    assert stop_qty == 20.0\n\n\ndef test_restart_reconcile_settles_strategy_pending_buy_before_adoption_check():\n''')
+          PY
+      - name: Install targeted test dependencies
+        working-directory: alpaca-bot
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
+      - name: Run live and IBKR regression tests before commit
+        working-directory: alpaca-bot
+        run: python -m pytest -q tests/test_live_pullback.py tests/test_ibkr_adapter.py
+      - name: Commit only after targeted tests pass
+        run: |
+          rm -f .github/workflows/one-time-audit-patch.yml \
+                .github/workflows/one-time-audit-refinements.yml \
+                .github/workflows/one-time-partial-fill-hardening.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Harden live reconciliation for terminal partial fills"
+          git push origin HEAD:agent/fix-repo-audit
