@@ -163,6 +163,16 @@ class PullbackLiveTrader:
                 f"{inst.name}: broker holds a {r.get('side')} position; Strategy 4 is long-only.")
         return r
 
+    def _order_status(self, order_id):
+        fn = getattr(self.pf, "order_status", None)
+        if fn is None:
+            return None
+        try:
+            return fn(order_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not read broker order status %s: %s", order_id, e)
+            return None
+
     def _managed_capacity(self, equity):
         gross = risk = 0.0
         for p in self.state["positions"].values():
@@ -183,9 +193,82 @@ class PullbackLiveTrader:
             if self._confirm_pending(name, inst):
                 return True
             time.sleep(ORDER_CONFIRM_INTERVAL)
+        if name not in self.state["pending"]:
+            return True
+
+        # A market order that remains active/ambiguous this long should not be left
+        # outstanding while the symbol is unmanaged. Request cancellation, then use
+        # terminal broker status + broker position truth to settle a partial/no-fill.
+        pending = self.state["pending"][name]
+        status = self._order_status(pending["order_id"])
+        if not (status and status.get("terminal")):
+            if self.pf.cancel_order(pending["order_id"]):
+                cancel_deadline = time.monotonic() + 3.0
+                while name in self.state["pending"] and time.monotonic() < cancel_deadline:
+                    if self._confirm_pending(name, inst):
+                        return True
+                    time.sleep(ORDER_CONFIRM_INTERVAL)
+        if name in self.state["pending"] and self._confirm_pending(name, inst):
+            return True
         if name in self.state["pending"]:
-            self.notify(f"ORDER UNCERTAIN: {name} accepted but not broker-confirmed; blocking symbol.")
+            self.notify(f"ORDER UNCERTAIN: {name} could not be terminally reconciled; blocking symbol.")
             return False
+        return True
+
+    def _settle_partial_buy(self, name, inst, pending, broker):
+        delta = max(0.0, broker["qty"] - float(pending["before_qty"]))
+        if delta <= 1e-9:
+            return False
+        pos = self.state["positions"].get(name)
+        if pos is None:
+            pos = {"tranches": 0, "stop_dist": pending["stop_dist"],
+                   "entry_time": pending["submitted_at"], "stop_order_id": None,
+                   "stop_level": None, "stop_qty": 0.0, "entry_orders": []}
+        fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]
+        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+        pos["tranches"] = len(self.params.tranches)
+        pos["last_add_price"] = fill_px
+        pos["last_price"] = fill_px
+        pos["partial_fill_frozen"] = True
+        pos.setdefault("entry_orders", []).append({
+            "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],
+            "filled_qty": delta, "fill_price": fill_px,
+            "submitted_at": pending["submitted_at"],
+            "tranche": pending["tranche_index"] + 1, "terminal_partial": True})
+        self.state["positions"][name] = pos
+        self.state["pending"].pop(name, None)
+        protected = self._place_stop(name, inst, pos)
+        self.save_state()
+        self.notify(f"PARTIAL BUY {name}: {delta}/{pending['requested_qty']} filled; "
+                    "remainder terminal/cancelled, position frozen as fully built" +
+                    ("." if protected else " [protective stop unavailable]."))
+        return True
+
+    def _settle_partial_close(self, name, inst, pending, broker):
+        original = pending["position"]
+        sold = max(0.0, float(original["qty"]) - broker["qty"])
+        if sold <= 1e-9:
+            return False
+        exit_px = (self.pf.recent_fill_price(inst, "sell", pending["order_id"]) or
+                   pending["requested_exit_price"])
+        partial_pos = dict(original)
+        partial_pos["qty"] = sold
+        pnl = (exit_px - original["avg_entry"]) * sold
+        self._log_trade(name, partial_pos, exit_px, pnl,
+                        pending["reason"] + " (terminal partial close)", pending["order_id"])
+        self._accrue_daily(pnl)
+        pos = self.state["positions"].get(name) or dict(original)
+        pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+        pos["tranches"] = len(self.params.tranches)
+        pos["last_price"] = broker["avg_entry"]
+        pos["partial_close_frozen"] = True
+        self.state["positions"][name] = pos
+        self.state["pending"].pop(name, None)
+        protected = self._place_stop(name, inst, pos)
+        self.save_state()
+        self.notify(f"PARTIAL CLOSE {name}: sold {sold}, {broker['qty']} remains; "
+                    "remainder frozen as fully built" +
+                    ("." if protected else " [protective stop unavailable]."))
         return True
 
     def _adopt_long(self, name, inst, broker):
@@ -312,9 +395,34 @@ class PullbackLiveTrader:
         if not pending:
             return True
         broker = self._broker_position(inst)
+        status = self._order_status(pending["order_id"])
+        terminal = bool(status and status.get("terminal"))
+
         if pending["type"] == "buy":
-            if not broker or broker["qty"] <= pending["before_qty"] + 1e-9:
+            before = float(pending["before_qty"])
+            requested = float(pending["requested_qty"])
+            delta = max(0.0, (broker["qty"] if broker else 0.0) - before)
+            if delta <= 1e-9:
+                if terminal:
+                    self.state["pending"].pop(name, None)
+                    self.save_state()
+                    self.notify(f"BUY ENDED WITHOUT FILL: {name} order {pending['order_id']} ({status['status']}).")
+                    return True
                 return False
+            if delta + 1e-9 < requested:
+                if terminal:
+                    return self._settle_partial_buy(name, inst, pending, broker)
+                # Do not let an incompletely filled market order sit open while the
+                # strategy prepares another tranche. Cancel it and settle only once
+                # broker status becomes terminal.
+                if not pending.get("cancel_requested"):
+                    pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))
+                    self.save_state()
+                status = self._order_status(pending["order_id"])
+                if status and status.get("terminal"):
+                    return self._settle_partial_buy(name, inst, pending, self._broker_position(inst))
+                return False
+
             pos = self.state["positions"].get(name)
             if pos is None:
                 pos = {"tranches": 0, "stop_dist": pending["stop_dist"],
@@ -322,42 +430,61 @@ class PullbackLiveTrader:
                        "stop_level": None, "stop_qty": 0.0, "entry_orders": []}
             pos["tranches"] = max(pos.get("tranches", 0), pending["tranche_index"] + 1)
             pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-            fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"])
-            fill_px = fill_px or broker["avg_entry"]
+            fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]
             pos["last_add_price"] = fill_px
             pos["last_price"] = fill_px
             pos.setdefault("entry_orders", []).append({
                 "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],
-                "fill_price": fill_px, "submitted_at": pending["submitted_at"],
-                "tranche": pending["tranche_index"] + 1,
-            })
+                "filled_qty": delta, "fill_price": fill_px,
+                "submitted_at": pending["submitted_at"],
+                "tranche": pending["tranche_index"] + 1})
             self.state["positions"][name] = pos
             self.state["pending"].pop(name, None)
             protected = self._place_stop(name, inst, pos)
             self.save_state()
             self.notify(f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
-                        f"qty={pending['requested_qty']} @~{fill_px:.4f} ({pending['how']})" +
+                        f"qty={delta} @~{fill_px:.4f} ({pending['how']})" +
                         ("" if protected else " [broker stop unavailable]"))
             return True
 
         if pending["type"] == "close":
-            if broker is not None:
-                pos = self.state["positions"].get(name)
-                if pos:
-                    pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-                return False
-            pos = pending["position"]
-            exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
-            exit_px = exit_px or pending["requested_exit_price"]
-            pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
-            self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])
-            self._accrue_daily(pnl)
-            self.state["positions"].pop(name, None)
-            self.state["intents"].pop(name, None)
-            self.state["pending"].pop(name, None)
-            self.save_state()
-            self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")
-            return True
+            if broker is None:
+                pos = pending["position"]
+                exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
+                exit_px = exit_px or pending["requested_exit_price"]
+                pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
+                self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])
+                self._accrue_daily(pnl)
+                self.state["positions"].pop(name, None)
+                self.state["intents"].pop(name, None)
+                self.state["pending"].pop(name, None)
+                self.save_state()
+                self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")
+                return True
+
+            original_qty = float(pending["position"]["qty"])
+            sold = max(0.0, original_qty - broker["qty"])
+            if terminal:
+                if sold > 1e-9:
+                    return self._settle_partial_close(name, inst, pending, broker)
+                # Terminal close request with zero fill: restore protection and clear
+                # pending instead of leaving the symbol permanently blocked.
+                pos = self.state["positions"].get(name) or dict(pending["position"])
+                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+                self.state["positions"][name] = pos
+                self.state["pending"].pop(name, None)
+                protected = self._place_stop(name, inst, pos)
+                self.save_state()
+                self.notify(f"CLOSE ENDED WITHOUT FILL: {name}; protection restored" +
+                            ("." if protected else " [protective stop unavailable]."))
+                return True
+            if sold > 1e-9 and not pending.get("cancel_requested"):
+                pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))
+                self.save_state()
+            pos = self.state["positions"].get(name)
+            if pos:
+                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
+            return False
         raise RuntimeError(f"Unknown pending order type for {name}: {pending['type']}")
 
     def _place_stop(self, name, inst, pos):

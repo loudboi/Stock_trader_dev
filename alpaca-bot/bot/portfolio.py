@@ -167,6 +167,25 @@ class Portfolio:
             log.error("Close failed for %s: %s", instrument.name, e)
             return None
 
+    def order_status(self, order_id):
+        """Normalized order state used by live reconciliation."""
+        try:
+            o = self.trading.get_order_by_id(order_id)
+            raw = o.status.value if hasattr(o.status, "value") else str(o.status)
+            status = str(raw).lower()
+            terminal = status in {
+                "filled", "canceled", "cancelled", "expired", "rejected",
+                "replaced", "stopped", "suspended", "calculated", "done_for_day"}
+            return {
+                "status": status,
+                "filled_qty": float(getattr(o, "filled_qty", 0) or 0),
+                "qty": float(getattr(o, "qty", 0) or 0),
+                "terminal": terminal,
+            }
+        except APIError as e:
+            log.warning("Could not read order status %s: %s", order_id, e)
+            return None
+
     def submit_stop_order(self, instrument, qty: float, stop_price: float):
         if instrument.asset_class == "crypto" or qty <= 0 or stop_price <= 0:
             return None

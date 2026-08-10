@@ -25,6 +25,7 @@ class FakePortfolio:
         self.price = 100.0
         self.fail_cancel = False
         self.position_error = None
+        self.order_states = {}
 
     def get_equity(self):
         return self._equity
@@ -50,6 +51,8 @@ class FakePortfolio:
         if side == "buy":
             self._fill_buy(qty)
             self.last_buy_fill = self.price
+        self.order_states[oid] = {"status": "filled", "filled_qty": float(qty),
+                                  "qty": float(qty), "terminal": True}
         return oid
 
     def _fill_buy(self, qty):
@@ -67,7 +70,10 @@ class FakePortfolio:
         self._next_id += 1
         self.market_orders.append((oid, "sell", self.position["qty"] if self.position else 0.0))
         self.last_sell_fill = self.price
+        filled = self.position["qty"] if self.position else 0.0
         self.position = None
+        self.order_states[oid] = {"status": "filled", "filled_qty": float(filled),
+                                  "qty": float(filled), "terminal": True}
         return oid
 
     def submit_stop_order(self, inst, qty, stop_price):
@@ -81,7 +87,13 @@ class FakePortfolio:
         if self.fail_cancel:
             return False
         self.stops.pop(order_id, None)
+        if order_id in self.order_states and not self.order_states[order_id].get("terminal"):
+            self.order_states[order_id]["status"] = "canceled"
+            self.order_states[order_id]["terminal"] = True
         return True
+
+    def order_status(self, order_id):
+        return dict(self.order_states[order_id]) if order_id in self.order_states else None
 
     def recent_fill_price(self, inst, side, order_id=None, since=None):
         return self.last_buy_fill if side == "buy" else self.last_sell_fill
@@ -93,14 +105,33 @@ class DelayedFillPortfolio(FakePortfolio):
         oid = f"mkt-{self._next_id}"
         self._next_id += 1
         self.market_orders.append((oid, side, qty))
-        self._delayed = (qty, side)
+        self._delayed = (qty, side, oid)
+        self.order_states[oid] = {"status": "new", "filled_qty": 0.0,
+                                  "qty": float(qty), "terminal": False}
         return oid
 
     def fill_delayed(self):
-        qty, side = self._delayed
+        qty, side, oid = self._delayed
         if side == "buy":
             self._fill_buy(qty)
             self.last_buy_fill = self.price
+            self.order_states[oid] = {"status": "filled", "filled_qty": float(qty),
+                                      "qty": float(qty), "terminal": True}
+
+
+class PartialFillPortfolio(FakePortfolio):
+    def submit_market_order(self, inst, qty, side):
+        oid = f"mkt-{self._next_id}"
+        self._next_id += 1
+        self.market_orders.append((oid, side, qty))
+        partial = min(float(qty), 20.0)
+        if side == "buy":
+            self._fill_buy(partial)
+            self.last_buy_fill = self.price
+        self.order_states[oid] = {"status": "partially_filled",
+                                  "filled_qty": partial, "qty": float(qty),
+                                  "terminal": False}
+        return oid
 
 
 def _trader(pf, symbols=("SPY",), **params):
@@ -129,12 +160,8 @@ def test_buy_tranche_sizes_and_places_resting_stop():
 def test_accepted_buy_is_not_state_fill_until_broker_confirms():
     pf = DelayedFillPortfolio(); pf.price = 100.0
     t = _trader(pf)
-    old_seconds = lp.ORDER_CONFIRM_SECONDS
-    lp.ORDER_CONFIRM_SECONDS = 0.0
-    try:
-        assert not t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
-    finally:
-        lp.ORDER_CONFIRM_SECONDS = old_seconds
+    t._wait_pending = lambda name, inst, seconds=lp.ORDER_CONFIRM_SECONDS: False
+    assert not t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
     assert "SPY" in t.state["pending"]
     assert "SPY" not in t.state["positions"]
     pf.fill_delayed()
@@ -143,15 +170,24 @@ def test_accepted_buy_is_not_state_fill_until_broker_confirms():
     assert t.state["positions"]["SPY"]["qty"] == 60
 
 
+def test_terminal_partial_buy_is_frozen_and_protected_not_promoted_to_next_tranche():
+    pf = PartialFillPortfolio(); pf.price = 100.0
+    t = _trader(pf)
+    assert t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
+    pos = t.state["positions"]["SPY"]
+    assert pos["qty"] == 20.0
+    assert pos["tranches"] == len(t.params.tranches)
+    assert pos["partial_fill_frozen"] is True
+    assert "SPY" not in t.state["pending"]
+    stop_qty, _ = pf.stops[pos["stop_order_id"]]
+    assert stop_qty == 20.0
+
+
 def test_restart_reconcile_settles_strategy_pending_buy_before_adoption_check():
     pf = DelayedFillPortfolio(); pf.price = 100.0
     t = _trader(pf)
-    old_seconds = lp.ORDER_CONFIRM_SECONDS
-    lp.ORDER_CONFIRM_SECONDS = 0.0
-    try:
-        assert not t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
-    finally:
-        lp.ORDER_CONFIRM_SECONDS = old_seconds
+    t._wait_pending = lambda name, inst, seconds=lp.ORDER_CONFIRM_SECONDS: False
+    assert not t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
     assert "SPY" in t.state["pending"] and "SPY" not in t.state["positions"]
     pf.fill_delayed()
     # Simulate a process restart. The pending order already proves ownership; the

@@ -328,6 +328,29 @@ class IBKRPortfolio:
             log.error("Order failed (%s %s %s): %s", side, qty, inst.name, e)
             return None
 
+    def order_status(self, order_id):
+        """Normalized ib_async order state for pending/partial reconciliation."""
+        self._ensure()
+        wanted = str(order_id)
+        try:
+            for trade in self.ib.trades():
+                order = getattr(trade, "order", None)
+                if str(getattr(order, "orderId", "")) != wanted:
+                    continue
+                st = getattr(trade, "orderStatus", None)
+                status = str(getattr(st, "status", "") or "").lower()
+                filled = float(getattr(st, "filled", 0) or 0)
+                remaining = float(getattr(st, "remaining", 0) or 0)
+                return {
+                    "status": status,
+                    "filled_qty": filled,
+                    "qty": filled + remaining,
+                    "terminal": status in {"filled", "cancelled", "apicancelled", "inactive"},
+                }
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not read IBKR order status %s: %s", order_id, e)
+        return None
+
     def close_position_raw(self, inst):
         r = self.get_position_raw(inst)
         if not r:
