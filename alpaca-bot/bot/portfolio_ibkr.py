@@ -10,7 +10,8 @@ state. Equity positions use real GTC stop orders at IBKR, so protection survives
 bot/Gateway process interruptions after IBKR has accepted the stop. Cancellation
 success means IBKR has reported a cancellation state, not merely that cancelOrder
 was called successfully. Exact-order fill recovery aggregates every matching
-execution into a volume-weighted average price.
+execution into a volume-weighted average price. Persisted pending orders can be
+reconciled after an API-session restart through completed-order/execution requests.
 """
 
 import logging
@@ -23,6 +24,7 @@ log = logging.getLogger("portfolio_ibkr")
 _CANCEL_CONFIRM_POLLS = 12
 _CANCEL_POLL_SECONDS = 0.25
 _IBKR_CANCEL_CONFIRMED = {"cancelled", "apicancelled"}
+_IBKR_TERMINAL = {"filled", *_IBKR_CANCEL_CONFIRMED}
 
 
 def contract_kwargs(spec: dict) -> dict:
@@ -153,7 +155,7 @@ class IBKRPortfolio:
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self._contracts, self._hours, self._bar_cache = {}, {}, {}
-        self._strategy_orders = {}  # string order id -> ib_async Order object
+        self._strategy_orders = {}
         if connect:
             self.connect()
 
@@ -317,6 +319,20 @@ class IBKRPortfolio:
             oid = getattr(order, "orderId", None)
         return str(oid) if oid is not None else None
 
+    @staticmethod
+    def _normalized_trade_status(trade):
+        order = getattr(trade, "order", None)
+        st = getattr(trade, "orderStatus", None)
+        status = str(getattr(st, "status", "") or "").lower()
+        filled = float(getattr(st, "filled", 0) or 0)
+        remaining = float(getattr(st, "remaining", 0) or 0)
+        return str(getattr(order, "orderId", "")), {
+            "status": status,
+            "filled_qty": filled,
+            "qty": filled + remaining,
+            "terminal": status in _IBKR_TERMINAL,
+        }
+
     def submit_market_order(self, inst, qty: float, side: str):
         self._ensure()
         if qty <= 0:
@@ -335,24 +351,20 @@ class IBKRPortfolio:
             return None
 
     def order_status(self, order_id):
-        """Normalized ib_async order state for pending/partial reconciliation."""
+        """Normalized order state, including completed-order recovery after restart."""
         self._ensure()
         wanted = str(order_id)
         try:
             for trade in self.ib.trades():
-                order = getattr(trade, "order", None)
-                if str(getattr(order, "orderId", "")) != wanted:
-                    continue
-                st = getattr(trade, "orderStatus", None)
-                status = str(getattr(st, "status", "") or "").lower()
-                filled = float(getattr(st, "filled", 0) or 0)
-                remaining = float(getattr(st, "remaining", 0) or 0)
-                return {
-                    "status": status,
-                    "filled_qty": filled,
-                    "qty": filled + remaining,
-                    "terminal": status in {"filled", "cancelled", "apicancelled"},
-                }
+                oid, status = self._normalized_trade_status(trade)
+                if oid == wanted:
+                    return status
+            # trades() is documented as session-scoped. Persisted pending state can
+            # outlive this API session, so query completed API orders before giving up.
+            for trade in self.ib.reqCompletedOrders(apiOnly=True):
+                oid, status = self._normalized_trade_status(trade)
+                if oid == wanted:
+                    return status
         except Exception as e:  # noqa: BLE001
             log.warning("Could not read IBKR order status %s: %s", order_id, e)
         return None
@@ -435,6 +447,36 @@ class IBKRPortfolio:
         log.warning("IBKR cancel request %s was not terminally confirmed.", order_id)
         return False
 
+    @staticmethod
+    def _matching_fills(fills, con_id, wanted_side, order_id, since_ts):
+        matches = []
+        for fill in fills:
+            ex, fc = getattr(fill, "execution", None), getattr(fill, "contract", None)
+            if ex is None or getattr(fc, "conId", None) != con_id:
+                continue
+            ex_side = str(getattr(ex, "side", "")).lower()
+            normalized = "buy" if ex_side.startswith("b") else "sell"
+            if normalized != wanted_side:
+                continue
+            ex_oid = getattr(ex, "orderId", None)
+            if order_id not in (None, "already-flat") and str(ex_oid) != str(order_id):
+                continue
+            ex_time = pd.Timestamp(getattr(ex, "time", datetime.now(timezone.utc)))
+            ex_time = (ex_time.tz_localize("UTC") if ex_time.tzinfo is None
+                       else ex_time.tz_convert("UTC"))
+            if since_ts is not None and ex_time < since_ts:
+                continue
+            px = getattr(ex, "price", None)
+            if px is None:
+                continue
+            try:
+                qty = float(getattr(ex, "shares", 0) or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            matches.append({"time": ex_time, "price": float(px),
+                            "qty": max(0.0, qty), "order_id": ex_oid})
+        return matches
+
     def recent_fill_price(self, inst, side: str, order_id=None, since=None):
         """Return VWAP for an exact order, or for the latest matching order."""
         try:
@@ -445,32 +487,13 @@ class IBKRPortfolio:
             if since_ts is not None:
                 since_ts = (since_ts.tz_localize("UTC") if since_ts.tzinfo is None
                             else since_ts.tz_convert("UTC"))
-            matches = []
-            for fill in self.ib.fills():
-                ex, fc = getattr(fill, "execution", None), getattr(fill, "contract", None)
-                if ex is None or getattr(fc, "conId", None) != con_id:
-                    continue
-                ex_side = str(getattr(ex, "side", "")).lower()
-                normalized = "buy" if ex_side.startswith("b") else "sell"
-                if normalized != wanted_side:
-                    continue
-                ex_oid = getattr(ex, "orderId", None)
-                if order_id not in (None, "already-flat") and str(ex_oid) != str(order_id):
-                    continue
-                ex_time = pd.Timestamp(getattr(ex, "time", datetime.now(timezone.utc)))
-                ex_time = (ex_time.tz_localize("UTC") if ex_time.tzinfo is None
-                           else ex_time.tz_convert("UTC"))
-                if since_ts is not None and ex_time < since_ts:
-                    continue
-                px = getattr(ex, "price", None)
-                if px is None:
-                    continue
-                try:
-                    qty = float(getattr(ex, "shares", 0) or 0)
-                except (TypeError, ValueError):
-                    qty = 0.0
-                matches.append({"time": ex_time, "price": float(px),
-                                "qty": max(0.0, qty), "order_id": ex_oid})
+            matches = self._matching_fills(
+                self.ib.fills(), con_id, wanted_side, order_id, since_ts)
+            # fills() is session-scoped. After a reconnect/restart, explicitly ask
+            # IBKR for executions when the current session has no matching fill.
+            if not matches:
+                matches = self._matching_fills(
+                    self.ib.reqExecutions(), con_id, wanted_side, order_id, since_ts)
             if not matches:
                 return None
 
