@@ -3,8 +3,10 @@ bot/seasonality.py
 ==================
 Calendar-effect research. The turn-of-month position is held on exactly the last
 `days_before` trading days and first `days_after` trading days named by the rule.
-Trading calendars are known in advance, so the calendar signal itself does not
-need the price-signal one-day delay used by technical strategies.
+Trading calendars are known in advance, so this calendar signal does not need the
+price-signal one-day delay used by technical strategies. Capturing a named trading
+day means establishing the position by the prior close; the calendar membership is
+already knowable then.
 """
 
 import argparse
@@ -40,8 +42,8 @@ def turn_of_month_signal(index: pd.DatetimeIndex, days_before=DAYS_BEFORE,
 def turn_of_month_returns(panel, days_before=DAYS_BEFORE, days_after=DAYS_AFTER):
     rets = panel.pct_change().fillna(0.0)
     w = turn_of_month_signal(panel.index, days_before, days_after)
-    # Calendar membership is knowable before the session. Do not shift it into a
-    # different set of days, which was the old off-by-one implementation.
+    # Calendar membership is knowable before the session. Shifting this signal
+    # would test the wrong dates (e.g. first 2-4 days instead of first 1-3).
     turnover = w.diff().abs().fillna(w.abs()) * SLIPPAGE
     return w * rets.mean(axis=1) - turnover
 
@@ -60,6 +62,12 @@ def print_weekday_stats(daily_data, begin_ts):
     for name, r in by_day.items():
         print(f"{name}: N={len(r)} mean={r.mean():+.4%} annualized-arithmetic={r.mean()*252:+.1%}")
     print(f"All: N={len(overall)} mean={overall.mean():+.4%}")
+    nonempty = {name: r for name, r in by_day.items() if len(r)}
+    if nonempty:
+        best = max(nonempty, key=lambda n: nonempty[n].mean())
+        worst = min(nonempty, key=lambda n: nonempty[n].mean())
+        print(f"Best day: {best} ({nonempty[best].mean():+.4%}/day). "
+              f"Worst day: {worst} ({nonempty[worst].mean():+.4%}/day).")
 
 
 def run(daily_data, begin_ts, days_before=DAYS_BEFORE, days_after=DAYS_AFTER):
