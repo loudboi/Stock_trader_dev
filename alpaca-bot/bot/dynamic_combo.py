@@ -44,9 +44,10 @@ def breadth_signal(reference_panel: pd.DataFrame, ma_period=BREADTH_MA) -> pd.Se
     ma = reference_panel.rolling(ma_period, min_periods=ma_period).mean()
     valid = ma.notna()
     above = (reference_panel > ma).where(valid)
-    # Do not treat an asset without enough history as a negative breadth vote.
-    count = valid.sum(axis=1).replace(0, pd.NA)
-    return above.sum(axis=1, skipna=True).div(count).astype(float)
+    # Keep the denominator numeric: pd.NA promotes this series to object dtype
+    # under current pandas and breaks the warmup rows on astype(float).
+    count = valid.sum(axis=1).astype(float).replace(0.0, float("nan"))
+    return above.sum(axis=1, skipna=True).astype(float).div(count)
 
 
 def dynamic_rp_weight(signal: pd.Series, target_index, low_thresh, high_thresh,
