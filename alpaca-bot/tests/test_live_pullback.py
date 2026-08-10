@@ -143,6 +143,26 @@ def test_accepted_buy_is_not_state_fill_until_broker_confirms():
     assert t.state["positions"]["SPY"]["qty"] == 60
 
 
+def test_restart_reconcile_settles_strategy_pending_buy_before_adoption_check():
+    pf = DelayedFillPortfolio(); pf.price = 100.0
+    t = _trader(pf)
+    old_seconds = lp.ORDER_CONFIRM_SECONDS
+    lp.ORDER_CONFIRM_SECONDS = 0.0
+    try:
+        assert not t._buy_tranche("SPY", t.instruments["SPY"], 100.0, 0, 0.05, "test")
+    finally:
+        lp.ORDER_CONFIRM_SECONDS = old_seconds
+    assert "SPY" in t.state["pending"] and "SPY" not in t.state["positions"]
+    pf.fill_delayed()
+    # Simulate a process restart. The pending order already proves ownership; the
+    # resulting broker long must not be mistaken for an untracked manual position.
+    restarted = _trader(pf)
+    restarted.reconcile()
+    assert "SPY" not in restarted.state["pending"]
+    assert restarted.state["positions"]["SPY"]["qty"] == 60
+    assert not restarted.state["positions"]["SPY"].get("adopted", False)
+
+
 def test_second_tranche_uses_existing_stop_distance_and_replaces_stop():
     pf = FakePortfolio(); pf.price = 100.0
     t = _trader(pf)
@@ -150,7 +170,6 @@ def test_second_tranche_uses_existing_stop_distance_and_replaces_stop():
     t._buy_tranche("SPY", inst, 100.0, 0, 0.05, "t1")
     first_stop = t.state["positions"]["SPY"]["stop_order_id"]
     pf.price = 110.0
-    # Pass a different new ATR distance; sizing/protection must keep first-stop distance.
     t._buy_tranche("SPY", inst, 110.0, 1, 0.20, "t2")
     pos = t.state["positions"]["SPY"]
     assert pos["stop_dist"] == 0.05
@@ -160,6 +179,26 @@ def test_second_tranche_uses_existing_stop_distance_and_replaces_stop():
     qty, stop_price = pf.stops[pos["stop_order_id"]]
     assert abs(qty - pos["qty"]) < 1e-9
     assert abs(stop_price - pos["avg_entry"] * 0.95) < 1e-6
+
+
+def test_manual_broker_position_change_refreshes_stop_and_freezes_further_adds():
+    pf = FakePortfolio(); pf.price = 100.0
+    t = _trader(pf); inst = t.instruments["SPY"]
+    t._buy_tranche("SPY", inst, 100.0, 0, 0.05, "t1")
+    old_stop = t.state["positions"]["SPY"]["stop_order_id"]
+    # Human/manual increase at broker: local tranche history can no longer tell us
+    # whether this corresponds to tranche 2, 3, or an unrelated position edit.
+    pf.position = {"side": "long", "qty": 75.0, "avg_entry": 102.0}
+    t.state["intents"]["SPY"] = {"type": "add", "tranche_index": 1, "limit": 101.0}
+    t.reconcile()
+    pos = t.state["positions"]["SPY"]
+    assert pos["qty"] == 75 and pos["avg_entry"] == 102.0
+    assert pos["tranches"] == len(t.params.tranches)
+    assert pos["externally_adjusted"] is True
+    assert "SPY" not in t.state["intents"]
+    assert old_stop in pf.cancelled
+    qty, _ = pf.stops[pos["stop_order_id"]]
+    assert qty == 75.0
 
 
 def test_crypto_tranche_tracks_position_when_broker_stop_unavailable():
