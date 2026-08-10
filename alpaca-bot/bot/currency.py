@@ -5,9 +5,19 @@ Currency conversion helpers for an EUR-based investor holding USD assets.
 
 `EURUSD=X` is USD per EUR, so a USD asset's EUR daily growth factor is
 ``(1 + usd_asset_return) / (1 + eurusd_return)``. For a portfolio that is only
-partly invested in USD assets and keeps the remainder in EUR cash, the conversion
-is performed as an exact wealth recurrence rather than multiplying an approximate
-FX-return adjustment.
+partly invested in USD assets and keeps the remainder in EUR cash, conversion is an
+exact wealth recurrence rather than an approximate FX-return multiplier.
+
+The supplied ``usd_returns`` is a whole-portfolio USD-denominated return
+contribution. It may include transaction costs on an entry/exit row even when the
+end-of-row asset exposure is zero. Therefore the same exact recurrence is applied at
+all exposure levels::
+
+    factor = (1-f) + (f + usd_return) / (1 + fx_return)
+
+When ``f == 0`` and ``usd_return`` is a small negative exit cost, this correctly
+preserves/converts that cost instead of discarding it or incorrectly rejecting the
+row.
 
 FX alignment is causal: observations may be forward-filled from the last known FX
 close, but future quotes are never backfilled into dates before FX history starts.
@@ -30,7 +40,6 @@ def te_invested_fraction(daily_data: dict, ma_period: int = 200,
         for name, daily in daily_data.items()
     }
     aligned = pd.concat(per_symbol, axis=1).fillna(0.0)
-    # Fixed capital split: a missing sleeve is idle, not reallocated to others.
     return aligned.sum(axis=1) / len(per_symbol)
 
 
@@ -49,8 +58,8 @@ def align_fx_causally(fx_close: pd.Series, idx: pd.Index) -> pd.Series:
     if fx_close is None or len(fx_close) == 0:
         raise ValueError("FX history is required for unhedged EUR conversion")
     fx = pd.Series(fx_close, dtype=float).sort_index()
-    if (fx <= 0).any():
-        raise ValueError("FX close must be positive")
+    if (~np.isfinite(fx)).any() or (fx <= 0).any():
+        raise ValueError("FX close must be finite and positive")
     union = fx.index.union(pd.Index(idx)).sort_values()
     aligned = fx.reindex(union).ffill().reindex(idx)
     if aligned.isna().any():
@@ -63,38 +72,30 @@ def align_fx_causally(fx_close: pd.Series, idx: pd.Index) -> pd.Series:
 
 def unhedged_eur_equity(usd_returns: pd.Series, fx_close: pd.Series,
                         invested_frac=1.0, initial: float = 100_000.0) -> pd.Series:
-    """Exact EUR wealth path for a USD-return stream plus EUR cash.
+    """Exact EUR wealth path for a USD return contribution plus EUR cash.
 
-    `usd_returns[t]` is the whole portfolio's USD-denominated return contribution
-    for day t. `invested_frac[t]` is the fraction whose capital is actually exposed
-    to USD assets; the remainder sits in EUR cash. If ``f > 0``, the implied USD
-    asset return is ``usd_returns / f`` and the exact EUR factor is::
-
-        (1-f) + f * (1 + usd_returns/f) / (1 + fx_return)
-
-    which simplifies to ``(1-f) + (f + usd_returns)/(1+fx_return)``.
+    ``invested_frac`` is the capital fraction exposed to USD assets over the row.
+    ``usd_returns`` is the whole-portfolio USD return contribution, including any
+    trading costs. The formula remains valid at ``f=0`` for a pure transaction-cost
+    row and at ``f=1`` for a fully USD-invested row.
     """
     if usd_returns.empty:
         return pd.Series(dtype=float)
+    if initial <= 0:
+        raise ValueError("initial must be positive")
     r = usd_returns.sort_index().astype(float)
+    if (~np.isfinite(r)).any():
+        raise ValueError("usd_returns must be finite")
     frac = _fraction(invested_frac, r.index)
     fx = align_fx_causally(fx_close, r.index)
     fx_ret = fx.pct_change(fill_method=None).fillna(0.0)
-    if (1.0 + fx_ret <= 0).any():
+    denom = 1.0 + fx_ret
+    if (denom <= 0).any() or (~np.isfinite(denom)).any():
         raise ValueError("invalid FX return")
 
-    factor = pd.Series(1.0, index=r.index, dtype=float)
-    exposed = frac > 0
-    factor.loc[exposed] = ((1.0 - frac.loc[exposed]) +
-                           (frac.loc[exposed] + r.loc[exposed]) /
-                           (1.0 + fx_ret.loc[exposed]))
-    # When f=0, a strategy should not report USD-asset P&L. Refuse inconsistent
-    # inputs instead of silently discarding a return.
-    inconsistent = (~exposed) & (r.abs() > 1e-12)
-    if inconsistent.any():
-        raise ValueError("non-zero USD return while invested_frac is zero")
-    if (factor <= 0).any():
-        raise ValueError("EUR portfolio wealth factor became non-positive")
+    factor = (1.0 - frac) + (frac + r) / denom
+    if (~np.isfinite(factor)).any() or (factor <= 0).any():
+        raise ValueError("EUR portfolio wealth factor became non-positive or non-finite")
     out = initial * factor.cumprod()
     out.attrs["initial_equity"] = initial
     return out
@@ -107,9 +108,15 @@ def hedged_eur_equity(usd_returns: pd.Series, annual_hedge_cost: float = 0.015,
         return pd.Series(dtype=float)
     if annual_hedge_cost < 0:
         raise ValueError("annual_hedge_cost cannot be negative")
+    if initial <= 0:
+        raise ValueError("initial must be positive")
     r = usd_returns.sort_index().astype(float)
+    if (~np.isfinite(r)).any():
+        raise ValueError("usd_returns must be finite")
     frac = _fraction(invested_frac, r.index)
     hedged_returns = r - frac * (annual_hedge_cost / _ANNUAL)
+    if (1.0 + hedged_returns <= 0).any():
+        raise ValueError("hedged wealth factor became non-positive")
     out = initial * (1.0 + hedged_returns).cumprod()
     out.attrs["initial_equity"] = initial
     return out
