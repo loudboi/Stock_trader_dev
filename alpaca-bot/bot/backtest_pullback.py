@@ -3,14 +3,14 @@ bot/backtest_pullback.py
 ========================
 Multi-timeframe backtester for the phased trend-pullback strategy.
 
-Daily bars create decisions. Intraday bars model the following session's limit
-attempt and stop path. If the improving limit is not touched, the live runner does
-not market-fill until the following daily evaluation, so the intraday backtest
-uses the next session's open for that fallback as well.
+Daily closes create decisions. Intraday bars model the following session's limit
+attempt and stop path. A no-dip intraday intent is not market-filled until the next
+daily evaluation, matching the live runner.
 
-The combined portfolio plans all decisions sharing a signal timestamp before it
-walks any future execution windows. This prevents one symbol's next-session result
-from leaking into another symbol's same-close position sizing.
+For a combined portfolio, every symbol sharing a signal timestamp is marked,
+decided and sized from the SAME close-time state before any future execution window
+is walked. An explicit no-action decision remains no-action; it is never recomputed
+after another symbol's future fill. This is the key causality invariant.
 """
 
 import argparse
@@ -28,7 +28,7 @@ import pandas as pd
 import config
 from bot import indicators as ind
 from bot import risk_manager as rm
-from bot.strategies.trend_pullback import TrendPullbackStrategy, PullbackParams
+from bot.strategies.trend_pullback import PullbackParams, TrendPullbackStrategy
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s")
@@ -40,6 +40,7 @@ SLIPPAGE = 0.0005
 ANNUALIZATION = 252
 _DAILY_WARMUP_DAYS = 320
 _INTRA_BUFFER_DAYS = 7
+_DECISION_UNSET = object()
 
 
 def fill_price(price: float, direction: str, is_entry: bool) -> float:
@@ -48,11 +49,19 @@ def fill_price(price: float, direction: str, is_entry: bool) -> float:
     return price * (1 - SLIPPAGE) if is_entry else price * (1 + SLIPPAGE)
 
 
-def _initial_equity(equity):
+def _initial_equity(equity: pd.Series) -> float:
     return float(equity.attrs.get("initial_equity", equity.iloc[0]))
 
 
-def compute_metrics(trades: list, equity: pd.Series) -> dict:
+def compute_metrics(trades: list, equity: pd.Series, risk_free_annual: float = 0.0) -> dict:
+    """Trade/equity metrics.
+
+    ``risk_free_annual`` is explicit rather than silently baked into the Sharpe
+    definition. Existing research remains comparable at the default 0%; studies
+    that need an excess-return Sharpe can pass an annual rate deliberately.
+    """
+    if risk_free_annual < -1:
+        raise ValueError("risk_free_annual must be greater than -100%")
     n = len(trades)
     pnls = np.array([t["pnl"] for t in trades], dtype=float) if n else np.array([])
     wins, losses = pnls[pnls > 0], pnls[pnls < 0]
@@ -69,21 +78,23 @@ def compute_metrics(trades: list, equity: pd.Series) -> dict:
     if len(equity) > 2:
         daily = equity.resample("1D").last().dropna()
         initial = _initial_equity(equity)
-        # Prepend the true starting NAV when the first observation already contains
-        # a return, so the first modeled return is not dropped from Sharpe.
         if len(daily) and initial != daily.iloc[0]:
             lead = daily.index[0] - pd.Timedelta(days=1)
             daily = pd.concat([pd.Series([initial], index=[lead]), daily])
         rets = daily.pct_change().dropna()
         if len(rets) > 1 and rets.std(ddof=1) > 0:
-            sharpe = float(rets.mean() / rets.std(ddof=1) * np.sqrt(ANNUALIZATION))
+            daily_rf = (1.0 + risk_free_annual) ** (1.0 / ANNUALIZATION) - 1.0
+            excess = rets - daily_rf
+            sharpe = float(excess.mean() / rets.std(ddof=1) * np.sqrt(ANNUALIZATION))
     return {
         "trades": n,
         "win_rate": len(wins) / n if n else 0.0,
         "avg_win": float(wins.mean()) if len(wins) else 0.0,
         "avg_loss": float(losses.mean()) if len(losses) else 0.0,
         "profit_factor": float(profit_factor),
-        "max_drawdown": max_dd, "sharpe": sharpe, "total_return": total_return,
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "total_return": total_return,
     }
 
 
@@ -98,7 +109,7 @@ class PyramidPos:
     last_price: float = 0.0
 
     @property
-    def avg_entry(self):
+    def avg_entry(self) -> float:
         return self.cost / self.qty if self.qty else 0.0
 
 
@@ -109,38 +120,40 @@ class PyramidBook:
     positions: dict = field(default_factory=dict)
     trades: list = field(default_factory=list)
 
-    def equity(self):
+    def equity(self) -> float:
         unreal = sum((p.last_price - p.avg_entry) * p.qty for p in self.positions.values())
         return self.initial + self.realized + unreal
 
-    def gross_notional(self):
+    def gross_notional(self) -> float:
         return sum(p.qty * max(p.last_price, p.avg_entry) for p in self.positions.values())
 
-    def stop_risk(self):
+    def stop_risk(self) -> float:
         return sum(p.qty * p.avg_entry * p.stop_dist for p in self.positions.values())
 
     def plan_tranche_qty(self, instrument, price, fraction, stop_dist, sizing_equity,
-                         capacity=None):
-        if price <= 0 or stop_dist <= 0 or sizing_equity <= 0:
+                         capacity=None) -> float:
+        if price <= 0 or stop_dist <= 0 or sizing_equity <= 0 or fraction <= 0:
             return 0.0
-        risk = config.RISK_PER_TRADE * sizing_equity
-        desired = rm.round_qty(fraction * risk / (price * stop_dist), instrument.qty_decimals)
+        desired = rm.round_qty(
+            fraction * config.RISK_PER_TRADE * sizing_equity / (price * stop_dist),
+            instrument.qty_decimals)
         if desired <= 0:
             return 0.0
         gross_used = self.gross_notional() if capacity is None else capacity["gross"]
         risk_used = self.stop_risk() if capacity is None else capacity["risk"]
         gross_room = max(0.0, config.MAX_GROSS_EXPOSURE * sizing_equity - gross_used)
         risk_room = max(0.0, config.MAX_PORTFOLIO_RISK * sizing_equity - risk_used)
-        max_by_gross = gross_room / price
-        max_by_risk = risk_room / (price * stop_dist)
-        qty = rm.round_qty(min(desired, max_by_gross, max_by_risk), instrument.qty_decimals)
+        qty = rm.round_qty(min(desired, gross_room / price,
+                               risk_room / (price * stop_dist)),
+                           instrument.qty_decimals)
+        qty = max(0.0, qty)
         if capacity is not None and qty > 0:
             capacity["gross"] += qty * price
             capacity["risk"] += qty * price * stop_dist
-        return max(0.0, qty)
+        return qty
 
-    def add_fixed_tranche(self, name, price, qty, stop_dist, ts):
-        if qty <= 0 or price <= 0:
+    def add_fixed_tranche(self, name, price, qty, stop_dist, ts) -> bool:
+        if qty <= 0 or price <= 0 or stop_dist <= 0:
             return False
         ef = fill_price(price, "long", is_entry=True)
         pos = self.positions.get(name) or PyramidPos()
@@ -156,7 +169,7 @@ class PyramidBook:
         return True
 
     def add_tranche(self, name, instrument, price, fraction, stop_dist, ts,
-                    sizing_equity=None):
+                    sizing_equity=None) -> bool:
         pos = self.positions.get(name)
         actual_stop = pos.stop_dist if pos else stop_dist
         eq = self.equity() if sizing_equity is None else sizing_equity
@@ -171,17 +184,24 @@ class PyramidBook:
         pnl = (xf - pos.avg_entry) * pos.qty
         self.realized += pnl
         self.trades.append({
-            "instrument": name, "direction": "long", "entry_time": pos.entry_time,
-            "entry_price": round(pos.avg_entry, 4), "exit_time": ts,
-            "exit_price": round(xf, 4), "qty": round(pos.qty, 6),
+            "instrument": name,
+            "direction": "long",
+            "entry_time": pos.entry_time,
+            "entry_price": round(pos.avg_entry, 4),
+            "exit_time": ts,
+            "exit_price": round(xf, 4),
+            "qty": round(pos.qty, 6),
             "pnl": round(pnl, 2),
             "return_pct": pnl / (pos.avg_entry * pos.qty) if pos.qty else 0.0,
-            "tranches": pos.tranches, "exit_reason": reason,
+            "tranches": pos.tranches,
+            "exit_reason": reason,
         })
 
 
 def exec_window(daily, intra, d, intraday: bool):
     if intraday:
+        if intra is None or intra.empty:
+            return daily.iloc[0:0]
         t0 = daily.index[d]
         if d + 1 < len(daily):
             t1 = daily.index[d + 1]
@@ -192,9 +212,8 @@ def exec_window(daily, intra, d, intraday: bool):
 
 def _decision(book, name, strat, daily, ma_f, ma_s, atr_series, d):
     price = float(daily["close"].iloc[d])
-    atr_v = atr_series.iloc[d]
-    atr_v = float(atr_v) if atr_v == atr_v else 0.0
-    stop_dist = strat.stop_distance(atr_v, price)
+    a = atr_series.iloc[d]
+    stop_dist = strat.stop_distance(float(a) if a == a else 0.0, price)
     pos = book.positions.get(name)
     decision = None
     if pos:
@@ -215,16 +234,20 @@ def _decision(book, name, strat, daily, ma_f, ma_s, atr_series, d):
 
 
 def _fallback_bar(daily, d, intraday):
-    # Intraday mode uses d+1 for the limit-attempt session. Live falls back at
-    # the next daily evaluation, corresponding to the following session open.
     idx = d + (2 if intraday else 1)
     return daily.iloc[idx] if idx < len(daily) else None
 
 
 def process_day(book, name, inst, strat, daily, ma_f, ma_s, atr_series, d,
-                win, exec_is_intraday, decision=None, planned_qty=None,
+                win, exec_is_intraday, decision=_DECISION_UNSET, planned_qty=None,
                 sizing_equity=None):
-    if decision is None:
+    """Execute a precomputed signal-day decision.
+
+    ``decision=None`` means an explicit, already-computed NO ACTION. Only the
+    private sentinel means the caller wants this function to calculate a decision
+    now. This distinction prevents combined-portfolio same-close lookahead.
+    """
+    if decision is _DECISION_UNSET:
         decision, price_d, stop_dist = _decision(
             book, name, strat, daily, ma_f, ma_s, atr_series, d)
     else:
@@ -256,13 +279,15 @@ def process_day(book, name, inst, strat, daily, ma_f, ma_s, atr_series, d,
     filled = closed = False
 
     for j in range(len(win)):
-        o, l = float(win["open"].iloc[j]), float(win["low"].iloc[j])
+        o = float(win["open"].iloc[j])
+        l = float(win["low"].iloc[j])
         wts = win.index[j]
         if name in book.positions:
             p = book.positions[name]
             stop_level = p.avg_entry * (1 - p.stop_dist)
             if l <= stop_level:
-                book.close(name, min(o, stop_level), wts, "volatility stop max(5%,2xATR)")
+                book.close(name, min(o, stop_level), wts,
+                           "volatility stop max(5%,2xATR)")
                 pending, closed = None, True
                 break
 
@@ -272,9 +297,8 @@ def process_day(book, name, inst, strat, daily, ma_f, ma_s, atr_series, d,
             actual_stop = current.stop_dist if current else stop_dist
             book.add_fixed_tranche(name, entry_ref, planned_qty, actual_stop, wts)
             filled = True
-            # If the same OHLC candle touched both the entry and protective stop,
-            # daily/intraday OHLC cannot prove a favorable ordering. Use the
-            # conservative fill-then-stop path rather than ignoring the stop.
+            # OHLC cannot establish whether entry or stop happened first. Assume
+            # the adverse fill-then-stop ordering rather than an optimistic survivor.
             p = book.positions[name]
             stop_level = p.avg_entry * (1 - p.stop_dist)
             if l <= stop_level:
@@ -291,10 +315,8 @@ def process_day(book, name, inst, strat, daily, ma_f, ma_s, atr_series, d,
             book.add_fixed_tranche(name, float(fb["open"]), planned_qty, actual_stop, fb.name)
 
     if name in book.positions:
-        if len(win):
-            book.positions[name].last_price = float(win["close"].iloc[-1])
-        else:
-            book.positions[name].last_price = price_d
+        book.positions[name].last_price = (float(win["close"].iloc[-1])
+                                           if len(win) else price_d)
     return book.equity()
 
 
@@ -318,12 +340,13 @@ def run_single(name, daily, intra, params, exec_is_intraday, begin_ts=None):
                                 d, win, exec_is_intraday))
         eq_t.append(daily.index[d])
     if name in book.positions:
-        book.close(name, float(daily["close"].iloc[-1]), daily.index[-1], "end of backtest")
+        book.close(name, float(daily["close"].iloc[-1]), daily.index[-1],
+                   "end of backtest")
         if eq_v:
             eq_v[-1] = book.equity()
-    s = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t)).sort_index()
-    s.attrs["initial_equity"] = INITIAL_EQUITY
-    return book.trades, s
+    out = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t)).sort_index()
+    out.attrs["initial_equity"] = INITIAL_EQUITY
+    return book.trades, out
 
 
 def run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts=None):
@@ -341,7 +364,6 @@ def run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts=None
     eq_t, eq_v = [], []
     for ts, grouped in groupby(events, key=lambda e: e[0]):
         group = list(grouped)
-        # Mark every existing same-close position before capturing sizing equity.
         for _, name, d in group:
             if name in book.positions:
                 book.positions[name].last_price = float(daily_data[name]["close"].iloc[d])
@@ -351,7 +373,8 @@ def run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts=None
         for _, name, d in group:
             dfd = daily_data[name]
             inst, strat, ma_f, ma_s, atrs = prepared[name]
-            decision, price, stop_dist = _decision(book, name, strat, dfd, ma_f, ma_s, atrs, d)
+            decision, price, stop_dist = _decision(
+                book, name, strat, dfd, ma_f, ma_s, atrs, d)
             qty = None
             if decision and decision[0] in ("enter", "add"):
                 current = book.positions.get(name)
@@ -360,8 +383,6 @@ def run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts=None
                                              sizing_equity, capacity)
             plans.append((name, d, decision, qty))
 
-        # Future execution paths are walked only after all same-close decisions
-        # and quantities have been fixed.
         for name, d, decision, qty in plans:
             dfd = daily_data[name]
             inst, strat, ma_f, ma_s, atrs = prepared[name]
@@ -375,12 +396,14 @@ def run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts=None
 
     for name, dfd in daily_data.items():
         if name in book.positions:
-            book.close(name, float(dfd["close"].iloc[-1]), dfd.index[-1], "end of backtest")
+            book.close(name, float(dfd["close"].iloc[-1]), dfd.index[-1],
+                       "end of backtest")
     if eq_v:
         eq_v[-1] = book.equity()
-    s = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t)).sort_index()
-    s.attrs["initial_equity"] = INITIAL_EQUITY
-    return book.trades, s
+    out = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t)).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    out.attrs["initial_equity"] = INITIAL_EQUITY
+    return book.trades, out
 
 
 def _fmt_pf(pf):
@@ -392,23 +415,20 @@ def print_summary(per_instrument, combined, signal_tf, exec_tf):
             "MaxDD%", "Sharpe", "Return%"]
     rows = []
     for name, m in per_instrument.items():
-        rows.append([name, m["trades"], f"{m['win_rate']*100:.1f}", f"{m['avg_win']:.0f}",
-                     f"{m['avg_loss']:.0f}", _fmt_pf(m["profit_factor"]),
-                     f"{m['max_drawdown']*100:.1f}", f"{m['sharpe']:.2f}",
-                     f"{m['total_return']*100:.1f}"])
+        rows.append([name, m["trades"], f"{m['win_rate']*100:.1f}",
+                     f"{m['avg_win']:.0f}", f"{m['avg_loss']:.0f}",
+                     _fmt_pf(m["profit_factor"]), f"{m['max_drawdown']*100:.1f}",
+                     f"{m['sharpe']:.2f}", f"{m['total_return']*100:.1f}"])
     rows.append(["PORTFOLIO", combined["trades"], f"{combined['win_rate']*100:.1f}",
                  f"{combined['avg_win']:.0f}", f"{combined['avg_loss']:.0f}",
-                 _fmt_pf(combined["profit_factor"]), f"{combined['max_drawdown']*100:.1f}",
-                 f"{combined['sharpe']:.2f}", f"{combined['total_return']*100:.1f}"])
+                 _fmt_pf(combined["profit_factor"]),
+                 f"{combined['max_drawdown']*100:.1f}", f"{combined['sharpe']:.2f}",
+                 f"{combined['total_return']*100:.1f}"])
     widths = [max(len(str(r[i])) for r in ([cols] + rows)) for i in range(len(cols))]
-    line = "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols))
-    print("\n" + "=" * len(line))
-    print(f"TREND-PULLBACK BACKTEST  signal={signal_tf}  exec={exec_tf}")
-    print("=" * len(line)); print(line); print("-" * len(line))
-    for r in rows:
-        if r[0] == "PORTFOLIO": print("-" * len(line))
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
-    print("=" * len(line))
+    print("\nTREND-PULLBACK BACKTEST  " + f"signal={signal_tf} exec={exec_tf}")
+    print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols)))
+    for row in rows:
+        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)))
 
 
 def flag_negative_sharpe(per_instrument, combined):
@@ -425,25 +445,33 @@ def plot_equity(per_series, combined_series, path, bh_series=None):
     if combined_series is None or not len(combined_series):
         return
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), height_ratios=[1.4, 1])
-    cs = combined_series.copy(); cs.index = cs.index.tz_localize(None) if cs.index.tz else cs.index
+    cs = combined_series.copy()
+    cs.index = cs.index.tz_localize(None) if cs.index.tz else cs.index
     ax1.plot(cs.index, cs.values, lw=1.8, label="Combined portfolio")
     if bh_series is not None and len(bh_series):
-        bh = bh_series.copy(); bh.index = bh.index.tz_localize(None) if bh.index.tz else bh.index
+        bh = bh_series.copy()
+        bh.index = bh.index.tz_localize(None) if bh.index.tz else bh.index
         ax1.plot(bh.index, bh.values, lw=1.4, ls=":", label="Buy & hold (equal-weight)")
-    ax1.axhline(_initial_equity(combined_series), ls="--", lw=1, label="Starting equity")
-    rmx = cs.cummax(); ax1.fill_between(cs.index, cs.values, rmx.values, where=cs.values < rmx.values,
-                                       alpha=0.25, label="Drawdown")
-    ax1.set_title("Trend-Pullback — Combined Portfolio Equity"); ax1.legend(); ax1.grid(alpha=0.3)
+    ax1.axhline(_initial_equity(combined_series), ls="--", lw=1,
+                label="Starting equity")
+    rmx = cs.cummax()
+    ax1.fill_between(cs.index, cs.values, rmx.values, where=cs.values < rmx.values,
+                     alpha=0.25, label="Drawdown")
+    ax1.set_title("Trend-Pullback — Combined Portfolio Equity")
+    ax1.legend(); ax1.grid(alpha=0.3)
     for name, s in per_series.items():
-        si = s.copy(); si.index = si.index.tz_localize(None) if si.index.tz else si.index
+        si = s.copy()
+        si.index = si.index.tz_localize(None) if si.index.tz else si.index
         ax2.plot(si.index, si.values, lw=1.2, label=name)
-    ax2.axhline(INITIAL_EQUITY, ls="--", lw=1); ax2.legend(); ax2.grid(alpha=0.3)
+    ax2.axhline(INITIAL_EQUITY, ls="--", lw=1)
+    ax2.legend(); ax2.grid(alpha=0.3)
     fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
 
 
 def fetch_bars(pf, instrument, tf_key, days_back):
     end = datetime.now(timezone.utc)
-    return pf.get_historical_bars(instrument, tf_key, end - timedelta(days=days_back), end)
+    return pf.get_historical_bars(instrument, tf_key,
+                                  end - timedelta(days=days_back), end)
 
 
 def fetch_all(symbols, exec_tf, start_dt, end_dt, source="alpaca"):
@@ -466,15 +494,18 @@ def fetch_all(symbols, exec_tf, start_dt, end_dt, source="alpaca"):
 
     from bot.portfolio import Portfolio
     config.validate_config()
-    pf = Portfolio(); daily_data, intra_data = {}, {}
+    pf = Portfolio()
+    daily_data, intra_data = {}, {}
     for name in symbols:
         try:
             inst = config.research_instrument(name)
         except ValueError as e:
-            log.error("%s", e); continue
+            log.error("%s", e)
+            continue
         d = pf.get_historical_bars(inst, "1Day", daily_start, end_dt)
         if d.empty:
-            log.warning("No daily data for %s; skipping.", name); continue
+            log.warning("No daily data for %s; skipping.", name)
+            continue
         daily_data[name] = d
         if exec_is_intraday:
             intra_data[name] = pf.get_historical_bars(inst, exec_tf, intra_start, end_dt)
@@ -491,18 +522,18 @@ def buy_hold_equity(daily, begin_ts=None, initial=INITIAL_EQUITY):
 
 
 def buy_hold_combined(daily_data, begin_ts=None, initial=INITIAL_EQUITY):
-    """Equal-weight initial allocation on the first date all assets have data."""
+    """Equal-weight initial allocation on the first date ALL assets are investable."""
     if not daily_data:
         return pd.Series(dtype=float)
-    starts = []
+    eligible = []
     for d in daily_data.values():
-        eligible = d[d.index >= begin_ts] if begin_ts is not None else d
-        if eligible.empty:
+        sub = d[d.index >= begin_ts] if begin_ts is not None else d
+        if sub.empty:
             return pd.Series(dtype=float)
-        starts.append(eligible.index[0])
-    common_start = max(starts)
-    n = len(daily_data)
-    parts = [buy_hold_equity(d, common_start, initial / n) for d in daily_data.values()]
+        eligible.append(sub.index[0])
+    common_start = max(eligible)
+    parts = [buy_hold_equity(d, common_start, initial / len(daily_data))
+             for d in daily_data.values()]
     merged = pd.concat(parts, axis=1).sort_index().ffill().dropna()
     out = merged.sum(axis=1)
     out.attrs["initial_equity"] = initial
@@ -510,42 +541,34 @@ def buy_hold_combined(daily_data, begin_ts=None, initial=INITIAL_EQUITY):
 
 
 def print_vs_benchmark(per_strat, per_bh, combined_strat, combined_bh):
-    cols = ["Instrument", "Strat Ret%", "B&H Ret%", "Strat MaxDD%", "B&H MaxDD%",
-            "Strat Shp", "B&H Shp", "Beat B&H?"]
-    rows = []
+    print("\nVS BUY-AND-HOLD (shared investable window)")
     for name in per_strat:
         s, b = per_strat[name], per_bh[name]
-        rows.append([name, f"{s['total_return']*100:.1f}", f"{b['total_return']*100:.1f}",
-                     f"{s['max_drawdown']*100:.1f}", f"{b['max_drawdown']*100:.1f}",
-                     f"{s['sharpe']:.2f}", f"{b['sharpe']:.2f}",
-                     "YES" if s["total_return"] > b["total_return"] else "no"])
-    rows.append(["PORTFOLIO", f"{combined_strat['total_return']*100:.1f}",
-                 f"{combined_bh['total_return']*100:.1f}",
-                 f"{combined_strat['max_drawdown']*100:.1f}", f"{combined_bh['max_drawdown']*100:.1f}",
-                 f"{combined_strat['sharpe']:.2f}", f"{combined_bh['sharpe']:.2f}",
-                 "YES" if combined_strat["total_return"] > combined_bh["total_return"] else "no"])
-    widths = [max(len(str(r[i])) for r in ([cols] + rows)) for i in range(len(cols))]
-    print("\nVS BUY-AND-HOLD (shared investable window)")
-    print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols)))
-    for r in rows:
-        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
+        print(f"{name}: strategy {s['total_return']:.1%} / B&H {b['total_return']:.1%}; "
+              f"Sharpe {s['sharpe']:.2f} / {b['sharpe']:.2f}")
+    print(f"PORTFOLIO: strategy {combined_strat['total_return']:.1%} / "
+          f"B&H {combined_bh['total_return']:.1%}; Sharpe "
+          f"{combined_strat['sharpe']:.2f} / {combined_bh['sharpe']:.2f}")
 
 
 def run_backtest(daily_data, intra_data, params, exec_is_intraday,
-                 signal_tf="1Day", exec_tf="4Hour", begin_ts=None):
+                 signal_tf="1Day", exec_tf="4Hour", begin_ts=None,
+                 risk_free_annual=0.0):
     if not daily_data:
-        log.error("No data to backtest."); return 1
+        log.error("No data to backtest.")
+        return 1
     per_instrument, per_series = {}, {}
     for name, daily in daily_data.items():
         trades, eq = run_single(name, daily, intra_data.get(name), params,
                                 exec_is_intraday, begin_ts)
-        per_instrument[name] = compute_metrics(trades, eq); per_series[name] = eq
+        per_instrument[name] = compute_metrics(trades, eq, risk_free_annual)
+        per_series[name] = eq
     ct, ce = run_combined(daily_data, intra_data, params, exec_is_intraday, begin_ts)
-    combined = compute_metrics(ct, ce)
-    per_bh = {name: compute_metrics([], buy_hold_equity(daily, begin_ts))
+    combined = compute_metrics(ct, ce, risk_free_annual)
+    per_bh = {name: compute_metrics([], buy_hold_equity(daily, begin_ts), risk_free_annual)
               for name, daily in daily_data.items()}
     bh_combined_series = buy_hold_combined(daily_data, begin_ts)
-    combined_bh = compute_metrics([], bh_combined_series)
+    combined_bh = compute_metrics([], bh_combined_series, risk_free_annual)
     print_summary(per_instrument, combined, signal_tf, exec_tf)
     print_vs_benchmark(per_instrument, per_bh, combined, combined_bh)
     flag_negative_sharpe(per_instrument, combined)
@@ -565,18 +588,25 @@ def main():
     ap.add_argument("--start"); ap.add_argument("--end")
     ap.add_argument("--ema", action="store_true")
     ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca")
+    ap.add_argument("--risk-free", type=float, default=0.0,
+                    help="Annual risk-free rate used for Sharpe only (default 0 for legacy comparability).")
     args = ap.parse_args()
-    if args.months <= 0:
-        ap.error("--months must be positive")
+    if args.months <= 0 or args.risk_free <= -1:
+        ap.error("--months must be positive and --risk-free greater than -1")
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
-    start_dt = _parse_date(args.start) if args.start else end_dt - pd.Timedelta(days=args.months * 31)
+    start_dt = (_parse_date(args.start) if args.start
+                else end_dt - pd.Timedelta(days=args.months * 31))
     if start_dt >= end_dt:
         ap.error("start date must be before end date")
     params = PullbackParams(use_ema=args.ema)
     daily_data, intra_data, exec_is_intraday = fetch_all(
         args.symbols, args.exec_timeframe, start_dt, end_dt, source=args.data_source)
+    if len(daily_data) != len(args.symbols):
+        log.error("Missing requested symbol data; refusing a silently changed universe.")
+        return 1
     return run_backtest(daily_data, intra_data, params, exec_is_intraday,
-                        "1Day", args.exec_timeframe, begin_ts=start_dt)
+                        "1Day", args.exec_timeframe, begin_ts=start_dt,
+                        risk_free_annual=args.risk_free)
 
 
 if __name__ == "__main__":
