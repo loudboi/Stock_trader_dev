@@ -1,48 +1,56 @@
-# Deploying Strategy 4 on a Linux VPS (systemd)
+# Deploying the pullback runner on Linux (systemd)
 
-Runs the live runner as an auto-restarting systemd service, logging to the
-journal. Two units are provided: the Alpaca runner and the IBKR (EUR) runner.
-Run **paper** until you trust it.
+Use Python **3.11 or 3.12** and start with a paper account. The service files assume
+`/opt/alpaca-bot` as the application path. The install below keeps a real Git clone
+at `/opt/stock-trader-dev` and makes `/opt/alpaca-bot` a symlink to its
+`alpaca-bot/` directory, so later `git pull` operations actually work.
 
-Paths below assume the app at `/opt/alpaca-bot`, a venv at `/opt/alpaca-bot/.venv`,
-and a dedicated `alpaca` user. Adjust to taste (and update the `.service` files
-if you change them).
-
-## 1. User + code
+## 1. Create the service user and clone the repository
 
 ```bash
-sudo useradd --system --create-home --home-dir /opt/alpaca-bot --shell /usr/sbin/nologin alpaca
-sudo -u alpaca git clone https://github.com/loudboi/Stock_trader_dev.git /tmp/st && \
-  sudo mv /tmp/st/alpaca-bot/* /opt/alpaca-bot/ && sudo chown -R alpaca:alpaca /opt/alpaca-bot
-# (or rsync your working copy of alpaca-bot/ into /opt/alpaca-bot)
+sudo useradd --system --create-home --home-dir /var/lib/alpaca --shell /usr/sbin/nologin alpaca
+sudo mkdir -p /opt/stock-trader-dev
+sudo chown alpaca:alpaca /opt/stock-trader-dev
+sudo -u alpaca git clone https://github.com/loudboi/Stock_trader_dev.git /opt/stock-trader-dev
+sudo ln -s /opt/stock-trader-dev/alpaca-bot /opt/alpaca-bot
 ```
 
-## 2. Virtualenv + dependencies
+Do not copy only the contents of `alpaca-bot/` and then expect `git -C
+/opt/alpaca-bot pull` to work; that directory would no longer contain the repository
+metadata.
+
+## 2. Create the virtual environment
 
 ```bash
-sudo -u alpaca python3 -m venv /opt/alpaca-bot/.venv
-sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install --upgrade pip
+sudo -u alpaca python3.12 -m venv /opt/alpaca-bot/.venv
+sudo -u alpaca /opt/alpaca-bot/.venv/bin/python -m pip install --upgrade pip
 sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install -r /opt/alpaca-bot/requirements.txt
 # IBKR runner only:
 sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install -r /opt/alpaca-bot/requirements-ibkr.txt
 ```
 
-## 3. Secrets / config
+If your host uses Python 3.11, substitute `python3.11`. CI currently covers 3.11 and
+3.12; do not assume a newer interpreter is deployment-tested until CI includes it.
+
+## 3. Install secrets/config outside the repository
 
 ```bash
 sudo mkdir -p /etc/alpaca-bot
 sudo cp /opt/alpaca-bot/deploy/pullback.env.example /etc/alpaca-bot/pullback.env
-sudo nano /etc/alpaca-bot/pullback.env          # fill in keys (+ optional alerts)
+sudo editor /etc/alpaca-bot/pullback.env
 sudo chown alpaca:alpaca /etc/alpaca-bot/pullback.env
 sudo chmod 600 /etc/alpaca-bot/pullback.env
-# IBKR runner: same with pullback-ibkr.env.example -> /etc/alpaca-bot/pullback-ibkr.env
 ```
 
-Alerts are optional. Set `ALERT_WEBHOOK_URL` (Slack-compatible) and/or
-`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` to get pings on start/stop, every
-entry/exit, a data stall, or a processing error. Leave blank to run silently.
+For IBKR, copy `pullback-ibkr.env.example` to
+`/etc/alpaca-bot/pullback-ibkr.env` instead. Keep credentials and alert tokens out of
+the Git working tree.
 
-## 4. Install + start the service
+Alerts are optional. `ALERT_WEBHOOK_URL` and/or `TELEGRAM_BOT_TOKEN` plus
+`TELEGRAM_CHAT_ID` enable entry/exit, stall and error notifications. Alert delivery
+is best-effort and must not be treated as the only operational monitoring channel.
+
+## 4. Install and start the PAPER service
 
 ```bash
 sudo cp /opt/alpaca-bot/deploy/alpaca-pullback.service /etc/systemd/system/
@@ -50,43 +58,64 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now alpaca-pullback.service
 ```
 
-To pass flags (e.g. a symbol subset or `--live`), edit `ExecStart` in the unit,
-e.g. `... -m bot.live_pullback --symbols SPY GLD`. After editing a unit, run
-`sudo systemctl daemon-reload && sudo systemctl restart alpaca-pullback`.
-
-## 5. Watch it
+Inspect it immediately:
 
 ```bash
 systemctl status alpaca-pullback
-journalctl -u alpaca-pullback -f          # live logs
-journalctl -u alpaca-pullback --since today
+journalctl -u alpaca-pullback -f
 ```
 
-Runtime CSVs/state (`pullback_trades.csv`, `pullback_daily_pnl.csv`,
-`pullback_state.json`) are written under `WorkingDirectory` (`/opt/alpaca-bot`).
-State is restart-safe and reconciled against the broker on startup.
+The process writes paper runtime state under `/opt/alpaca-bot`. Live Alpaca and
+IBKR modes use separate state/output names. A process lock prevents two instances
+from sharing the same runtime state file, but you should still enforce **one strategy
+owner per symbol/account** operationally.
 
-## 6. Updating
+Existing broker longs are not adopted automatically. If startup finds an untracked
+long, the runner refuses to proceed unless you deliberately use `--adopt-existing`.
+Review that broker position before enabling this flag.
+
+## 5. Real-money confirmation
+
+Do not add `--live` until you have deliberately reviewed the service unit, endpoint,
+account and symbol list. The runner refuses an Alpaca live endpoint without
+`--live`.
+
+For IBKR, standard live/paper ports are recognized. A non-standard port requires
+an explicit `IBKR_MODE=paper` or `IBKR_MODE=live`; the process refuses to guess.
+The live mode also requires `--live`.
+
+After editing a unit:
 
 ```bash
-sudo -u alpaca git -C /opt/alpaca-bot pull        # or rsync a new copy
-sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install -r /opt/alpaca-bot/requirements.txt
+sudo systemctl daemon-reload
 sudo systemctl restart alpaca-pullback
 ```
 
-Stops are graceful: systemd sends SIGTERM, the runner finishes the cycle and
-writes the day's P&L (TimeoutStopSec=90 covers the ≤60s poll loop).
+## 6. Updating safely
 
-## 7. The IBKR runner — extra caveats
+Do not update a running strategy by pulling code underneath it. Stop the service,
+update the real clone, install dependency changes, run tests, then restart.
 
-`alpaca-pullback-ibkr.service` is the same idea, but it needs **IB Gateway/TWS
-running and logged in** underneath it. Two things differ from the clean Alpaca
-deploy (see `../IBKR_SETUP.md`):
+```bash
+sudo systemctl stop alpaca-pullback
+sudo -u alpaca git -C /opt/stock-trader-dev pull --ff-only
+sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install -r /opt/alpaca-bot/requirements.txt
+sudo -u alpaca /opt/alpaca-bot/.venv/bin/pip install -r /opt/alpaca-bot/requirements-dev.txt
+sudo -u alpaca /opt/alpaca-bot/.venv/bin/pytest -q /opt/alpaca-bot/tests
+sudo systemctl start alpaca-pullback
+systemctl status alpaca-pullback
+```
 
-- **2FA on Gateway login** means an unattended reboot won't silently restore it.
-  Keep Gateway up for long stretches, or automate login with **IBC**. The bot's
-  `Restart=always` still applies, but it depends on Gateway being up.
-- **Memory.** Gateway is a ~4 GB Java app; size the VPS accordingly.
+For IBKR, also reinstall `requirements-ibkr.txt` and restart the IBKR unit. For a
+real-money deployment, review the Git diff/commit you are deploying before the
+restart rather than automatically tracking arbitrary new `main` changes.
+
+## 7. IBKR-specific operational caveats
+
+`alpaca-pullback-ibkr.service` requires IB Gateway/TWS to be running and logged in.
+2FA can prevent unattended login restoration after a reboot. The strategy now uses
+broker-resident GTC stop orders, but Gateway/account connectivity is still required
+for reconciliation, new entries, stop replacement, and monitoring.
 
 ```bash
 sudo cp /opt/alpaca-bot/deploy/alpaca-pullback-ibkr.service /etc/systemd/system/
@@ -94,5 +123,4 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now alpaca-pullback-ibkr.service
 ```
 
-> One position per symbol per account. Don't point two runners at the same
-> symbol on the same account.
+See `../IBKR_SETUP.md` before using this path.
