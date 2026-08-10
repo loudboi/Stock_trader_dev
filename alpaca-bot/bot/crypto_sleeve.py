@@ -1,65 +1,17 @@
 """
 bot/crypto_sleeve.py
 =====================
-Tests a genuinely new asset class in this project: a small, trend-filtered
-Bitcoin sleeve blended into the already-validated min_var+TE combo.
+Historical research on adding a small trend-filtered Bitcoin sleeve to the existing
+risk+trend book. Results are sample-dependent; this module does not describe a
+backtest as a proven future edge.
 
-Why trend-filtered, not raw buy-and-hold: BTC-USD's own max drawdown is a
-brutal -83% (pure buy-and-hold, 2014-2026); the SAME no-lookahead 200-day MA
-filter already validated elsewhere in this project (bot.trend_exposure) cuts
-that to -70% while actually IMPROVING Sharpe (0.80 -> 0.95) and total return --
-so the sleeve tested here is trend-exposure on BTC, not naive buy-and-hold.
-
-VALIDATED FINDING: blended into the min_var+TE combo at a modest 10-15%
-weight, this trend-filtered BTC sleeve has LOW correlation with the existing
-book (~0.12 on both primary universes -- the same low-correlation bar that
-made the original RP+TE combo work) and provides a REAL Sharpe improvement:
-universe 1 (SPY/QQQ/GLD/TLT) 1.11 -> 1.36 at 15% weight; universe 2 (8-asset)
-0.87 -> 1.20 at 10% weight. Walk-forward (5 folds, universe 2, 10% weight):
-beat the pure blend in 4/5 folds -- the one loss is the most recent, shortest
-fold, not a red flag on its own. Max drawdown rises only modestly (roughly
-+2-8 percentage points), not offsetting the Sharpe/return gain.
-
-Honest caveats: only ~10-11 years of BTC history exist (since Oct 2014), far
-shorter than this project's usual 20+ year windows, so this is inherently a
-less-tested result than the equity-only combo. BTC's own correlation with
-risk assets has structurally risen since ~2020 (institutional adoption) --
-the "low correlation" finding could erode over time; re-check periodically
-rather than assuming it holds forever. Crypto trading (BTC/USD) requires the
-`alpaca-py` crypto path (slash-form symbol) -- see README's "You can't short
-crypto on Alpaca" caveat, which is fine here since this is long-only trend
-exposure, same as everywhere else in this project.
-
-TAX (--mode aftertax, added 2026-07): Slovenia's crypto tax changed 2026-01-01
--- a flat 25% on disposal to FIAT (no graduated holding-period discount like
-securities have), but crypto-to-crypto swaps (including into a stablecoin)
-are explicitly NOT a taxable event and carry forward the original cost basis.
-In principle that lets a trend-following crypto strategy defer ALL tax to one
-eventual cash-out by parking in a stablecoin instead of literally converting
-to EUR on every "exit" -- exactly like buy-and-hold's deferral. That full-
-deferral scenario was tried and DELIBERATELY NOT used as the headline model
-here: it requires never rebalancing crypto back into the equity/bond legs
-(any such rebalance needs an intermediate fiat conversion), which lets a
-winning BTC position balloon to an undisciplined, unbounded fraction of net
-worth over a decade of 100x+ growth -- in direct tension with this project's
-whole risk-managed, fixed-allocation philosophy. --mode aftertax instead
-models the DISCIPLINED scenario: the BTC sleeve held at a constant target
-weight (rebalanced alongside the rest of the book) and taxed annually, same
-mechanic as everything else active in this project (bot.taxes.after_tax_active
--- its flat rate already matches CRYPTO_TAX_RATE, since both happen to be
-25%). Finding: even under this realistic, disciplined, fully-taxed scenario,
-the BTC sleeve still meaningfully improves after-tax Sharpe (see README).
-Crypto acquired BEFORE 2026-01-01 is grandfathered -- 100% exempt forever,
-even sold later -- so if the user already holds pre-2026 BTC, none of this
-tax modeling applies to that specific position.
-
-Sources: [CoinDesk -- Slovenia moves to tax crypto profits at 25%](https://www.coindesk.com/policy/2025/04/19/slovenia-moves-to-tax-crypto-profits-at-25),
-[Waltio -- Slovenia crypto tax guide 2026](https://help.waltio.com/en/articles/14739040-slovenia-crypto-tax-guide-2026-the-complete-guide).
-
-    python -m bot.crypto_sleeve --symbols SPY QQQ GLD TLT --start 2015-01-01 --data-source yahoo
-    python -m bot.crypto_sleeve --mode walk --folds 5 --symbols SPY QQQ IWM EFA EEM TLT IEF GLD \
-        --start 2015-01-01 --data-source yahoo
-    python -m bot.crypto_sleeve --mode aftertax --symbols SPY QQQ GLD TLT --start 2015-01-01 --data-source yahoo
+Tax handling is deliberately explicit. As rechecked in August 2026, FURS states
+that ordinary virtual-currency gains of an individual are not subject to income tax
+when they are not earned in a business activity. A separate 25% crypto-gains bill
+proposed in 2025 remains under consideration. ``--mode aftertax`` therefore prints
+BOTH a current non-business-individual scenario (0% crypto income tax) and a
+hypothetical/proposal 25% scenario; it does not claim the proposal took effect on
+2026-01-01 and does not invent a grandfathering rule.
 """
 
 import argparse
@@ -68,12 +20,13 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+import bot.aftertax as at
 import bot.taxes as tx
 import bot.trend_exposure as te
-from bot.combo import compute_books, combine_books
+from bot.combo import combine_books, compute_books
 from bot.lab import fold_bounds, slice_equity
-from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
-                                   _parse_date, INITIAL_EQUITY)
+from bot.backtest_pullback import (INITIAL_EQUITY, _parse_date, buy_hold_combined,
+                                   compute_metrics, fetch_all)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s")
@@ -84,155 +37,173 @@ BTC_BUFFER = 0.01
 DEFAULT_WEIGHTS = [0.0, 0.05, 0.10, 0.15, 0.20]
 
 
-def compute_btc_sleeve(btc_daily, ma_period=BTC_MA_PERIOD, buffer=BTC_BUFFER) -> pd.Series:
-    """Trend-exposure return series for BTC-USD -- long/cash on the same
-    no-lookahead 200-day MA filter used throughout this project."""
+def compute_btc_sleeve(btc_daily, ma_period=BTC_MA_PERIOD,
+                       buffer=BTC_BUFFER) -> pd.Series:
+    if ma_period <= 1 or buffer < 0:
+        raise ValueError("invalid BTC trend parameters")
     return te.strategy_returns(btc_daily, ma_period=ma_period, buffer=buffer,
                                leverage=1.0, borrow_rate=0.0)
 
 
+def _common_window(blend, btc_sleeve, begin_ts, end_ts):
+    common = blend.index.intersection(btc_sleeve.index)
+    common = common[(common >= begin_ts) & (common <= end_ts)]
+    if not len(common):
+        raise ValueError("no overlapping blend/BTC history in requested window")
+    return common
+
+
+def _metric(r):
+    eq = INITIAL_EQUITY * (1 + r).cumprod()
+    eq.attrs["initial_equity"] = INITIAL_EQUITY
+    return compute_metrics([], eq)
+
+
 def print_score(daily_data, books, btc_daily, begin_ts, end_ts):
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
-    bh_ret = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
-    btc_sleeve = compute_btc_sleeve(btc_daily)
+    btc = compute_btc_sleeve(btc_daily)
+    common = _common_window(blend, btc, begin_ts, end_ts)
+    blend, btc = blend.loc[common], btc.loc[common]
+    bh = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
+    bh = bh.reindex(common).fillna(0.0)
+    corr = blend.corr(btc)
 
-    common = blend.index.intersection(btc_sleeve.index)
-    common = common[(common >= begin_ts) & (common <= end_ts)]
-    blend, btc_sleeve = blend.loc[common], btc_sleeve.loc[common]
-    # Same window for the buy-and-hold row: if BTC's history starts after
-    # begin_ts, every row must cover the SAME (BTC-limited) period or the
-    # comparison is apples-to-oranges.
-    bh_ret = bh_ret[(bh_ret.index >= common[0]) & (bh_ret.index <= common[-1])]
-
-    corr = blend.corr(btc_sleeve)
-
-    def m(r):
-        return compute_metrics([], INITIAL_EQUITY * (1 + r).cumprod())
-
-    print(f"\nCRYPTO SLEEVE  (trend-filtered BTC blended into the min_var+TE combo)")
-    print(f"Correlation(blend, trend-filtered BTC) = {corr:.3f}  "
+    print("\nCRYPTO SLEEVE — historical comparison")
+    print(f"Correlation(blend, trend-filtered BTC) = {corr:.3f} "
           f"(window: {common[0].date()} -> {common[-1].date()})")
-    print("=" * 74)
-    print(f"{'Book':28}{'Sharpe':>10}{'Return%':>13}{'MaxDD%':>11}{'beats blend?':>13}")
-    print("-" * 74)
-    m_bh, m_blend = m(bh_ret), m(blend)
-    print(f"{'buy_and_hold':28}{m_bh['sharpe']:>10.3f}{m_bh['total_return']*100:>13.1f}"
-          f"{m_bh['max_drawdown']*100:>11.1f}{'':>13}")
-    print(f"{'min_var+TE blend (0% BTC)':28}{m_blend['sharpe']:>10.3f}"
-          f"{m_blend['total_return']*100:>13.1f}{m_blend['max_drawdown']*100:>11.1f}{'':>13}")
+    m_blend = _metric(blend)
+    m_bh = _metric(bh)
+    print(f"buy_and_hold: Sharpe={m_bh['sharpe']:.3f} Return={m_bh['total_return']:.1%} "
+          f"MaxDD={m_bh['max_drawdown']:.1%}")
+    print(f"risk+trend blend (0% BTC): Sharpe={m_blend['sharpe']:.3f} "
+          f"Return={m_blend['total_return']:.1%} MaxDD={m_blend['max_drawdown']:.1%}")
     for w in DEFAULT_WEIGHTS[1:]:
-        mixed = (1 - w) * blend + w * btc_sleeve
-        mm = m(mixed)
-        beat = "YES" if mm["sharpe"] > m_blend["sharpe"] else "no"
-        print(f"{f'blend + {w:.0%} BTC':28}{mm['sharpe']:>10.3f}{mm['total_return']*100:>13.1f}"
-              f"{mm['max_drawdown']*100:>11.1f}{beat:>13}")
-    print("=" * 74)
+        mixed = (1 - w) * blend + w * btc
+        mm = _metric(mixed)
+        print(f"blend + {w:.0%} BTC: Sharpe={mm['sharpe']:.3f} "
+              f"Return={mm['total_return']:.1%} MaxDD={mm['max_drawdown']:.1%} "
+              f"{'above' if mm['sharpe'] > m_blend['sharpe'] else 'not above'} blend Sharpe")
+    return corr
 
 
-def print_walk(daily_data, books, btc_daily, start_dt, end_dt, folds, btc_weight=0.10):
+def print_walk(daily_data, books, btc_daily, start_dt, end_dt, folds,
+               btc_weight=0.10):
+    """Legacy function name; fixed-parameter chronological consistency only."""
+    if folds <= 0 or not 0 <= btc_weight <= 1:
+        raise ValueError("invalid folds/btc_weight")
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
-    btc_sleeve = compute_btc_sleeve(btc_daily)
-    common = blend.index.intersection(btc_sleeve.index)
-    blend, btc_sleeve = blend.loc[common], btc_sleeve.loc[common]
-    mixed = (1 - btc_weight) * blend + btc_weight * btc_sleeve
+    btc = compute_btc_sleeve(btc_daily)
+    common = _common_window(blend, btc, start_dt, end_dt)
+    blend, btc = blend.loc[common], btc.loc[common]
+    mixed = (1 - btc_weight) * blend + btc_weight * btc
 
-    print(f"\nCRYPTO SLEEVE WALK-FORWARD  btc_weight={btc_weight:.0%}  {folds} folds")
-    print("=" * 78)
-    print(f"{'Fold':>4}  {'Window':>23}  {'pure blend':>11}  {'+BTC':>8}  beats")
-    print("-" * 78)
-    wins = 0
-    checks = 0
-    for k, (fs, fe) in enumerate(fold_bounds(start_dt, end_dt, folds)):
-        pure_eq = slice_equity(blend, fs, fe)
-        if not len(pure_eq):
+    print(f"\nCRYPTO SLEEVE CHRONOLOGICAL CONSISTENCY — legacy walk alias; "
+          f"btc_weight={btc_weight:.0%}, {folds} folds")
+    bounds = fold_bounds(max(start_dt, common[0]), min(end_dt, common[-1]), folds)
+    wins = checks = 0
+    for k, (fs, fe) in enumerate(bounds):
+        final = k == len(bounds) - 1
+        pure_eq = slice_equity(blend, fs, fe, end_inclusive=final)
+        mix_eq = slice_equity(mixed, fs, fe, end_inclusive=final)
+        if not len(pure_eq) or not len(mix_eq):
             continue
-        m_pure = compute_metrics([], pure_eq)
-        m_mix = compute_metrics([], slice_equity(mixed, fs, fe))
-        beat = m_mix["sharpe"] > m_pure["sharpe"]
-        wins += int(beat)
-        checks += 1
-        print(f"{k+1:>4}  {fs.date()}->{fe.date()}  {m_pure['sharpe']:>11.2f}  "
-              f"{m_mix['sharpe']:>8.2f}  {'YES' if beat else 'no'}")
-    print("-" * 78)
-    print(f"+{btc_weight:.0%} BTC beat pure blend in {wins}/{checks} folds.")
-    print("=" * 78)
+        mp, mm = compute_metrics([], pure_eq), compute_metrics([], mix_eq)
+        beat = mm["sharpe"] > mp["sharpe"]
+        wins += int(beat); checks += 1
+        print(f"{k+1}: {fs.date()}->{fe.date()} blend={mp['sharpe']:.2f} "
+              f"+BTC={mm['sharpe']:.2f} {'above' if beat else 'not above'}")
+    print(f"SUMMARY: +{btc_weight:.0%} BTC above pure blend Sharpe in {wins}/{checks} folds.")
+    return wins, checks
 
 
-def print_aftertax(daily_data, books, btc_daily, begin_ts, end_ts, tax_rate=tx.CRYPTO_TAX_RATE):
-    """The DISCIPLINED after-tax comparison: the BTC sleeve held at a constant
-    target weight (rebalanced alongside the rest of the book, not left to
-    balloon unbounded) and taxed annually -- see module docstring for why this,
-    not the full-deferral-via-stablecoin-swaps scenario, is the headline
-    model. after_tax_active's flat rate already matches CRYPTO_TAX_RATE (both
-    25%), so this reuses it directly for the blended return series."""
+def _securities_base_after_tax(daily_data, books, common, weight):
+    if weight <= 0:
+        return pd.Series(0.0, index=common)
+    rp = books["rp"].reindex(common).fillna(0.0)
+    rp_eq = tx.after_tax_active(rp, tx.SLOVENIA_TAX_RATE,
+                                initial=INITIAL_EQUITY * weight * 0.5)
+    te_eq = at._te_after_tax_equity(
+        daily_data, common[0], common[-1], currency="usd",
+        initial=INITIAL_EQUITY * weight * 0.5)
+    return rp_eq.reindex(common).ffill().add(te_eq.reindex(common).ffill(), fill_value=0.0)
+
+
+def _crypto_after_tax(btc_returns, weight, tax_rate):
+    if weight <= 0:
+        return pd.Series(0.0, index=btc_returns.index)
+    return tx.after_tax_active(btc_returns, tax_rate,
+                               initial=INITIAL_EQUITY * weight)
+
+
+def print_aftertax(daily_data, books, btc_daily, begin_ts, end_ts,
+                   current_rate=tx.CRYPTO_TAX_RATE,
+                   proposal_rate=tx.CRYPTO_PROPOSED_TAX_RATE):
+    """Compare explicit current-law and hypothetical proposal crypto scenarios."""
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
-    btc_sleeve = compute_btc_sleeve(btc_daily)
-    common = blend.index.intersection(btc_sleeve.index)
-    common = common[(common >= begin_ts) & (common <= end_ts)]
-    blend, btc_sleeve = blend.loc[common], btc_sleeve.loc[common]
+    btc = compute_btc_sleeve(btc_daily)
+    common = _common_window(blend, btc, begin_ts, end_ts)
+    btc = btc.loc[common]
 
-    print(f"\nCRYPTO SLEEVE AFTER-TAX  (disciplined: constant weight, rebalanced + taxed "
-          f"annually at Slovenia's flat {tax_rate:.0%} crypto rate)")
-    print("=" * 74)
-    print(f"{'Book':30}{'Sharpe':>10}{'Return%':>13}{'MaxDD%':>11}{'beats blend?':>13}")
-    print("-" * 74)
-    blend_eq = tx.after_tax_active(blend, tax_rate)
-    m_blend = compute_metrics([], blend_eq)
-    print(f"{'blend (0% BTC), post-tax':30}{m_blend['sharpe']:>10.3f}"
-          f"{m_blend['total_return']*100:>13.1f}{m_blend['max_drawdown']*100:>11.1f}{'':>13}")
-    for w in DEFAULT_WEIGHTS[1:]:
-        mixed = (1 - w) * blend + w * btc_sleeve
-        mixed_eq = tx.after_tax_active(mixed, tax_rate)
-        mm = compute_metrics([], mixed_eq)
-        beat = "YES" if mm["sharpe"] > m_blend["sharpe"] else "no"
-        print(f"{f'blend + {w:.0%} BTC, post-tax':30}{mm['sharpe']:>10.3f}"
-              f"{mm['total_return']*100:>13.1f}{mm['max_drawdown']*100:>11.1f}{beat:>13}")
-    print("-" * 74)
-    print("Note: crypto acquired before 2026-01-01 is grandfathered (0% tax forever,")
-    print("regardless of when sold) -- this table assumes a position acquired now, at")
-    print("the flat post-2026 rate. See module docstring for the full-deferral-via-")
-    print("stablecoin-swap scenario and why it's not modeled as the headline case.")
-    print("=" * 74)
+    print("\nCRYPTO SLEEVE TAX SCENARIOS")
+    print("Current FURS non-business-individual scenario: ordinary virtual-currency "
+          f"gains income-tax rate modeled at {current_rate:.0%}.")
+    print("Separate 25% crypto bill: PROPOSAL/HYPOTHETICAL scenario only; not treated "
+          "as enacted law. Business-activity treatment can differ.")
+    print(f"{'Book':24}{'Current Shp':>14}{'Proposal25 Shp':>16}{'Current Ret%':>14}")
+
+    for w in DEFAULT_WEIGHTS:
+        base = _securities_base_after_tax(daily_data, books, common, 1 - w)
+        crypto_current = _crypto_after_tax(btc, w, current_rate)
+        crypto_proposal = _crypto_after_tax(btc, w, proposal_rate)
+        cur_eq = base.add(crypto_current.reindex(common).ffill(), fill_value=0.0)
+        prop_eq = base.add(crypto_proposal.reindex(common).ffill(), fill_value=0.0)
+        cur_eq.attrs["initial_equity"] = INITIAL_EQUITY
+        prop_eq.attrs["initial_equity"] = INITIAL_EQUITY
+        mc, mp = compute_metrics([], cur_eq), compute_metrics([], prop_eq)
+        label = "blend (0% BTC)" if w == 0 else f"blend + {w:.0%} BTC"
+        print(f"{label:24}{mc['sharpe']:>14.3f}{mp['sharpe']:>16.3f}"
+              f"{mc['total_return']*100:>14.1f}")
+    return 0
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Trend-filtered BTC sleeve blended into the RP+TE combo.")
-    ap.add_argument("--mode", choices=["score", "walk", "aftertax"], default="score")
+    ap = argparse.ArgumentParser(description="Trend-filtered BTC sleeve historical research.")
+    ap.add_argument("--mode", choices=["score", "consistency", "walk", "aftertax"],
+                    default="score")
     ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--btc-weight", type=float, default=0.10,
-                    help="Capital fraction in the BTC sleeve for --mode walk (score mode "
-                         "sweeps a fixed grid instead).")
-    ap.add_argument("--btc-symbol", type=str, default="BTC-USD")
+    ap.add_argument("--btc-weight", type=float, default=0.10)
+    ap.add_argument("--btc-symbol", default="BTC-USD")
     ap.add_argument("--rp-strategy", choices=["min_var", "inverse_vol", "erc"], default="min_var")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--months", type=int, default=240)
-    ap.add_argument("--start", type=str, default=None)
-    ap.add_argument("--end", type=str, default=None)
+    ap.add_argument("--start"); ap.add_argument("--end")
     ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca")
     args = ap.parse_args()
 
+    if args.folds <= 0 or args.months <= 0 or not 0 <= args.btc_weight <= 1:
+        ap.error("invalid folds/months/btc-weight")
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
     start_dt = (_parse_date(args.start) if args.start
-                else end_dt - pd.Timedelta(days=int(args.months * 31)))
-    log.info("Crypto sleeve window: %s -> %s (%s mode)", start_dt.date(), end_dt.date(), args.mode)
-
-    daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt, source=args.data_source)
-    if len(daily_data) < 2:
-        log.error("Need >= 2 symbols with data; got %d.", len(daily_data))
+                else end_dt - pd.Timedelta(days=args.months * 31))
+    if start_dt >= end_dt:
+        ap.error("start must precede end")
+    daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt,
+                                 source=args.data_source)
+    if len(daily_data) != len(args.symbols):
+        log.error("Missing requested symbol data; refusing a silently changed universe.")
         return 1
     btc_data, _, _ = fetch_all([args.btc_symbol], "none", start_dt, end_dt, source="yahoo")
     if args.btc_symbol not in btc_data:
-        log.error("Could not fetch %s.", args.btc_symbol)
-        return 1
+        log.error("Could not fetch %s.", args.btc_symbol); return 1
     books = compute_books(daily_data, rp_strategy=args.rp_strategy)
-
-    if args.mode == "walk":
-        print_walk(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt, args.folds,
+    btc_daily = btc_data[args.btc_symbol]
+    if args.mode in {"consistency", "walk"}:
+        print_walk(daily_data, books, btc_daily, start_dt, end_dt, args.folds,
                    args.btc_weight)
     elif args.mode == "aftertax":
-        print_aftertax(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt)
+        print_aftertax(daily_data, books, btc_daily, start_dt, end_dt)
     else:
-        print_score(daily_data, books, btc_data[args.btc_symbol], start_dt, end_dt)
+        print_score(daily_data, books, btc_daily, start_dt, end_dt)
     return 0
 
 
