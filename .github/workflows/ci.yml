@@ -34,7 +34,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
       - name: Run test suite
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q > pytest.log 2>&1
+          status=$?
+          cat pytest.log
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          from pathlib import Path
+          lines = Path("pytest.log").read_text(errors="replace").splitlines()
+          text = "\n".join(lines[-160:])
+          text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=pytest failure summary::{text}")
+          PY
+            exit "$status"
+          fi
 
   gex-lab:
     runs-on: ubuntu-latest
@@ -52,6 +67,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pytest
+          python -m pip install -r requirements.txt 'pytest>=8,<10'
       - name: Run test suite
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q > pytest.log 2>&1
+          status=$?
+          cat pytest.log
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          from pathlib import Path
+          lines = Path("pytest.log").read_text(errors="replace").splitlines()
+          text = "\n".join(lines[-160:])
+          text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=pytest failure summary::{text}")
+          PY
+            exit "$status"
+          fi
