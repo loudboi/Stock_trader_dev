@@ -9,7 +9,8 @@ shared live trader confirms broker position changes before mutating strategy
 state. Equity positions use real GTC stop orders at IBKR, so protection survives
 bot/Gateway process interruptions after IBKR has accepted the stop. Cancellation
 success means IBKR has reported a cancellation state, not merely that cancelOrder
-was called successfully.
+was called successfully. Exact-order fill recovery aggregates every matching
+execution into a volume-weighted average price.
 """
 
 import logging
@@ -350,8 +351,6 @@ class IBKRPortfolio:
                     "status": status,
                     "filled_qty": filled,
                     "qty": filled + remaining,
-                    # Inactive is deliberately not terminal here: IB documents
-                    # multiple causes, including states that may later be released.
                     "terminal": status in {"filled", "cancelled", "apicancelled"},
                 }
         except Exception as e:  # noqa: BLE001
@@ -403,7 +402,6 @@ class IBKRPortfolio:
 
         order = self._strategy_orders.get(wanted)
         if order is None:
-            # Recover the Order object after a process restart when possible.
             for trade in self.ib.openTrades():
                 candidate = getattr(trade, "order", None)
                 if candidate is not None and str(getattr(candidate, "orderId", "")) == wanted:
@@ -438,13 +436,15 @@ class IBKRPortfolio:
         return False
 
     def recent_fill_price(self, inst, side: str, order_id=None, since=None):
+        """Return VWAP for an exact order, or for the latest matching order."""
         try:
             self._ensure()
             con_id = getattr(self._contract(inst), "conId", None)
-            wanted = side.lower()
+            wanted_side = side.lower()
             since_ts = pd.Timestamp(since) if since is not None else None
             if since_ts is not None:
-                since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts.tz_convert("UTC")
+                since_ts = (since_ts.tz_localize("UTC") if since_ts.tzinfo is None
+                            else since_ts.tz_convert("UTC"))
             matches = []
             for fill in self.ib.fills():
                 ex, fc = getattr(fill, "execution", None), getattr(fill, "contract", None)
@@ -452,21 +452,41 @@ class IBKRPortfolio:
                     continue
                 ex_side = str(getattr(ex, "side", "")).lower()
                 normalized = "buy" if ex_side.startswith("b") else "sell"
-                if normalized != wanted:
+                if normalized != wanted_side:
                     continue
-                if order_id not in (None, "already-flat"):
-                    ex_oid = getattr(ex, "orderId", None)
-                    if ex_oid is not None and str(ex_oid) != str(order_id):
-                        continue
+                ex_oid = getattr(ex, "orderId", None)
+                if order_id not in (None, "already-flat") and str(ex_oid) != str(order_id):
+                    continue
                 ex_time = pd.Timestamp(getattr(ex, "time", datetime.now(timezone.utc)))
-                ex_time = ex_time.tz_localize("UTC") if ex_time.tzinfo is None else ex_time.tz_convert("UTC")
+                ex_time = (ex_time.tz_localize("UTC") if ex_time.tzinfo is None
+                           else ex_time.tz_convert("UTC"))
                 if since_ts is not None and ex_time < since_ts:
                     continue
                 px = getattr(ex, "price", None)
-                if px is not None:
-                    matches.append((ex_time, float(px)))
-            if matches:
-                return sorted(matches, key=lambda x: x[0])[-1][1]
+                if px is None:
+                    continue
+                try:
+                    qty = float(getattr(ex, "shares", 0) or 0)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                matches.append({"time": ex_time, "price": float(px),
+                                "qty": max(0.0, qty), "order_id": ex_oid})
+            if not matches:
+                return None
+
+            if order_id not in (None, "already-flat"):
+                chosen = matches
+            else:
+                latest = max(matches, key=lambda m: m["time"])
+                if latest["order_id"] is None:
+                    chosen = [latest]
+                else:
+                    chosen = [m for m in matches if str(m["order_id"]) == str(latest["order_id"])]
+
+            weighted_qty = sum(m["qty"] for m in chosen)
+            if weighted_qty > 0:
+                return sum(m["price"] * m["qty"] for m in chosen) / weighted_qty
+            return max(chosen, key=lambda m: m["time"])["price"]
         except Exception as e:  # noqa: BLE001
             log.debug("recent_fill_price failed for %s: %s", inst.name, e)
         return None
