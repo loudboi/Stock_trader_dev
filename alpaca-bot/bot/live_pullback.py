@@ -5,7 +5,8 @@ Live execution for the phased trend-pullback strategy.
 
 Safety invariants:
   * broker reads are authoritative; an API failure is not treated as "flat";
-  * accepted orders are not fills -- broker position changes confirm execution;
+  * accepted orders are not fills -- the bot order's own terminal broker state and
+    fill quantity are required before pending strategy state is resolved;
   * a symbol with an uncertain order is blocked from additional strategy orders;
   * missing live prices are data stalls, never stale daily-price substitutes;
   * managed positions cannot silently disappear from the configured symbol set;
@@ -175,6 +176,23 @@ class PullbackLiveTrader:
             log.warning("Could not read broker order status %s: %s", order_id, e)
             return None
 
+    @staticmethod
+    def _filled_qty(status):
+        if not status:
+            return None
+        try:
+            return max(0.0, float(status.get("filled_qty", 0) or 0))
+        except (TypeError, ValueError):
+            return None
+
+    def _request_pending_cancel(self, pending):
+        """Attempt cancellation once; broker adapter itself confirms terminal cancel."""
+        if pending.get("cancel_requested"):
+            return
+        pending["cancel_requested"] = True
+        pending["cancel_confirmed"] = bool(self.pf.cancel_order(pending["order_id"]))
+        self.save_state()
+
     def _managed_capacity(self, equity):
         gross = risk = 0.0
         for p in self.state["positions"].values():
@@ -198,18 +216,15 @@ class PullbackLiveTrader:
         if name not in self.state["pending"]:
             return True
 
-        # A market order that remains active/ambiguous this long should not be left
-        # outstanding while the symbol is unmanaged. Request cancellation, then use
-        # terminal broker status + broker position truth to settle a partial/no-fill.
         pending = self.state["pending"][name]
         status = self._order_status(pending["order_id"])
         if not (status and status.get("terminal")):
-            if self.pf.cancel_order(pending["order_id"]):
-                cancel_deadline = time.monotonic() + 3.0
-                while name in self.state["pending"] and time.monotonic() < cancel_deadline:
-                    if self._confirm_pending(name, inst):
-                        return True
-                    time.sleep(ORDER_CONFIRM_INTERVAL)
+            self._request_pending_cancel(pending)
+            cancel_deadline = time.monotonic() + 3.0
+            while name in self.state["pending"] and time.monotonic() < cancel_deadline:
+                if self._confirm_pending(name, inst):
+                    return True
+                time.sleep(ORDER_CONFIRM_INTERVAL)
         if name in self.state["pending"] and self._confirm_pending(name, inst):
             return True
         if name in self.state["pending"]:
@@ -217,66 +232,169 @@ class PullbackLiveTrader:
             return False
         return True
 
-    def _settle_partial_buy(self, name, inst, pending, broker):
-        delta = max(0.0, broker["qty"] - float(pending["before_qty"]))
-        if delta <= 1e-9:
-            return False
+    def _settle_terminal_buy(self, name, inst, pending, broker, filled_qty):
+        requested = float(pending["requested_qty"])
+        before = float(pending["before_qty"])
+        fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"])
+        if filled_qty <= 1e-9:
+            self.state["pending"].pop(name, None)
+            self.save_state()
+            self.notify(f"BUY ENDED WITHOUT BOT FILL: {name} order {pending['order_id']}.")
+            return True
+
+        if broker is None:
+            # The bot order did fill, but no long exists now. A separate sell/close
+            # happened before reconciliation. Preserve the known entry and record the
+            # unresolved exit rather than resurrecting a position or guessing P&L.
+            known_entry = fill_px or pending["signal_price"]
+            transient = {
+                "qty": filled_qty, "avg_entry": known_entry,
+                "tranches": pending["tranche_index"] + 1,
+                "entry_time": pending["submitted_at"],
+                "entry_orders": [{
+                    "order_id": pending["order_id"],
+                    "requested_qty": requested, "filled_qty": filled_qty,
+                    "fill_price": fill_px, "submitted_at": pending["submitted_at"],
+                    "tranche": pending["tranche_index"] + 1}],
+            }
+            self._log_trade(name, transient, None, None,
+                            "bot buy filled, but broker was flat at reconciliation; "
+                            "exit fill unavailable; PnL not accrued", None)
+            self.state["pending"].pop(name, None)
+            self.state["positions"].pop(name, None)
+            self.save_state()
+            self.notify(f"BUY/FLAT RACE {name}: bot order filled {filled_qty}, but broker is flat; reconcile statement.")
+            return True
+
+        broker_delta = broker["qty"] - before
         pos = self.state["positions"].get(name)
         if pos is None:
             pos = {"tranches": 0, "stop_dist": pending["stop_dist"],
                    "entry_time": pending["submitted_at"], "stop_order_id": None,
                    "stop_level": None, "stop_qty": 0.0, "entry_orders": []}
-        fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]
+        exact_overlap = abs(broker_delta - filled_qty) > 1e-8
+        terminal_partial = filled_qty + 1e-8 < requested
+        if terminal_partial or exact_overlap:
+            pos["tranches"] = len(self.params.tranches)
+        else:
+            pos["tranches"] = max(pos.get("tranches", 0), pending["tranche_index"] + 1)
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-        pos["tranches"] = len(self.params.tranches)
-        pos["last_add_price"] = fill_px
-        pos["last_price"] = fill_px
-        pos["partial_fill_frozen"] = True
+        resolved_fill = fill_px or broker["avg_entry"]
+        pos["last_add_price"] = resolved_fill
+        pos["last_price"] = broker["avg_entry"]
+        if terminal_partial:
+            pos["partial_fill_frozen"] = True
+        if exact_overlap:
+            pos["external_overlap"] = True
+            pos["tranches"] = len(self.params.tranches)
         pos.setdefault("entry_orders", []).append({
-            "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],
-            "filled_qty": delta, "fill_price": fill_px,
+            "order_id": pending["order_id"], "requested_qty": requested,
+            "filled_qty": filled_qty, "fill_price": fill_px,
             "submitted_at": pending["submitted_at"],
-            "tranche": pending["tranche_index"] + 1, "terminal_partial": True})
+            "tranche": pending["tranche_index"] + 1,
+            "terminal_partial": terminal_partial})
         self.state["positions"][name] = pos
         self.state["pending"].pop(name, None)
         protected = self._place_stop(name, inst, pos)
         self.save_state()
-        self.notify(f"PARTIAL BUY {name}: {delta}/{pending['requested_qty']} filled; "
-                    "remainder terminal/cancelled, position frozen as fully built" +
-                    ("." if protected else " [protective stop unavailable]."))
+        if terminal_partial:
+            label = (f"PARTIAL BUY {name}: bot filled {filled_qty}/{requested}; "
+                     "position frozen as fully built")
+        elif exact_overlap:
+            label = (f"BUY {name}: bot filled {filled_qty}, but broker quantity changed by "
+                     f"{broker_delta}; external overlap detected and position frozen")
+        else:
+            label = (f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
+                     f"qty={filled_qty} @~{resolved_fill:.4f} ({pending['how']})")
+        self.notify(label + ("" if protected else " [protective stop unavailable]"))
         return True
 
-    def _settle_partial_close(self, name, inst, pending, broker):
-        original = pending["position"]
-        sold = max(0.0, float(original["qty"]) - broker["qty"])
-        if sold <= 1e-9:
-            return False
-        exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
-        partial_pos = dict(original)
-        partial_pos["qty"] = sold
+    def _record_close_piece(self, name, pos, qty, exit_px, reason, order_id):
+        piece = dict(pos)
+        piece["qty"] = qty
         if exit_px is None:
-            pnl = None
-            self._log_trade(
-                name, partial_pos, None, None,
-                pending["reason"] + " (terminal partial close; fill unavailable; PnL not accrued)",
-                pending["order_id"])
-        else:
-            pnl = (exit_px - original["avg_entry"]) * sold
-            self._log_trade(name, partial_pos, exit_px, pnl,
-                            pending["reason"] + " (terminal partial close)", pending["order_id"])
-            self._accrue_daily(pnl)
+            self._log_trade(name, piece, None, None,
+                            reason + " (fill unavailable; PnL not accrued)", order_id)
+            return None
+        pnl = (exit_px - pos["avg_entry"]) * qty
+        self._log_trade(name, piece, exit_px, pnl, reason, order_id)
+        self._accrue_daily(pnl)
+        return pnl
+
+    def _settle_terminal_close(self, name, inst, pending, broker, filled_qty):
+        original = pending["position"]
+        original_qty = float(original["qty"])
+        exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
+
+        if filled_qty <= 1e-9:
+            self.state["pending"].pop(name, None)
+            if broker is None:
+                # Bot sell did not fill, but the broker position disappeared through
+                # another order/manual action. Attribute it as external, not to the
+                # bot's canceled/rejected close.
+                pos = self.state["positions"].get(name) or dict(original)
+                self._finalize_external_close(name, inst, pos)
+                return True
+            pos = self.state["positions"].get(name) or dict(original)
+            changed = (abs(float(pos.get("qty", 0)) - broker["qty"]) > 1e-9 or
+                       abs(float(pos.get("avg_entry", 0)) - broker["avg_entry"]) > 1e-9)
+            if changed:
+                self._apply_external_position_change(name, inst, pos, broker)
+            else:
+                self.state["positions"][name] = pos
+                protected = self._place_stop(name, inst, pos)
+                self.notify(f"CLOSE ENDED WITHOUT BOT FILL: {name}; protection restored" +
+                            ("." if protected else " [protective stop unavailable]."))
+            self.save_state()
+            return True
+
+        if filled_qty + 1e-8 >= original_qty:
+            pnl = self._record_close_piece(name, original, original_qty, exit_px,
+                                           pending["reason"], pending["order_id"])
+            self.state["positions"].pop(name, None)
+            self.state["intents"].pop(name, None)
+            self.state["pending"].pop(name, None)
+            self.save_state()
+            detail = (f"@~{exit_px:.4f} pnl={pnl:.2f}"
+                      if exit_px is not None else "fill/PnL unavailable")
+            suffix = (" Broker now has a separate long; it will require explicit adoption."
+                      if broker is not None else "")
+            self.notify(f"CLOSE {name} {detail} ({pending['reason']}).{suffix}")
+            return True
+
+        # Terminal partial bot close. Record only the bot order's exact filled qty.
+        pnl = self._record_close_piece(
+            name, original, filled_qty, exit_px,
+            pending["reason"] + " (terminal partial close)", pending["order_id"])
+        expected_remaining = max(0.0, original_qty - filled_qty)
+        self.state["pending"].pop(name, None)
+        if broker is None:
+            # The bot sold only part, while another action removed the remainder.
+            remainder = dict(original)
+            remainder["qty"] = expected_remaining
+            if expected_remaining > 1e-9:
+                self._log_trade(
+                    name, remainder, None, None,
+                    "external close of remainder after terminal partial bot close; "
+                    "fill unavailable; PnL not accrued", None)
+            self.state["positions"].pop(name, None)
+            self.save_state()
+            self.notify(f"PARTIAL CLOSE {name}: bot sold {filled_qty}; broker is now flat. Reconcile external remainder.")
+            return True
+
         pos = self.state["positions"].get(name) or dict(original)
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
         pos["tranches"] = len(self.params.tranches)
         pos["last_price"] = broker["avg_entry"]
         pos["partial_close_frozen"] = True
+        if abs(broker["qty"] - expected_remaining) > 1e-8:
+            pos["external_overlap"] = True
         self.state["positions"][name] = pos
-        self.state["pending"].pop(name, None)
         protected = self._place_stop(name, inst, pos)
         self.save_state()
-        detail = f"realized pnl={pnl:.2f}" if pnl is not None else "fill/PnL unavailable; reconcile statement"
-        self.notify(f"PARTIAL CLOSE {name}: sold {sold}, {broker['qty']} remains; {detail}; "
-                    "remainder frozen as fully built" +
+        detail = f"realized pnl={pnl:.2f}" if pnl is not None else "fill/PnL unavailable"
+        self.notify(f"PARTIAL CLOSE {name}: bot sold {filled_qty}, broker has {broker['qty']} long; "
+                    f"{detail}; position frozen as fully built" +
                     ("." if protected else " [protective stop unavailable]."))
         return True
 
@@ -330,8 +448,6 @@ class PullbackLiveTrader:
 
     def reconcile(self):
         for name, inst in self.instruments.items():
-            # A persisted pending order from a crash/restart is strategy-owned. Settle
-            # it before classifying any resulting broker quantity as an external edit.
             if name in self.state["pending"]:
                 if not self._confirm_pending(name, inst):
                     log.warning("%s has an unresolved pending broker order; leaving symbol blocked.", name)
@@ -406,102 +522,45 @@ class PullbackLiveTrader:
         broker = self._broker_position(inst)
         status = self._order_status(pending["order_id"])
         terminal = bool(status and status.get("terminal"))
+        filled_qty = self._filled_qty(status)
 
         if pending["type"] == "buy":
             before = float(pending["before_qty"])
-            requested = float(pending["requested_qty"])
-            delta = max(0.0, (broker["qty"] if broker else 0.0) - before)
-            if delta <= 1e-9:
-                if terminal:
-                    self.state["pending"].pop(name, None)
-                    self.save_state()
-                    self.notify(f"BUY ENDED WITHOUT FILL: {name} order {pending['order_id']} ({status['status']}).")
-                    return True
+            broker_delta = max(0.0, (broker["qty"] if broker else 0.0) - before)
+            if not terminal:
+                # Any observed quantity change while the exact bot order is still
+                # nonterminal is ambiguous: it can be a partial bot fill OR a manual
+                # trade. Cancel the bot order before attributing anything.
+                if broker_delta > 1e-9:
+                    self._request_pending_cancel(pending)
+                    status = self._order_status(pending["order_id"])
+                    terminal = bool(status and status.get("terminal"))
+                    filled_qty = self._filled_qty(status)
+                if not terminal:
+                    return False
+            if filled_qty is None:
                 return False
-            if delta + 1e-9 < requested:
-                if terminal:
-                    return self._settle_partial_buy(name, inst, pending, broker)
-                # Do not let an incompletely filled market order sit open while the
-                # strategy prepares another tranche. Cancel it and settle only once
-                # broker status becomes terminal.
-                if not pending.get("cancel_requested"):
-                    pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))
-                    self.save_state()
-                status = self._order_status(pending["order_id"])
-                if status and status.get("terminal"):
-                    return self._settle_partial_buy(name, inst, pending, self._broker_position(inst))
-                return False
-
-            pos = self.state["positions"].get(name)
-            if pos is None:
-                pos = {"tranches": 0, "stop_dist": pending["stop_dist"],
-                       "entry_time": pending["submitted_at"], "stop_order_id": None,
-                       "stop_level": None, "stop_qty": 0.0, "entry_orders": []}
-            pos["tranches"] = max(pos.get("tranches", 0), pending["tranche_index"] + 1)
-            pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-            fill_px = self.pf.recent_fill_price(inst, "buy", pending["order_id"]) or broker["avg_entry"]
-            pos["last_add_price"] = fill_px
-            pos["last_price"] = fill_px
-            pos.setdefault("entry_orders", []).append({
-                "order_id": pending["order_id"], "requested_qty": pending["requested_qty"],
-                "filled_qty": delta, "fill_price": fill_px,
-                "submitted_at": pending["submitted_at"],
-                "tranche": pending["tranche_index"] + 1})
-            self.state["positions"][name] = pos
-            self.state["pending"].pop(name, None)
-            protected = self._place_stop(name, inst, pos)
-            self.save_state()
-            self.notify(f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
-                        f"qty={delta} @~{fill_px:.4f} ({pending['how']})" +
-                        ("" if protected else " [broker stop unavailable]"))
-            return True
+            return self._settle_terminal_buy(name, inst, pending, broker, filled_qty)
 
         if pending["type"] == "close":
-            if broker is None:
-                pos = pending["position"]
-                exit_px = self.pf.recent_fill_price(inst, "sell", pending["order_id"])
-                if exit_px is None:
-                    self._log_trade(
-                        name, pos, None, None,
-                        pending["reason"] + " (fill unavailable; PnL not accrued)",
-                        pending["order_id"])
-                else:
-                    pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
-                    self._log_trade(name, pos, exit_px, pnl, pending["reason"], pending["order_id"])
-                    self._accrue_daily(pnl)
-                self.state["positions"].pop(name, None)
-                self.state["intents"].pop(name, None)
-                self.state["pending"].pop(name, None)
-                self.save_state()
-                if exit_px is None:
-                    self.notify(f"CLOSE {name}: broker is flat but fill/PnL unavailable; reconcile statement ({pending['reason']}).")
-                else:
-                    self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} ({pending['reason']})")
-                return True
-
             original_qty = float(pending["position"]["qty"])
-            sold = max(0.0, original_qty - broker["qty"])
-            if terminal:
-                if sold > 1e-9:
-                    return self._settle_partial_close(name, inst, pending, broker)
-                # Terminal close request with zero fill: restore protection and clear
-                # pending instead of leaving the symbol permanently blocked.
-                pos = self.state["positions"].get(name) or dict(pending["position"])
-                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-                self.state["positions"][name] = pos
-                self.state["pending"].pop(name, None)
-                protected = self._place_stop(name, inst, pos)
-                self.save_state()
-                self.notify(f"CLOSE ENDED WITHOUT FILL: {name}; protection restored" +
-                            ("." if protected else " [protective stop unavailable]."))
-                return True
-            if sold > 1e-9 and not pending.get("cancel_requested"):
-                pending["cancel_requested"] = bool(self.pf.cancel_order(pending["order_id"]))
-                self.save_state()
-            pos = self.state["positions"].get(name)
-            if pos:
-                pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
-            return False
+            broker_remaining = broker["qty"] if broker else 0.0
+            broker_changed = (broker is None or
+                              abs(broker_remaining - original_qty) > 1e-9)
+            if not terminal:
+                # Flat/partial broker state is not proof that this sell order caused
+                # it. Cancel the still-working bot sell before it can execute later
+                # against an externally changed position and create a short.
+                if broker_changed:
+                    self._request_pending_cancel(pending)
+                    status = self._order_status(pending["order_id"])
+                    terminal = bool(status and status.get("terminal"))
+                    filled_qty = self._filled_qty(status)
+                if not terminal:
+                    return False
+            if filled_qty is None:
+                return False
+            return self._settle_terminal_close(name, inst, pending, broker, filled_qty)
         raise RuntimeError(f"Unknown pending order type for {name}: {pending['type']}")
 
     def _place_stop(self, name, inst, pos):
