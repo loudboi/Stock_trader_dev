@@ -55,7 +55,7 @@ class PullbackParams:
         }.items():
             if value < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if not 0 < self.vol_contraction:
+        if self.vol_contraction <= 0:
             raise ValueError("vol_contraction must be positive")
         if self.breakout_vol_mult <= 0:
             raise ValueError("breakout_vol_mult must be positive")
@@ -89,24 +89,18 @@ class TrendPullbackStrategy:
 
     def _pullback_entry(self, df, ma_f, i):
         p = self.p
-        lb = p.pullback_lookback
-        recent_low = df["low"].iloc[i - lb + 1:i + 1].min()
+        recent_low = df["low"].iloc[i - p.pullback_lookback + 1:i + 1].min()
         ma_now = ma_f.iloc[i]
-        # "Within touch_band" is a two-sided band. The old one-sided comparison
-        # also accepted crashes far below the MA as valid touches.
         near_ma = ma_now * (1 - p.touch_band) <= recent_low <= ma_now * (1 + p.touch_band)
-
         pull_vol = df["volume"].iloc[i - 2:i + 1].mean()
         base_end = i - 2
-        base_start = base_end - p.vol_baseline
-        base_vol = df["volume"].iloc[base_start:base_end].mean()
+        base_vol = df["volume"].iloc[base_end - p.vol_baseline:base_end].mean()
         vol_contract = base_vol > 0 and pull_vol < base_vol * p.vol_contraction
-
         rebound = (df["close"].iloc[i] > df["close"].iloc[i - 1]
                    and df["close"].iloc[i] > ma_now
                    and df["low"].iloc[i] >= ma_now * (1 - p.touch_band))
         if near_ma and vol_contract and rebound:
-            return True, "pullback to fast MA on lighter volume, rebound"
+            return True, "pullback to 50MA on lighter volume, rebound"
         return False, ""
 
     def _breakout_entry(self, df, i):
@@ -116,24 +110,18 @@ class TrendPullbackStrategy:
         win_low = df["low"].iloc[i - c:i].min()
         close = df["close"].iloc[i]
         rng = (win_high - win_low) / close if close > 0 else float("inf")
-        consolidated = rng <= p.consolidation_range
-        broke_out = close > win_high
         avg_vol = df["volume"].iloc[i - c:i].mean()
-        vol_ok = avg_vol > 0 and df["volume"].iloc[i] >= p.breakout_vol_mult * avg_vol
-        if consolidated and broke_out and vol_ok:
+        if (rng <= p.consolidation_range and close > win_high and avg_vol > 0 and
+                df["volume"].iloc[i] >= p.breakout_vol_mult * avg_vol):
             return True, "consolidation breakout on rising volume"
         return False, ""
 
     def entry_signal(self, df, ma_f, i):
         ok, reason = self._pullback_entry(df, ma_f, i)
-        if ok:
-            return True, reason
-        return self._breakout_entry(df, i)
+        return (ok, reason) if ok else self._breakout_entry(df, i)
 
     def should_add(self, df, ma_f, i, last_add_price):
-        if last_add_price is None or last_add_price <= 0:
-            return False, ""
-        if df["close"].iloc[i] <= ma_f.iloc[i]:
+        if last_add_price is None or last_add_price <= 0 or df["close"].iloc[i] <= ma_f.iloc[i]:
             return False, ""
         if df["close"].iloc[i] >= last_add_price * (1 + self.p.add_step):
             return True, f"trend extending (+{self.p.add_step*100:.0f}% since last add)"
@@ -147,7 +135,7 @@ class TrendPullbackStrategy:
     def trend_exit(self, df, ma_f, i):
         c = df["close"].iloc[i]
         if c < ma_f.iloc[i]:
-            return (c, "closed below fast MA")
+            return (c, "closed below 50MA")
         swing_low = df["low"].iloc[i - self.p.structural_low_lookback:i].min()
         if c < swing_low:
             return (c, "closed below structural low")
