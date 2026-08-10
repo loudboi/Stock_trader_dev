@@ -3,9 +3,10 @@ bot/live_pullback_ibkr.py
 =========================
 Live runner for Strategy 4 on Interactive Brokers, EUR-only.
 
-Standard IBKR ports are recognized automatically. A custom port is intentionally
-ambiguous and requires IBKR_MODE=paper or IBKR_MODE=live so a custom live Gateway
-cannot accidentally bypass the real-money confirmation gate.
+Standard IBKR ports are recognized automatically. A custom port requires
+IBKR_MODE=paper or IBKR_MODE=live, so real-money mode is never inferred from an
+unknown port. Existing untracked positions are only taken over with the explicit
+--adopt-existing flag.
 """
 
 import argparse
@@ -39,25 +40,22 @@ def _mode_for_port(port: int):
 
 def main():
     ap = argparse.ArgumentParser(description="Live runner for Strategy 4 on IBKR (EUR-only).")
-    ap.add_argument("--symbols", nargs="+", default=ibkr_universe.DEFAULT_SYMBOLS,
-                    help="Names from ibkr_universe.IBKR_EUR_UNIVERSE.")
-    ap.add_argument("--ema", action="store_true", help="Use EMAs instead of SMAs.")
+    ap.add_argument("--symbols", nargs="+", default=ibkr_universe.DEFAULT_SYMBOLS)
+    ap.add_argument("--ema", action="store_true")
     ap.add_argument("--live", action="store_true",
                     help="Required confirmation when IBKR_MODE/port is live.")
+    ap.add_argument("--adopt-existing", action="store_true",
+                    help="Explicitly take over untracked existing long positions as fully built.")
     args = ap.parse_args()
 
     ibkr_universe.register()
     port = int(os.getenv("IBKR_PORT", "4002"))
     mode = _mode_for_port(port)
     if mode is None:
-        log.error("IBKR_PORT %s is non-standard. Set IBKR_MODE=paper or IBKR_MODE=live "
-                  "explicitly; refusing to guess account mode.", port)
+        log.error("IBKR_PORT %s is non-standard. Set IBKR_MODE=paper or IBKR_MODE=live.", port)
         return 1
-    if mode == "live" and not args.live:
-        log.error("IBKR runtime is LIVE. Re-run with --live to confirm real-money trading.")
-        return 1
-    if mode == "paper" and args.live:
-        log.error("--live was supplied but IBKR runtime is explicitly paper; refusing ambiguity.")
+    if (mode == "live") != args.live:
+        log.error("IBKR runtime mode and --live confirmation disagree; refusing ambiguity.")
         return 1
 
     suffix = "_live" if mode == "live" else ""
@@ -75,7 +73,6 @@ def main():
                   ", ".join(ibkr_universe.IBKR_EUR_UNIVERSE))
         return 1
 
-    params = PullbackParams(use_ema=args.ema)
     try:
         pf = IBKRPortfolio()
     except Exception as e:  # noqa: BLE001
@@ -84,7 +81,9 @@ def main():
 
     try:
         with lp.SingleInstanceLock(state_file + ".lock"):
-            trader = lp.PullbackLiveTrader(pf, args.symbols, params, state_file=state_file)
+            trader = lp.PullbackLiveTrader(
+                pf, args.symbols, PullbackParams(use_ema=args.ema), state_file=state_file,
+                adopt_existing=args.adopt_existing)
             trader.reconcile()
             trader.run()
     finally:
