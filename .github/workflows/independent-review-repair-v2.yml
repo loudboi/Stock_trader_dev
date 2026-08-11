@@ -1,0 +1,86 @@
+name: Independent Review Repair V2
+
+on:
+  push:
+    branches: [agent/fix-repo-audit]
+    paths:
+      - .github/workflows/independent-review-repair-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/fix-repo-audit
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-ibkr.txt
+            alpaca-bot/requirements-dev.txt
+      - name: Install dependencies
+        working-directory: alpaca-bot
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
+      - name: Extract and run corrected repair script
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/independent-review-repair.yml')
+          text = p.read_text()
+          marker = "          cat > /tmp/repair.py <<'PY'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("\n          PY\n", start)
+          block = text[start:end]
+          lines = []
+          for line in block.splitlines():
+              lines.append(line[10:] if line.startswith('          ') else line)
+          script = '\n'.join(lines) + '\n'
+          old = "regression = textwrap.dedent(r'''\\\n"
+          new = "regression = textwrap.dedent('''\\\n"
+          if old not in script:
+              raise RuntimeError('regression-string harness marker not found')
+          script = script.replace(old, new, 1)
+          Path('/tmp/repair.py').write_text(script)
+          PY
+          python /tmp/repair.py
+          python -m py_compile \
+            alpaca-bot/bot/live_pullback.py \
+            alpaca-bot/bot/portfolio_ibkr.py \
+            alpaca-bot/bot/backtest_pullback.py \
+            alpaca-bot/tests/test_independent_review_regressions.py
+          git diff --check
+          git diff --stat
+      - name: Run targeted regressions
+        working-directory: alpaca-bot
+        run: |
+          python -m pytest -q \
+            tests/test_live_state_schema.py \
+            tests/test_backtest_pullback.py \
+            tests/test_independent_review_regressions.py \
+            tests/test_pending_order_attribution.py \
+            tests/test_live_reconciliation_edges.py \
+            tests/test_ibkr_restart_reconciliation.py \
+            tests/test_cancel_confirmation.py
+      - name: Run full alpaca-bot suite
+        working-directory: alpaca-bot
+        run: python -m pytest -q
+      - name: Commit repairs and remove repair workflows
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm \
+            .github/workflows/independent-review-repair.yml \
+            .github/workflows/independent-review-repair-v2.yml
+          git add alpaca-bot
+          git commit -m "Address independent review safety blockers"
+          git push origin HEAD:agent/fix-repo-audit
