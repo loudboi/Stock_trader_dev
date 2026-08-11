@@ -105,7 +105,11 @@ def _te_after_tax_equity(daily_data, begin_ts, end_ts, currency="usd",
         taxed = tx.after_tax_binary_strategy(converted, held, initial=initial / n)
         parts.append(taxed)
     merged = pd.concat(parts, axis=1).sort_index().ffill()
-    out = merged.sum(axis=1)
+    # Never sum partial sleeve capital before every sleeve actually exists. Doing
+    # so makes the curve begin below declared initial equity and fabricates a
+    # drawdown/capital jump when a later-inception sleeve first appears.
+    merged = merged.dropna(how="any")
+    out = merged.sum(axis=1, min_count=len(parts))
     out.attrs["initial_equity"] = initial
     return out
 

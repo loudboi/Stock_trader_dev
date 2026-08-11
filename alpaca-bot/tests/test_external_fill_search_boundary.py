@@ -66,7 +66,7 @@ def test_external_position_adjustment_resets_fill_search_boundary(tmp_path):
     assert pos["fill_search_since"] == pos["external_adjustment_at"]
 
 
-def test_finalize_external_close_uses_latest_fill_search_boundary(tmp_path, monkeypatch):
+def test_finalize_external_close_does_not_attribute_generic_recent_sell(tmp_path, monkeypatch):
     pf = BoundaryPortfolio()
     t = _trader(tmp_path, pf)
     pos = _position()
@@ -74,4 +74,4 @@ def test_finalize_external_close_uses_latest_fill_search_boundary(tmp_path, monk
     t.state["positions"]["SPY"] = pos
     monkeypatch.setattr(lp, "PULLBACK_TRADES_CSV", str(tmp_path / "trades.csv"))
     t._finalize_external_close("SPY", t.instruments["SPY"], pos)
-    assert pf.seen_since == "2026-08-10T12:34:56+00:00"
+    assert pf.seen_since is None

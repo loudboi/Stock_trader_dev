@@ -38,7 +38,6 @@ from bot import indicators as ind
 from bot import risk_manager as rm
 from bot.notifier import Notifier
 from bot.portfolio import Portfolio
-from bot.backtest_pullback import _DAILY_WARMUP_DAYS
 from bot.strategies.trend_pullback import TrendPullbackStrategy, PullbackParams
 
 logging.basicConfig(level=logging.INFO,
@@ -446,6 +445,7 @@ class PullbackLiveTrader:
             pos["partial_fill_frozen"] = True
         if external_mismatch:
             pos["external_overlap"] = True
+            pos["manual_reconciliation_required"] = True
             pos["tranches"] = len(self.params.tranches)
             pos["fill_search_since"] = datetime.now(timezone.utc).isoformat()
         pos.setdefault("entry_orders", []).append({
@@ -469,7 +469,9 @@ class PullbackLiveTrader:
         elif external_mismatch:
             label = (
                 f"BUY {name}: bot filled {filled_qty}, but broker quantity changed by "
-                f"{broker_delta}; external overlap detected and position frozen")
+                f"{broker_delta}; external/manual ownership overlap detected. The full broker "
+                "long is temporarily protected, further strategy adds are blocked, and manual "
+                "reconciliation is required before discretionary strategy closes.")
         else:
             px_text = (
                 f"@~{resolved_fill:.4f}" if resolved_fill is not None
@@ -617,14 +619,16 @@ class PullbackLiveTrader:
         pos["tranches"] = len(self.params.tranches)
         pos["last_add_price"] = broker["avg_entry"]
         pos["externally_adjusted"] = True
+        pos["manual_reconciliation_required"] = True
         pos["external_adjustment_at"] = adjusted_at
         pos["fill_search_since"] = adjusted_at
         self.state["intents"].pop(name, None)
         protected = self._place_stop(name, inst, pos)
         self.notify(
             f"EXTERNAL POSITION CHANGE {name}: broker qty/avg {old_qty}@{old_avg:.4f} -> "
-            f"{broker['qty']}@{broker['avg_entry']:.4f}; treating as fully built and "
-            "blocking further strategy adds" +
+            f"{broker['qty']}@{broker['avg_entry']:.4f}; ownership is ambiguous, so the "
+            "full broker long is temporarily protected, further strategy adds are blocked, and "
+            "manual reconciliation is required before discretionary strategy closes" +
             ("." if protected else " [protective stop replacement not confirmed]."))
         return pos
 
@@ -663,7 +667,7 @@ class PullbackLiveTrader:
         try:
             end = datetime.now(timezone.utc)
             daily = self.pf.get_historical_bars(
-                inst, "1Day", end - timedelta(days=_DAILY_WARMUP_DAYS + 30), end)
+                inst, "1Day", end - timedelta(days=config.PULLBACK_DAILY_WARMUP_DAYS + 30), end)
             if daily is None or daily.empty:
                 return self.params.min_stop
             a = ind.atr(daily, self.params.atr_period).iloc[-1]
@@ -842,6 +846,11 @@ class PullbackLiveTrader:
         pos = self.state["positions"].get(name)
         if not pos:
             return False
+        if pos.get("manual_reconciliation_required") and not reason.startswith("volatility stop"):
+            self.notify(
+                f"CLOSE BLOCKED {name}: broker ownership changed outside attributable bot orders; "
+                "manual reconciliation is required before a discretionary strategy close.")
+            return False
         old_stop = pos.get("stop_order_id")
         if old_stop and not self.pf.cancel_order(old_stop):
             self.notify(
@@ -876,18 +885,29 @@ class PullbackLiveTrader:
         return name not in self.state["pending"]
 
     def _finalize_external_close(self, name, inst, pos):
+        stop_id = pos.get("stop_order_id")
         if not self._release_protective_stop_after_flat(name, pos):
             return False
-        since = pos.get("fill_search_since") or pos.get("entry_time")
-        exit_px = self.pf.recent_fill_price(inst, "sell", since=since)
+
+        # A generic recent SELL is not sufficient attribution: it may be an older
+        # partial/manual order, and host-clock boundaries are not broker evidence.
+        # Only an exact protective stop confirmed FILLED can supply realized P&L.
+        exit_px = None
+        exact_exit_order_id = None
+        if stop_id:
+            status = self._order_status(stop_id)
+            if status and str(status.get("status", "")).lower() == "filled":
+                exit_px = self.pf.recent_fill_price(inst, "sell", order_id=stop_id)
+                if exit_px is not None:
+                    exact_exit_order_id = stop_id
         if exit_px is None:
             self._log_trade(
                 name, pos, None, None,
-                "broker stop / external close (fill unavailable; PnL not accrued)", None)
+                "broker stop / external close (exact fill unavailable; PnL not accrued)", None)
         else:
             pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
             self._log_trade(
-                name, pos, exit_px, pnl, "broker stop / external close", None)
+                name, pos, exit_px, pnl, "broker protective stop fill", exact_exit_order_id)
             self._accrue_daily(pnl)
         pending = self.state["pending"].get(name)
         if pending:
@@ -990,7 +1010,7 @@ class PullbackLiveTrader:
         else:
             end = datetime.now(timezone.utc)
             daily_full = self.pf.get_historical_bars(
-                inst, "1Day", end - timedelta(days=_DAILY_WARMUP_DAYS + 30), end)
+                inst, "1Day", end - timedelta(days=config.PULLBACK_DAILY_WARMUP_DAYS + 30), end)
             if daily_full is None or daily_full.empty:
                 self._mark_data(name, False)
                 return

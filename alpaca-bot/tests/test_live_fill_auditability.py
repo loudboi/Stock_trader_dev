@@ -92,3 +92,24 @@ def test_strategy_close_without_recoverable_fill_does_not_use_requested_quote(tm
     assert row["pnl"] == ""
     assert row["exit_order_id"] == "close-1"
     assert trader.state["daily"]["realized"] == 0.0
+
+
+
+def test_external_flat_uses_exact_filled_stop_order_when_available(tmp_path, monkeypatch):
+    trader, pf, trades = _trader(tmp_path, monkeypatch)
+    pos = _position()
+    pos.update({"stop_order_id": "stop-filled", "stop_level": 95.0, "stop_qty": 10.0})
+    trader.state["positions"]["SPY"] = pos
+    pf.fill = 94.5
+    pf.cancel_order = lambda order_id: False
+    pf.order_status = lambda order_id: {
+        "status": "filled", "terminal": True, "filled_qty": 10.0, "qty": 10.0}
+
+    trader._finalize_external_close("SPY", trader.instruments["SPY"], pos)
+
+    with open(trades, newline="") as fh:
+        row = next(csv.DictReader(fh))
+    assert row["exit_order_id"] == "stop-filled"
+    assert float(row["exit_price"]) == 94.5
+    assert float(row["pnl"]) == -55.0
+    assert trader.state["daily"]["realized"] == -55.0

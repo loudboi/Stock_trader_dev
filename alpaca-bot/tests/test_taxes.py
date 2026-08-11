@@ -132,3 +132,21 @@ def test_invalid_inputs_rejected():
         tx.after_tax_active(pd.Series([0.1]), tax_rate=1.5)
     with pytest.raises(ValueError):
         tx.after_tax_core_satellite(pd.Series([0.0]), pd.Series([0.0]), 1.2)
+
+
+
+def test_custom_tax_schedule_is_honored_by_buy_hold_and_duration_helper():
+    custom = ((10_000, 0.99),)
+    assert tx.slovenia_rate_for_holding(100, custom) == 0.99
+    r = _returns("2020-01-01", "2021-01-01", 1.10)
+    baseline = tx.after_tax_buy_hold(r)
+    stressed = tx.after_tax_buy_hold(r, schedule=custom)
+    assert stressed.iloc[-1] < baseline.iloc[-1]
+    assert abs(stressed.iloc[-1] - 100_100.0) < 3.0
+
+
+def test_invalid_custom_tax_schedule_is_rejected():
+    with pytest.raises(ValueError):
+        tx.slovenia_rate_for_holding(100, ((10, 0.2), (5, 0.1)))
+    with pytest.raises(ValueError):
+        tx.slovenia_rate_for_holding(100, ((10, 1.5),))

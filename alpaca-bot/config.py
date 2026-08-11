@@ -22,6 +22,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 RISK_PER_TRADE = 0.01
 MAX_PORTFOLIO_RISK = 0.05
 MAX_GROSS_EXPOSURE = 1.00
+PULLBACK_DAILY_WARMUP_DAYS = 320
 
 
 @dataclass

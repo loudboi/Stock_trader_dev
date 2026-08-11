@@ -93,3 +93,28 @@ def test_invalid_score_tax_rate_rejected():
     idx = next(iter(data.values())).index
     with pytest.raises(ValueError):
         aftertax.print_score(data, books, idx[250], idx[-1], tax_rate=2.0)
+
+
+
+def test_te_after_tax_staggered_inception_does_not_create_partial_capital(monkeypatch):
+    idx_a = pd.date_range("2020-01-01", periods=5, freq="D", tz="UTC")
+    idx_b = pd.date_range("2020-01-03", periods=3, freq="D", tz="UTC")
+    data = {
+        "A": pd.DataFrame({"close": 100.0}, index=idx_a),
+        "B": pd.DataFrame({"close": 100.0}, index=idx_b),
+    }
+    monkeypatch.setattr(
+        aftertax, "_te_held_by_symbol",
+        lambda d: {name: pd.Series(1.0, index=df.index) for name, df in d.items()})
+    monkeypatch.setattr(
+        aftertax.te, "strategy_returns",
+        lambda daily, *args: pd.Series(0.0, index=daily.index))
+    monkeypatch.setattr(
+        aftertax.tx, "after_tax_binary_strategy",
+        lambda returns, held, initial=100_000.0, **kwargs:
+            pd.Series(float(initial), index=returns.index))
+
+    eq = aftertax._te_after_tax_equity(data, idx_a[0], idx_a[-1], initial=100_000.0)
+    assert eq.index[0] == idx_b[0]
+    assert np.allclose(eq.values, 100_000.0)
+    assert eq.attrs["initial_equity"] == 100_000.0

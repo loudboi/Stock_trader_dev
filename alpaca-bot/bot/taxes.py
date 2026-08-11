@@ -67,18 +67,43 @@ def slovenia_rate_for_dates(acquired, disposed) -> float:
     return 0.0
 
 
+def _normalized_schedule(schedule):
+    try:
+        rows = tuple((float(days), float(rate)) for days, rate in schedule)
+    except (TypeError, ValueError) as e:
+        raise ValueError("schedule must contain (holding_days, rate) pairs") from e
+    if not rows:
+        raise ValueError("schedule cannot be empty")
+    prev = -1.0
+    for days, rate in rows:
+        if days <= prev or days <= 0:
+            raise ValueError("schedule holding-day cutoffs must be positive and strictly increasing")
+        if not 0 <= rate <= 1:
+            raise ValueError("schedule rates must be in [0, 1]")
+        prev = days
+    return rows
+
+
 def slovenia_rate_for_holding(hold_days: float, schedule=SLOVENIA_SCHEDULE) -> float:
-    """Compatibility helper when callers only have a duration, not transaction dates."""
+    """Duration-only compatibility helper honoring the supplied scenario schedule."""
     if hold_days < 0:
         raise ValueError("hold_days cannot be negative")
-    years = hold_days / 365.2425
-    if years < 5:
-        return 0.25
-    if years < 10:
-        return 0.20
-    if years < 15:
-        return 0.15
+    for cutoff_days, rate in _normalized_schedule(schedule):
+        if hold_days < cutoff_days:
+            return rate
     return 0.0
+
+
+def _rate_for_disposal(acquired, disposed, schedule=SLOVENIA_SCHEDULE) -> float:
+    """Use legal calendar anniversaries for the default schedule; custom schedules use days."""
+    normalized = _normalized_schedule(schedule)
+    if normalized == tuple((float(d), float(r)) for d, r in SLOVENIA_SCHEDULE):
+        return slovenia_rate_for_dates(acquired, disposed)
+    a, d = _ts(acquired), _ts(disposed)
+    if d < a:
+        raise ValueError("disposed must not precede acquired")
+    hold_days = (d - a).total_seconds() / 86400.0
+    return slovenia_rate_for_holding(hold_days, normalized)
 
 
 def _year_end_event(index: pd.DatetimeIndex, i: int, realize_final: bool) -> bool:
@@ -138,7 +163,7 @@ def after_tax_buy_hold(returns: pd.Series, schedule=SLOVENIA_SCHEDULE,
     equity.attrs["initial_equity"] = initial
     if not realize_final:
         return equity
-    rate = slovenia_rate_for_dates(equity.index[0], equity.index[-1])
+    rate = _rate_for_disposal(equity.index[0], equity.index[-1], schedule)
     gain = float(equity.iloc[-1] - initial)
     # Compatibility hook only: callers must independently establish that a loss is
     # legally eligible in the same year. The model itself never carries one forward.
@@ -151,7 +176,8 @@ def after_tax_buy_hold(returns: pd.Series, schedule=SLOVENIA_SCHEDULE,
 
 
 def after_tax_binary_strategy(returns: pd.Series, held: pd.Series,
-                              initial: float = 100_000.0) -> pd.Series:
+                              initial: float = 100_000.0,
+                              schedule=SLOVENIA_SCHEDULE) -> pd.Series:
     """Tax a binary long/cash strategy only when an actual holding run exits.
 
     Unlike :func:`after_tax_exposure_based`, this accepts the strategy's actual
@@ -187,7 +213,7 @@ def after_tax_binary_strategy(returns: pd.Series, held: pd.Series,
         nav *= 1.0 + ret
         if prev > 0 and current <= 0:
             gain = nav - entry_nav
-            rate = slovenia_rate_for_dates(entry_date, trade_date)
+            rate = _rate_for_disposal(entry_date, trade_date, schedule)
             if gain > 0 and rate > 0:
                 nav -= rate * gain
             entry_nav = entry_date = None
@@ -209,7 +235,7 @@ def after_tax_exposure_based(close: pd.Series, held: pd.Series,
         return pd.Series(dtype=float)
     h = held.reindex(close.index).fillna(0.0).astype(float)
     returns = h * close.astype(float).pct_change().fillna(0.0)
-    return after_tax_binary_strategy(returns, h, initial)
+    return after_tax_binary_strategy(returns, h, initial, schedule=schedule)
 
 
 def after_tax_core_satellite(core_returns: pd.Series, satellite_returns: pd.Series,
