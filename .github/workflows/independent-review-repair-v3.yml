@@ -1,0 +1,119 @@
+name: Independent Review Repair V3
+
+on:
+  push:
+    branches: [agent/fix-repo-audit]
+    paths:
+      - .github/workflows/independent-review-repair-v3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/fix-repo-audit
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-ibkr.txt
+            alpaca-bot/requirements-dev.txt
+      - name: Install dependencies
+        working-directory: alpaca-bot
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
+      - name: Build corrected repair script
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/independent-review-repair.yml').read_text()
+          marker = "          cat > /tmp/repair.py <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY\n", start)
+          block = source[start:end]
+          lines = [line[10:] if line.startswith('          ') else line
+                   for line in block.splitlines()]
+          script = '\n'.join(lines) + '\n'
+
+          import_marker = "import textwrap\n"
+          helper = (
+              "import textwrap\n\n"
+              "def class_block(value):\n"
+              "    return textwrap.indent(textwrap.dedent(value), '    ')\n")
+          if script.count(import_marker) != 1:
+              raise RuntimeError('unexpected textwrap import count')
+          script = script.replace(import_marker, helper, 1)
+
+          needle = "textwrap.dedent('''\\\n"
+          positions = []
+          cursor = 0
+          while True:
+              idx = script.find(needle, cursor)
+              if idx < 0:
+                  break
+              positions.append(idx)
+              cursor = idx + len(needle)
+          if len(positions) < 8:
+              raise RuntimeError(f'expected at least 8 dedent blocks, found {len(positions)}')
+
+          # The first eight dedented replacement blocks are PullbackLiveTrader
+          # methods. They must retain four spaces of class indentation.
+          shift = 0
+          for original_idx in positions[:8]:
+              idx = original_idx + shift
+              replacement = "class_block('''\\\n"
+              script = script[:idx] + replacement + script[idx + len(needle):]
+              shift += len(replacement) - len(needle)
+
+          raw_regression = "textwrap.dedent(r'''\\\n"
+          if raw_regression not in script:
+              raise RuntimeError('regression-string harness marker not found')
+          script = script.replace(raw_regression, "textwrap.dedent('''\\\n", 1)
+
+          Path('/tmp/repair.py').write_text(script)
+          PY
+          python /tmp/repair.py
+          python -m py_compile \
+            alpaca-bot/bot/live_pullback.py \
+            alpaca-bot/bot/portfolio_ibkr.py \
+            alpaca-bot/bot/backtest_pullback.py \
+            alpaca-bot/tests/test_independent_review_regressions.py
+          git diff --check
+          git diff --stat
+      - name: Run targeted regressions
+        working-directory: alpaca-bot
+        run: |
+          python -m pytest -q \
+            tests/test_live_state_schema.py \
+            tests/test_backtest_pullback.py \
+            tests/test_independent_review_regressions.py \
+            tests/test_pending_order_attribution.py \
+            tests/test_live_reconciliation_edges.py \
+            tests/test_ibkr_restart_reconciliation.py \
+            tests/test_cancel_confirmation.py \
+            tests/test_live_fill_auditability.py \
+            tests/test_external_fill_search_boundary.py
+      - name: Run full alpaca-bot suite
+        working-directory: alpaca-bot
+        run: python -m pytest -q
+      - name: Commit repairs and remove one-time workflows
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm \
+            .github/workflows/independent-review-repair.yml \
+            .github/workflows/independent-review-repair-v2.yml \
+            .github/workflows/independent-review-repair-v3.yml
+          git add alpaca-bot
+          git commit -m "Address independent review safety blockers"
+          git push origin HEAD:agent/fix-repo-audit
