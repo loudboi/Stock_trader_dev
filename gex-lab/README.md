@@ -1,71 +1,97 @@
-# gex-lab — a free, DIY GEX levels tool + rules backtester
+# gex-lab — point-in-time GEX research with free option-chain data
 
-A from-scratch attempt at the "Vol Desk" GEX / dealer-positioning idea, built on
-**free** option-chain data (yfinance). Two connected pieces:
+`gex-lab` is a research tool, not an option-trading engine. It has two connected
+parts:
 
-- **`gex_lab/screen.py`** — computes approximate dealer-GEX levels for a watchlist
-  each evening (call wall / +GEX, gamma flip, put mass), prints a screen, and
-  **logs a dated snapshot** so you accumulate a real point-in-time GEX history.
-- **`gex_lab/backtest.py`** — a mechanical backtest of the "cross above pTrans →
-  ride to +GEX" thesis with the full stop framework. It consumes the snapshots the
-  screen produces (plus price bars).
+- `gex_lab.screen` fetches current yfinance option chains, computes approximate GEX
+  levels, prints a watchlist screen, and saves a timestamped point-in-time snapshot.
+- `gex_lab.backtest` combines accumulated snapshots with daily underlying prices and
+  tests a mechanical pTrans-cross / +GEX-target thesis.
 
-**They're designed to connect: the screen is the data collector, the backtester
-consumes what it collects.** Free data only gives *today's* chain, so you build
-history forward by running the screen nightly.
+Free option-chain sources do not provide the historical point-in-time chains needed
+for a clean historical GEX study. The intended workflow is therefore to accumulate
+snapshots going forward or substitute a licensed historical chain dataset later.
 
-## ⚠️ Read this before trusting a single number
+## Important model limitations
 
-This is an honest *approximation*, not the real system. Specifically:
+1. **Dealer sign is assumed.** Calls are assigned positive dealer gamma and puts
+   negative dealer gamma. Real dealer positioning is not observable from free OI
+   alone.
+2. **Transition levels are reconstructions.** `pTrans` uses the modeled gamma flip,
+   `nTrans` uses the put wall, and `+GEX` uses a positive gamma concentration above
+   spot. These are not proprietary vendor definitions.
+3. **BSM assumptions are inputs.** The screen exposes `--risk-free` and
+   `--dividend-yield`. Both are stored in snapshots. A fixed rate/dividend assumption
+   can materially change gamma estimates for longer-dated options.
+4. **Underlying P&L only.** The backtest does not model option delta/gamma P&L,
+   implied-volatility changes, theta, bid/ask spreads, assignment/exercise,
+   liquidity, or commissions.
+5. **Daily bars do not reveal intraday ordering.** When a bar is compatible with
+   both the locked target and a price stop, the backtest takes the adverse stop
+   result rather than automatically awarding a target win.
+6. **Close signals cannot fill at the same close.** A crossing confirmed from a
+   daily close enters, at earliest, at the next available session open.
+7. **Snapshots cannot explain their own day.** A nightly snapshot is not made
+   available to the backtest until a later calendar day/session. Legacy date-only
+   snapshots are treated the same conservative way.
+8. **Snapshot levels expire.** The real-history loader does not carry an old GEX
+   surface forward indefinitely when collection stops.
 
-1. **Naive dealer-sign assumption.** GEX is computed assuming dealers are long
-   calls / short puts. That one assumption drives every level and is genuinely
-   uncertain — real vendors (SpotGamma etc.) use far more sophisticated models.
-2. **Levels are approximated.** `+GEX` = nearest call-gamma peak above spot,
-   `pTrans` ≈ the gamma flip, `nTrans` ≈ the put wall. The real system's pTrans /
-   nTrans / COTMC definitions are proprietary and almost certainly differ — which
-   is why a live screen may show everything BLOCKED on R:R (my +GEX sits close
-   above spot). Tune the level definitions in `gex.py` to taste.
-3. **No history = no real backtest yet.** Until you've accumulated snapshots (or
-   bought historical option data), `backtest.py` only runs on `--demo` synthetic
-   data. It's a working *engine*, not a result.
-4. **P&L is on the UNDERLYING, not options.** It tests whether price reaches +GEX
-   (the core thesis). Real single-stock option P&L (theta, IV crush, 5–15%
-   spreads) is very different and much harsher.
-5. **Grade / db_change / dealer-delta-balance are omitted** — they need vendor
-   data, so the screen uses only the free-data filters (spot vs pTrans, R:R ≥ 2,
-   put-mass cushion ≥ 2%).
-
-## Usage
+## Install and test
 
 ```bash
-pip install -r requirements.txt
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+pytest -q
+```
 
-# Nightly: screen a watchlist and log a snapshot (builds your dataset)
+Python 3.11/3.12 are the recommended repository versions.
+
+## Screen and collect history
+
+```bash
 python -m gex_lab.screen --tickers NVDA AAPL TSLA AMD META MSFT AMZN
+```
 
-# Backtest the engine now on synthetic data (proves it runs)
+Optional BSM inputs:
+
+```bash
+python -m gex_lab.screen --risk-free 0.04 --dividend-yield 0.00
+```
+
+Each run creates a unique file such as:
+
+```text
+snapshots/gex_2026-08-10T201530.123456Z.csv
+```
+
+The CSV includes `asof_utc`, model rates, and the dealer-sign convention. Rerunning
+on the same date does not overwrite the earlier file. `snapshots/` is ignored by Git
+by default because it is runtime/research data; back it up separately if it matters.
+
+## Backtest
+
+Engine-only synthetic demo:
+
+```bash
 python -m gex_lab.backtest --demo
+```
 
-# Once you've run the screen for a few weeks, backtest on your REAL history
+Point-in-time accumulated history:
+
+```bash
 python -m gex_lab.backtest --snapshots snapshots/
 ```
 
-## The honest path this enables
+The only built-in price source is currently Yahoo. Passing an unsupported source is
+an error rather than being silently ignored.
 
-1. Run the screen nightly → accumulate free GEX history.
-2. Forward-observe the **thesis** (does price actually accelerate to +GEX after a
-   pTrans cross?) for $0, logging every signal.
-3. **Only if it holds up**, invest in historical option data (ThetaData / ORATS)
-   to properly backtest the full system, and/or a vendor feed (SpotGamma, Unusual
-   Whales) for real dealer positioning.
+## Interpreting results
 
-Don't skip to step 3, and don't trade real options off the 2-week "100% win rate"
-claim — that's a small-sample mirage, the same trap that flatters every unvalidated
-backtest.
-
-## Tests
-
-```bash
-pip install pytest && pytest -q      # 16 offline tests, no network
-```
+A profitable underlying-price simulation is, at most, evidence that the modeled
+levels may contain useful directional/target information in the collected sample.
+It is not evidence that an option implementation is profitable. Before spending
+money on a vendor or trading options, accumulate enough point-in-time observations
+to evaluate different regimes, inspect losing trades, and test the same hypothesis
+with realistic option-chain history and execution costs.

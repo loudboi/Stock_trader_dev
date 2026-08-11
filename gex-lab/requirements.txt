@@ -1,4 +1,6 @@
-yfinance>=0.2.40
-pandas>=2.0
-numpy>=1.24
-# Dev: pip install pytest
+# Runtime research dependencies. Major-version upper bounds prevent silently
+# crossing untested breaking releases; save `python -m pip freeze` with studies.
+yfinance>=0.2.40,<1
+pandas>=2.0,<4
+numpy>=1.24,<3
+# Dev/CI installs pytest>=8,<10 separately.

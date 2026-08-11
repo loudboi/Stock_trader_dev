@@ -1,216 +1,174 @@
 # Setup Guide
 
-A start-to-finish walkthrough. Follow it in order. **Do the backtest before the
-live bot, and keep the live bot on paper trading until you trust it.**
+This is the shortest supported path from a clean checkout to an Alpaca **paper**
+run. Use Python **3.11 or 3.12**; those are the versions exercised by CI.
 
-Estimated time: ~15 minutes.
-
----
-
-## Step 0 — What you need
-
-- Python 3.9 or newer.
-- A free Alpaca account (paper trading is free and uses fake money).
-- A terminal (Terminal on macOS/Linux, PowerShell or Command Prompt on Windows).
-
-Check your Python version:
+## 1. Get the repository
 
 ```bash
-python3 --version       # macOS/Linux
-python --version        # Windows
+git clone https://github.com/loudboi/Stock_trader_dev.git
+cd Stock_trader_dev/alpaca-bot
 ```
 
-If it prints 3.9+ you're set. If `python3` isn't found, install Python from
-https://www.python.org/downloads/ (tick "Add Python to PATH" on Windows).
+You should now be in the directory containing `config.py`, `bot/`, `tests/`, and
+`requirements.txt`.
 
----
+## 2. Create a virtual environment
 
-## Step 1 — Get the project onto your computer
-
-Unzip `alpaca-bot.zip` somewhere you'll remember, then open a terminal **inside
-that folder**. You should be in the directory that contains `config.py` and the
-`bot/` folder. Verify:
+macOS/Linux:
 
 ```bash
-cd path/to/alpaca-bot
-ls          # macOS/Linux  -> should list: bot  config.py  requirements.txt  README.md ...
-dir         # Windows
-```
-
-Everything below is run from this folder.
-
----
-
-## Step 2 — Create a virtual environment (recommended)
-
-This keeps the bot's packages isolated from the rest of your system.
-
-**macOS / Linux**
-```bash
-python3 -m venv .venv
+python3.12 -m venv .venv        # use python3.11 if that is your supported interpreter
 source .venv/bin/activate
 ```
 
-**Windows (PowerShell)**
+Windows PowerShell:
+
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Your prompt should now show `(.venv)`. (To leave it later, type `deactivate`.)
-
----
-
-## Step 3 — Install the dependencies
+## 3. Install and test
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
 ```
 
-This installs `alpaca-py` (Alpaca's current SDK), `pandas`, `numpy`,
-`python-dotenv`, and `matplotlib`. If `pip` isn't found, try `pip3` or
-`python -m pip`.
+For the Interactive Brokers path, also install:
 
-> Works on modern Python, including 3.13. All Alpaca API calls live in
-> `bot/portfolio.py`, so the rest of the project never imports the SDK directly.
+```bash
+python -m pip install -r requirements-ibkr.txt
+```
 
----
+A successful test run is a prerequisite, not proof that live execution will behave
+identically to the test environment.
 
-## Step 4 — Get your Alpaca API keys (paper)
+## 4. Configure Alpaca PAPER credentials
 
-1. Sign up / log in at https://alpaca.markets/.
-2. In the dashboard, switch to **Paper Trading** (toggle near the top — it should
-   say "Paper" not "Live").
-3. Find the **API Keys** panel and click **Generate** (or **Regenerate**).
-4. Copy the **Key ID** and the **Secret Key**. The secret is shown only once —
-   copy it now.
+Copy the template:
 
-The paper endpoint is `https://paper-api.alpaca.markets`. Keep it on paper for now.
-
----
-
-## Step 5 — Create your `.env` file
-
-The repo ships a template called `.env.example`. Copy it to `.env` and fill in
-your keys.
-
-**macOS / Linux**
 ```bash
 cp .env.example .env
 ```
 
-**Windows (PowerShell)**
+Windows PowerShell:
+
 ```powershell
-copy .env.example .env
+Copy-Item .env.example .env
 ```
 
-Open `.env` in any text editor and paste your keys:
+Fill in the paper credentials:
 
-```
-ALPACA_API_KEY=PKxxxxxxxxxxxxxxxxxx
-ALPACA_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```text
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 ```
 
-Save it. **Never share this file or commit it to git** — `.gitignore` already
-excludes it.
+Never commit `.env`. The repository ignore rules exclude it, but you should still
+check `git status` before any commit.
 
----
-
-## Step 6 — Backtest first
-
-Before risking anything (even paper), see how the strategy would have behaved on
-historical data. This also confirms your keys and data access work.
+## 5. Backtest before running the executor
 
 ```bash
-python -m bot.backtest_pullback                 # daily signal, 4h fills
-```
-
-To backtest a specific date window, pass `--start` / `--end` (it automatically
-fetches ~320 days of warm-up history before the start so the 200-day MA is valid on
-day one):
-
-```bash
+python -m bot.backtest_pullback
 python -m bot.backtest_pullback --start 2025-02-04 --end 2026-06-24
-python -m bot.backtest_pullback --exec-timeframe 1Hour --months 9 --ema
 ```
 
-It prints a summary table (trades, win rate, profit factor, max drawdown, Sharpe,
-return), flags any strategy with a negative Sharpe, and saves an equity-curve chart
-(`backtest_pullback_results.png`). If Alpaca's free data doesn't reach your start
-date, the run uses what's available and prints the actual range. If you see a data
-error, check Step 8 (troubleshooting).
+The backtest uses completed daily signals and models later execution. It is still an
+approximation: fill ordering inside OHLC bars, transaction costs, market impact,
+data provenance, interest on cash, and broker behavior can differ from reality.
+Use `--data-source yahoo` for long daily-history research when appropriate; Yahoo
+adjusted history is not bar-identical to the live Alpaca feed.
 
----
+If any requested symbol has no usable data, the command refuses to silently change
+the requested universe.
 
-## Step 7 — Run the live (paper) bot
-
-When you're ready to watch it trade with fake money:
+## 6. Start the paper runner
 
 ```bash
-python -m bot.live_pullback                  # paper, default symbols
+python -m bot.live_pullback
 python -m bot.live_pullback --symbols SPY GLD
 ```
 
-It will:
-- reconcile with any existing position on startup (adopting it as fully built),
-- poll the latest price every 60s: act on completed daily bars, fill armed
-  entries/adds on a dip, and monitor the `max(5%, 2×ATR)` stop in real time,
-- write completed trades to `pullback_trades.csv` and daily P&L to
-  `pullback_daily_pnl.csv`,
-- keep restart-safe state in `pullback_state.json`.
+The runner:
 
-Stop it any time with **Ctrl+C** — it shuts down cleanly and writes the day's P&L.
-It refuses the real-money endpoint unless you pass `--live`.
+- acts on completed daily bars;
+- checks current broker state instead of trusting local state;
+- treats broker/API failures as errors, not as a flat position;
+- does not mutate local position state merely because an order was accepted;
+- waits for the broker position change to confirm the fill;
+- uses a broker-resident protective stop where supported and an in-process check as
+  an additional path;
+- writes restart state and trade/P&L audit files;
+- refuses a real-money Alpaca endpoint without `--live`.
 
-> **Important — one position per symbol per account.** Don't run two copies of the
-> runner on the *same* symbol against the *same* Alpaca account at the same time;
-> they'll fight over the position. To change which symbols it trades, edit
-> `PULLBACK_SYMBOLS` (and `PULLBACK_UNIVERSE` for new tickers) in `config.py`.
+### Existing broker positions
 
-Leave it running in the terminal. To run it unattended on a Linux VPS, use the
-systemd units and runbook in `deploy/` (auto-restart, journal logs, graceful
-shutdown) — but get comfortable watching it live first. Set `ALERT_WEBHOOK_URL` or
-the `TELEGRAM_*` env vars to be pinged on entries/exits, stalls, and errors. (For
-the EUR-only Interactive Brokers path, see `IBKR_SETUP.md`.)
+An untracked long is **not adopted automatically**. Startup fails with a clear
+message. If you have inspected that position and intentionally want this strategy to
+own/manage it, rerun with:
 
----
+```bash
+python -m bot.live_pullback --adopt-existing
+```
 
-## Step 8 — Troubleshooting
+The adopted position is treated conservatively as fully built; the runner cannot
+reconstruct historical tranche intent from broker quantity alone.
 
-**"Missing required env vars"** — your `.env` isn't being read. Make sure the file
-is named exactly `.env` (not `.env.txt`) and lives in the same folder as
-`config.py`.
+### Changing the symbol list
 
-**Stock data / subscription errors on backtest** — free Alpaca data plans use the
-IEX feed. `bot/portfolio.py` already requests `feed="iex"`; if you have a paid SIP
-subscription you can change that there.
+Do not remove a symbol from `--symbols` while its state file still manages a live
+position or pending order. The runner refuses to start rather than orphaning it.
+Flatten/migrate the position deliberately first.
 
-**"module not found: bot"** — run commands from the project root (the folder with
-`config.py`) using the `python -m bot.live_pullback` form, not `python bot/live_pullback.py`.
+A process lock prevents a second process from opening the same runtime state file.
+That is not a substitute for account-level operational discipline: do not assign the
+same broker symbol to two independent strategies/processes.
 
-**Crypto symbol errors** — `alpaca-py` expects the slash form (`BTC/USD`), which is
-what `config.py` uses (`api_symbol`). If you add a crypto ticker, use the same
-slash form (e.g. `ETH/USD`).
+Stop the foreground runner with `Ctrl+C`. Shutdown flushes current state/P&L and
+waits briefly for queued alerts.
 
-**A short order was rejected** — you can't short crypto on Alpaca, and shorting
-equities needs a margin account with the asset shortable. The bot logs the rejection
-and stays flat; this is expected, not a crash.
+## 7. Live mode
 
-**Install problems** — make sure your virtual environment is active and pip is
-current: `python -m pip install --upgrade pip`, then re-run
-`pip install -r requirements.txt`.
+Switching to a real-money endpoint is a separate operational decision. The executor
+requires the `--live` confirmation in addition to the endpoint configuration.
+Do not put `--live` into an unattended service until the paper deployment, account,
+symbol list, stop behavior, alerting, and restart/reconciliation path have all been
+reviewed.
 
----
+For Linux systemd deployment, follow `deploy/README.md`; its install keeps a real
+Git clone so updates are reproducible. For IBKR, follow `IBKR_SETUP.md` as well.
 
-## A few honest reminders
+## Troubleshooting
 
-- **Keep it on paper.** Switching `ALPACA_BASE_URL` to the live endpoint trades real
-  money. Don't do that until you've watched the paper bot behave for a good while.
-- **A good backtest is not a guarantee.** Historical results are optimistic relative
-  to live trading, and tuning parameters to make a backtest look good is the easiest
-  way to fool yourself. Treat the numbers as "not obviously broken," not "proven."
-- **This is software, not financial advice.** Automated trading can lose money fast.
-  Only ever use money you can afford to lose.
+**Missing required env vars** — `.env` must live beside `config.py` and contain the
+Alpaca key/secret.
 
-See `README.md` for how each strategy works and the design details.
+**`module not found: bot`** — run commands from `alpaca-bot/` using the module form,
+for example `python -m bot.live_pullback`.
+
+**Stock-data subscription errors** — the free Alpaca stock path uses IEX. A paid SIP
+subscription is a separate feed/configuration decision.
+
+**Crypto symbol errors** — Alpaca uses slash-form symbols such as `BTC/USD`.
+
+**Existing-position refusal** — this is intentional. Inspect the broker position;
+use `--adopt-existing` only if the strategy should take ownership of it.
+
+**Order remains uncertain/pending** — the broker accepted a request but the position
+change was not confirmed. The runner blocks further strategy orders for that symbol
+until reconciliation rather than assuming a fill.
+
+**Install problems** — confirm Python 3.11/3.12, activate the venv, upgrade pip, and
+rerun the dependency install.
+
+## Research and risk reminder
+
+Historical performance, Sharpe, drawdown, tax scenarios, and parameter sweeps are
+model outputs. They are not guarantees, and they are sensitive to data source,
+transaction costs, execution assumptions, tax facts, and the chosen sample window.
+Paper trading is the minimum operational check before real-money automation.

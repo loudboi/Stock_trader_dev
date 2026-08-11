@@ -1,4 +1,3 @@
-# Optional: decades of free daily history for full-cycle backtests via
-#   --data-source yahoo  (bot/data.py). Not needed for live trading.
-#   pip install -r requirements-backtest.txt
-yfinance>=0.2.40
+# Optional Yahoo daily-history dependency for --data-source yahoo.
+# Keep the major line bounded; save `python -m pip freeze` with reproducibility artifacts.
+yfinance>=0.2.40,<1

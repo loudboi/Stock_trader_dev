@@ -1,0 +1,38 @@
+# Python / test caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+
+# Virtual environments / local env files
+**/.venv/
+**/venv/
+**/.env
+**/.env.*
+!**/.env.example
+
+# Live/paper trading runtime state and audit output
+alpaca-bot/pullback*_state.json
+alpaca-bot/pullback*_state.json.tmp
+alpaca-bot/pullback*_trades.csv
+alpaca-bot/pullback*_daily_pnl.csv
+alpaca-bot/*.lock
+alpaca-bot/ibkr_cache/
+
+# Generated research outputs (source code and curated fixtures remain tracked)
+alpaca-bot/*_results.png
+alpaca-bot/*.log
+alpaca-bot/pytest.log
+gex-lab/pytest.log
+
+# Point-in-time GEX runtime/research collection
+gex-lab/snapshots/
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

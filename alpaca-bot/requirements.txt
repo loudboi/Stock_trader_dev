@@ -1,5 +1,6 @@
-alpaca-py>=0.33
-pandas>=2.0
-numpy>=1.24
-python-dotenv>=1.0
-matplotlib>=3.6
+alpaca-py>=0.33,<1
+pandas>=2.0,<4
+numpy>=1.24,<3
+scipy>=1.11,<2
+python-dotenv>=1.0,<2
+matplotlib>=3.6,<4

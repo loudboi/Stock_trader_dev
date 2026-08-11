@@ -1,3 +1,2 @@
-# Dev / CI tooling. Install alongside the runtime requirements:
-#   pip install -r requirements.txt -r requirements-ibkr.txt -r requirements-dev.txt
-pytest>=8.0
+# Dev / CI tooling. Install alongside runtime requirements.
+pytest>=8.0,<10

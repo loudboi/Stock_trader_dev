@@ -1,39 +1,16 @@
 """
 bot/aftertax.py
 ================
-The honest, after-tax version of "does anything beat buy-and-hold?" — because
-every backtest elsewhere in this project is PRE-TAX, and Slovenian capital-gains
-tax is a massive structural advantage for true buy-and-hold: a graduated
-schedule (25% under 5y, 20% 5-10y, 15% 10-15y, 0% past 15y — verified against
-fu.gov.si; see bot/taxes.py for the model, its sources, and its honest
-simplifications) that no actively-traded strategy can fully escape.
+After-tax research scenarios for a Slovenian-resident individual.
 
-THE HEADLINE FINDING (see README): once taxed, the min_var+TE combo (this
-project's best PRE-TAX result) actually LOSES to plain buy-and-hold on Sharpe —
-annual tax on realized gains erodes a strategy's edge far more than it erodes
-buy-and-hold's, which pays nothing until a single deferred sale (and even then
-at a discounted rate if held 5+ years). The one structure that BEATS after-tax
-buy-and-hold: a CORE-SATELLITE split — most of the capital in a true, untouched
-buy-and-hold core (tax-deferred), a minority in the active combo as a satellite
-(taxed annually). --mode checkpoints also reports --cross-offset: letting a
-leftover satellite loss shelter part of the core's eventual sale gain, which
-only matters before the core itself reaches its 0% exemption (see bot/taxes.py
-for why an intra-year "harvest sooner" variant was tried and dropped as a
-proven no-op).
+This module is intentionally conservative about what the data can prove. It is not
+a tax return calculator. Securities holding-period rates are modeled from actual
+calendar dates; ordinary loss carry-forward is not assumed; and the trend-exposure
+sleeve is taxed on its actual exit dates instead of being forced through the coarse
+annual-realization proxy used for high-turnover allocation books.
 
-A SECOND, EQUALLY LARGE FACTOR (see bot/currency.py): every number above
-implicitly assumes a USD-based investor, but the user is Slovenian (EUR-based)
-and SPY/QQQ/GLD/TLT are USD-denominated. --currency {eur_naive,eur_smart,
-eur_hedged} converts the same comparison into a EUR investor's REAL return.
-Unhedged EUR exposure compresses every Sharpe by roughly as much as tax does,
-and the min_var+TE blend's pre-tax edge over buy-and-hold nearly disappears
-once currency risk is honestly priced in — see README for the combined
-(currency + tax) picture.
-
-    python -m bot.aftertax --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
-    python -m bot.aftertax --currency eur_naive --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
-    python -m bot.aftertax --mode checkpoints --core-weight 0.7 \
-        --symbols SPY QQQ GLD TLT --start 2005-01-01 --data-source yahoo
+Currency conversion happens before the tax scenario. EUR conversion is exact for
+the modeled USD exposure and never backfills future FX observations.
 """
 
 import argparse
@@ -42,11 +19,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-import bot.taxes as tx
 import bot.currency as cur
-from bot.combo import compute_books, combine_books
-from bot.backtest_pullback import (compute_metrics, buy_hold_combined, fetch_all,
-                                   _parse_date, INITIAL_EQUITY)
+import bot.taxes as tx
+import bot.trend_exposure as te
+from bot.combo import compute_books, combine_books, TE_MA_PERIOD, TE_BUFFER
+from bot.backtest_pullback import (INITIAL_EQUITY, _parse_date, buy_hold_combined,
+                                   compute_metrics, fetch_all)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-7s | %(message)s")
@@ -59,186 +37,221 @@ def _slice(r, begin_ts, end_ts):
     return r[(r.index >= begin_ts) & (r.index <= end_ts)]
 
 
-def _apply_currency(r, name, currency, fx_close=None, te_frac=None, hedge_cost=0.015):
-    """currency: 'usd' (no change), 'eur_hedged' (fixed cost drag, no FX risk),
-    'eur_naive' (full FX exposure always, cash assumed held in USD), or
-    'eur_smart' (FX exposure only while actually invested in USD assets --
-    always 1.0 for rp/buy_and_hold, which never go to cash; te_frac for the
-    te leg; a 50/50 mix of the two for the blend)."""
+def _currency_fraction(name, currency, te_frac=None):
+    if currency not in {"eur_smart", "eur_hedged"}:
+        return 1.0
+    if name == "te":
+        return te_frac if te_frac is not None else 0.0
+    if name == "blend":
+        return 0.5 if te_frac is None else 0.5 + 0.5 * te_frac
+    return 1.0
+
+
+def _apply_currency(r, name, currency, fx_close=None, te_frac=None,
+                    hedge_cost=0.015):
+    """Convert one aggregate USD return stream into the requested EUR scenario."""
     if currency == "usd":
         return r
+    frac = _currency_fraction(name, currency, te_frac)
     if currency == "eur_hedged":
-        eq = cur.hedged_eur_equity(r, annual_hedge_cost=hedge_cost)
-        return eq.pct_change().fillna(0.0)
-    if currency == "eur_smart":
-        if name == "te":
-            frac = te_frac
-        elif name == "blend":
-            frac = 0.5 * 1.0 + 0.5 * te_frac
-        else:
-            frac = 1.0
+        eq = cur.hedged_eur_equity(r, annual_hedge_cost=hedge_cost,
+                                   invested_frac=frac)
+    elif currency in {"eur_naive", "eur_smart"}:
+        exposure = 1.0 if currency == "eur_naive" else frac
+        eq = cur.unhedged_eur_equity(r, fx_close, invested_frac=exposure)
     else:
-        frac = 1.0
-    eq = cur.unhedged_eur_equity(r, fx_close, invested_frac=frac)
-    return eq.pct_change().fillna(0.0)
+        raise ValueError(f"unknown currency scenario {currency}")
+    out = eq.pct_change().fillna(0.0)
+    out.attrs.update(r.attrs)
+    return out
+
+
+def _te_held_by_symbol(daily_data):
+    return {
+        name: te.exposure_series(daily["close"], TE_MA_PERIOD, TE_BUFFER)
+                .shift(1).fillna(0.0)
+        for name, daily in daily_data.items()
+    }
+
+
+def _te_after_tax_equity(daily_data, begin_ts, end_ts, currency="usd",
+                         fx_close=None, hedge_cost=0.015,
+                         initial=INITIAL_EQUITY):
+    """Equal-capital TE sleeve taxed at each symbol's actual exits.
+
+    Per-symbol strategy returns already contain switch costs. Currency conversion is
+    applied before exit-timed tax. ``eur_naive`` keeps flat capital in USD cash;
+    that cash-FX component is included in wealth but this remains a scenario proxy,
+    not a full tax treatment of every currency transaction.
+    """
+    held_map = _te_held_by_symbol(daily_data)
+    parts = []
+    n = len(daily_data)
+    for name, daily in daily_data.items():
+        raw = te.strategy_returns(daily, TE_MA_PERIOD, TE_BUFFER, 1.0, 0.0)
+        raw = _slice(raw, begin_ts, end_ts)
+        held = held_map[name].reindex(raw.index).fillna(0.0)
+        if currency == "usd":
+            converted = raw
+        else:
+            local_frac = held if currency in {"eur_smart", "eur_hedged"} else 1.0
+            if currency == "eur_hedged":
+                eq = cur.hedged_eur_equity(raw, hedge_cost, initial=1.0,
+                                           invested_frac=local_frac)
+            else:
+                eq = cur.unhedged_eur_equity(raw, fx_close, invested_frac=local_frac,
+                                              initial=1.0)
+            converted = eq.pct_change().fillna(0.0)
+        taxed = tx.after_tax_binary_strategy(converted, held, initial=initial / n)
+        parts.append(taxed)
+    merged = pd.concat(parts, axis=1).sort_index().ffill()
+    # Never sum partial sleeve capital before every sleeve actually exists. Doing
+    # so makes the curve begin below declared initial equity and fabricates a
+    # drawdown/capital jump when a later-inception sleeve first appears.
+    merged = merged.dropna(how="any")
+    out = merged.sum(axis=1, min_count=len(parts))
+    out.attrs["initial_equity"] = initial
+    return out
+
+
+def _metrics_from_returns(r):
+    eq = INITIAL_EQUITY * (1 + r).cumprod()
+    eq.attrs["initial_equity"] = INITIAL_EQUITY
+    return compute_metrics([], eq)
 
 
 def print_score(daily_data, books, begin_ts, end_ts, tax_rate=tx.SLOVENIA_TAX_RATE,
                 currency="usd", fx_close=None, te_frac=None, hedge_cost=0.015):
+    if not 0 <= tax_rate <= 1:
+        raise ValueError("tax_rate must be in [0, 1]")
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
     bh_ret = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
-    rp, te, blend, bh_ret = (_slice(books["rp"], begin_ts, end_ts),
-                             _slice(books["te"], begin_ts, end_ts),
-                             _slice(blend, begin_ts, end_ts),
-                             _slice(bh_ret, begin_ts, end_ts))
-    rp = _apply_currency(rp, "rp", currency, fx_close, te_frac, hedge_cost)
-    te = _apply_currency(te, "te", currency, fx_close, te_frac, hedge_cost)
-    blend = _apply_currency(blend, "blend", currency, fx_close, te_frac, hedge_cost)
-    bh_ret = _apply_currency(bh_ret, "buy_and_hold", currency, fx_close, te_frac, hedge_cost)
+    rp = _slice(books["rp"], begin_ts, end_ts)
+    te_ret = _slice(books["te"], begin_ts, end_ts)
+    blend = _slice(blend, begin_ts, end_ts)
+    bh_ret = _slice(bh_ret, begin_ts, end_ts)
 
-    def pretax_m(r):
-        eq = INITIAL_EQUITY * (1 + r).cumprod()
-        return compute_metrics([], eq)
+    if te_frac is None:
+        te_frac = cur.te_invested_fraction(daily_data, TE_MA_PERIOD, TE_BUFFER)
+    rp_c = _apply_currency(rp, "rp", currency, fx_close, te_frac, hedge_cost)
+    te_c = _apply_currency(te_ret, "te", currency, fx_close, te_frac, hedge_cost)
+    blend_c = _apply_currency(blend, "blend", currency, fx_close, te_frac, hedge_cost)
+    bh_c = _apply_currency(bh_ret, "buy_and_hold", currency, fx_close, te_frac, hedge_cost)
 
-    hold_years = (bh_ret.index[-1] - bh_ret.index[0]).days / 365.0
-    print(f"\nAFTER-TAX COMPARISON  (currency={currency}; Slovenia: {tax_rate:.0%} under 5y, "
-          f"20% 5-10y, 15% 10-15y, 0% past 15y; window covers {hold_years:.1f}y)")
-    print("=" * 70)
-    print(f"{'Strategy':22}{'Pre-tax Shp':>13}{'Post-tax Shp':>14}{'Post-tax Ret%':>15}")
-    print("-" * 70)
-    rows = [("pure risk-based", rp, tx.after_tax_active(rp, tax_rate)),
-            ("pure trend_exposure", te, tx.after_tax_active(te, tax_rate)),
-            ("min_var+TE blend", blend, tx.after_tax_active(blend, tax_rate)),
-            ("buy_and_hold", bh_ret, tx.after_tax_buy_hold(bh_ret))]
-    bh_post_sharpe = None
-    for name, pre_r, post_eq in rows:
-        pre_m = pretax_m(pre_r)
-        post_m = compute_metrics([], post_eq)
-        if name == "buy_and_hold":
-            bh_post_sharpe = post_m["sharpe"]
-        print(f"{name:22}{pre_m['sharpe']:>13.3f}{post_m['sharpe']:>14.3f}"
+    rp_post = tx.after_tax_active(rp_c, tax_rate, INITIAL_EQUITY)
+    te_post = _te_after_tax_equity(daily_data, begin_ts, end_ts, currency,
+                                   fx_close, hedge_cost, INITIAL_EQUITY)
+    rp_half = tx.after_tax_active(rp_c, tax_rate, INITIAL_EQUITY * 0.5)
+    te_half = _te_after_tax_equity(daily_data, begin_ts, end_ts, currency,
+                                   fx_close, hedge_cost, INITIAL_EQUITY * 0.5)
+    blend_post = rp_half.add(te_half, fill_value=0.0)
+    blend_post.attrs["initial_equity"] = INITIAL_EQUITY
+    bh_post = tx.after_tax_buy_hold(bh_c, initial=INITIAL_EQUITY)
+
+    rows = [
+        ("risk-based allocation", rp_c, rp_post),
+        ("trend exposure", te_c, te_post),
+        ("50/50 risk + trend", blend_c, blend_post),
+        ("buy_and_hold", bh_c, bh_post),
+    ]
+    print(f"\nAFTER-TAX SCENARIO COMPARISON (currency={currency})")
+    print("Securities scenario: 25%/<5y, 20%/5-10y, 15%/10-15y, 0%/15y+; "
+          "calendar holding periods. This is not tax-lot accounting.")
+    print(f"{'Strategy':28}{'Pre-tax Shp':>13}{'Post-tax Shp':>14}{'Post-tax Ret%':>15}")
+    for name, pre, post in rows:
+        pre_m = _metrics_from_returns(pre)
+        post_m = compute_metrics([], post)
+        print(f"{name:28}{pre_m['sharpe']:>13.3f}{post_m['sharpe']:>14.3f}"
               f"{post_m['total_return']*100:>15.1f}")
-    print("-" * 70)
 
-    print(f"\nCORE-SATELLITE  (core_weight in true buy-and-hold, rest in the active blend)")
-    print(f"{'core/satellite':18}{'post-tax Sharpe':>17}{'post-tax Ret%':>15}{'beats pure B&H?':>17}")
-    print("-" * 67)
-    best_w, best_sharpe = None, -1e9
+    bh_sharpe = compute_metrics([], bh_post)["sharpe"]
+    print("\nCORE-SATELLITE STRESS GRID (core=B&H; satellite=annual-realization proxy)")
     for core_w in DEFAULT_CORE_WEIGHTS:
-        eq = tx.after_tax_core_satellite(bh_ret, blend, core_w, tax_rate)
+        eq = tx.after_tax_core_satellite(bh_c, blend_c, core_w, tax_rate)
         m = compute_metrics([], eq)
-        beat = "YES" if m["sharpe"] > bh_post_sharpe else "no"
-        print(f"{core_w:.1f}/{1-core_w:.1f}            {m['sharpe']:>17.3f}"
-              f"{m['total_return']*100:>15.1f}{beat:>17}")
-        if m["sharpe"] > best_sharpe:
-            best_w, best_sharpe = core_w, m["sharpe"]
-    print("-" * 67)
-    print(f"Best of the grid above: core_weight={best_w:.1f} -> Sharpe={best_sharpe:.3f} "
-          f"(informational only -- this is a scan over a pre-defined grid, not a fit; "
-          f"don't over-read the exact peak, look at the shape of the curve). Note: at "
-          f"this window's {hold_years:.1f}y length the core is already past its 15y "
-          f"exemption, so --cross-offset (--mode checkpoints) makes no difference here "
-          f"-- it only matters before the core's own tax reaches 0%.")
-    print("=" * 70)
+        print(f"{core_w:.1f}/{1-core_w:.1f}: Sharpe={m['sharpe']:.3f} "
+              f"Return={m['total_return']:.1%} "
+              f"{'above' if m['sharpe'] > bh_sharpe else 'not above'} pure B&H Sharpe")
+    return rows
 
 
-def print_checkpoints(daily_data, books, begin_ts, core_weight, tax_rate=tx.SLOVENIA_TAX_RATE,
+def print_checkpoints(daily_data, books, begin_ts, core_weight,
+                      tax_rate=tx.SLOVENIA_TAX_RATE,
                       checkpoint_years=(10, 12, 15, 18, 21)):
-    """Robustness check specific to a core-satellite/buy-hold structure: since the
-    core's tax treatment depends on ONE continuous holding period (not
-    independent folds -- there's nothing to 'walk forward' over), the honest
-    stress test is to look at several DIFFERENT END DATES along that SAME
-    continuous hold and see whether the core-satellite's after-tax Sharpe
-    advantage over pure buy-and-hold holds up at each checkpoint, not just the
-    specific end date the full backtest happens to stop at. Also reports the
-    cross_offset_losses variant (a leftover satellite loss sheltering part of
-    the core's gain), which only bites before the core reaches its own 0%
-    exemption -- so it's most visible at the earlier checkpoints here."""
+    if not 0 <= core_weight <= 1:
+        raise ValueError("core_weight must be in [0, 1]")
     blend = combine_books(books, weights={"rp": 0.5, "te": 0.5})
-    bh_ret_full = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
-    bh_ret_full = bh_ret_full[bh_ret_full.index >= begin_ts]
-    blend_full = blend[blend.index >= begin_ts]
-
-    print(f"\nCORE-SATELLITE CHECKPOINTS  core_weight={core_weight:.0%}  "
-          f"(same continuous hold from {begin_ts.date()}, measured at several end dates)")
-    print("=" * 78)
-    print(f"{'End date':12}{'Years held':>11}{'pure B&H Shp':>14}{'core-sat Shp':>14}"
-          f"{'+crossoffst':>13}{'beats?':>8}")
-    print("-" * 78)
-    wins = 0
-    checks = 0
+    bh = buy_hold_combined(daily_data, begin_ts).pct_change().fillna(0.0)
+    bh = bh[bh.index >= begin_ts]
+    blend = blend[blend.index >= begin_ts]
+    print(f"\nCORE-SATELLITE CHECKPOINTS — same continuous start {begin_ts.date()}")
+    checks = wins = 0
     for years in checkpoint_years:
-        end_ts = begin_ts + pd.Timedelta(days=int(years * 365))
-        if end_ts > bh_ret_full.index[-1]:
+        target = begin_ts + pd.DateOffset(years=years)
+        if target > bh.index[-1]:
             continue
-        bh_slice = bh_ret_full[bh_ret_full.index <= end_ts]
-        blend_slice = blend_full[blend_full.index <= end_ts]
+        bh_slice = bh[bh.index <= target]
+        sat_slice = blend[blend.index <= target]
         bh_eq = tx.after_tax_buy_hold(bh_slice)
-        cs_eq = tx.after_tax_core_satellite(bh_slice, blend_slice, core_weight, tax_rate)
-        cs_eq_x = tx.after_tax_core_satellite(bh_slice, blend_slice, core_weight, tax_rate,
-                                              cross_offset_losses=True)
-        m_bh, m_cs, m_cs_x = (compute_metrics([], bh_eq), compute_metrics([], cs_eq),
-                              compute_metrics([], cs_eq_x))
-        beat = m_cs_x["sharpe"] > m_bh["sharpe"]
-        wins += int(beat)
-        checks += 1
-        print(f"{end_ts.date()!s:12}{years:>11}{m_bh['sharpe']:>14.3f}{m_cs['sharpe']:>14.3f}"
-              f"{m_cs_x['sharpe']:>13.3f}{'YES' if beat else 'no':>8}")
-    print("-" * 78)
-    print(f"Core-satellite (+cross-offset column) beat pure buy-and-hold in {wins}/{checks} "
-          f"checkpoints.")
-    print("=" * 78)
+        cs_eq = tx.after_tax_core_satellite(bh_slice, sat_slice, core_weight, tax_rate)
+        mb, mc = compute_metrics([], bh_eq), compute_metrics([], cs_eq)
+        beat = mc["sharpe"] > mb["sharpe"]
+        checks += 1; wins += int(beat)
+        print(f"{target.date()}: B&H={mb['sharpe']:.3f} core-sat={mc['sharpe']:.3f} "
+              f"{'above' if beat else 'not above'}")
+    print(f"SUMMARY: core-satellite above pure B&H Sharpe in {wins}/{checks} checkpoints.")
+    return wins, checks
 
 
 def main():
-    ap = argparse.ArgumentParser(description="After-tax (Slovenia) comparison vs buy-and-hold.")
+    ap = argparse.ArgumentParser(description="Slovenian after-tax scenario research.")
     ap.add_argument("--mode", choices=["score", "checkpoints"], default="score")
-    ap.add_argument("--core-weight", type=float, default=0.7,
-                    help="Core-satellite split for --mode checkpoints (fraction in "
-                         "the untouched buy-and-hold core).")
-    ap.add_argument("--tax-rate", type=float, default=tx.SLOVENIA_TAX_RATE)
+    ap.add_argument("--core-weight", type=float, default=0.7)
+    ap.add_argument("--tax-rate", type=float, default=tx.SLOVENIA_TAX_RATE,
+                    help="Annual-realization proxy rate for the high-turnover sleeve")
     ap.add_argument("--currency", choices=["usd", "eur_naive", "eur_smart", "eur_hedged"],
-                    default="usd", help="usd: no currency adjustment (default). eur_naive: "
-                    "full unhedged EUR/USD exposure at all times. eur_smart: EUR/USD exposure "
-                    "only while actually invested in USD assets (only affects --mode score). "
-                    "eur_hedged: currency risk removed at a fixed annual cost (--hedge-cost).")
-    ap.add_argument("--hedge-cost", type=float, default=0.015,
-                    help="Fixed annual cost drag assumed for --currency eur_hedged.")
+                    default="usd")
+    ap.add_argument("--hedge-cost", type=float, default=0.015)
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
     ap.add_argument("--rp-strategy", choices=["min_var", "inverse_vol", "erc"], default="min_var")
     ap.add_argument("--months", type=int, default=240)
-    ap.add_argument("--start", type=str, default=None)
-    ap.add_argument("--end", type=str, default=None)
+    ap.add_argument("--start"); ap.add_argument("--end")
     ap.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca")
     args = ap.parse_args()
 
+    if (args.months <= 0 or not 0 <= args.core_weight <= 1 or
+            not 0 <= args.tax_rate <= 1 or args.hedge_cost < 0):
+        ap.error("invalid months/core-weight/tax-rate/hedge-cost")
     end_dt = _parse_date(args.end) if args.end else pd.Timestamp(datetime.now(timezone.utc))
     start_dt = (_parse_date(args.start) if args.start
-                else end_dt - pd.Timedelta(days=int(args.months * 31)))
-    log.info("After-tax window: %s -> %s (%s mode)", start_dt.date(), end_dt.date(), args.mode)
+                else end_dt - pd.Timedelta(days=args.months * 31))
+    if start_dt >= end_dt:
+        ap.error("start must precede end")
 
-    daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt, source=args.data_source)
-    if len(daily_data) < 2:
-        log.error("Need >= 2 symbols with data; got %d.", len(daily_data))
+    daily_data, _, _ = fetch_all(args.symbols, "none", start_dt, end_dt,
+                                 source=args.data_source)
+    if len(daily_data) != len(args.symbols):
+        log.error("Missing requested symbol data; refusing a silently changed universe.")
         return 1
     books = compute_books(daily_data, rp_strategy=args.rp_strategy)
 
     if args.mode == "checkpoints":
         if args.currency != "usd":
-            log.warning("--currency is not yet modeled in --mode checkpoints; ignoring.")
+            log.error("Checkpoint tax/currency interaction is not modeled; use --currency usd.")
+            return 1
         print_checkpoints(daily_data, books, start_dt, args.core_weight, args.tax_rate)
-    else:
-        fx_close, te_frac = None, None
-        if args.currency != "usd":
-            # EURUSD=X is a Yahoo-style ticker -- fetch it from yahoo regardless of
-            # --data-source, since alpaca doesn't carry FX pairs in this format.
-            fx_data, _, _ = fetch_all(["EURUSD=X"], "none", start_dt, end_dt, source="yahoo")
-            fx_close = fx_data["EURUSD=X"]["close"]
-            if args.currency == "eur_smart":
-                te_frac = cur.te_invested_fraction(daily_data)
-        print_score(daily_data, books, start_dt, end_dt, args.tax_rate,
-                   currency=args.currency, fx_close=fx_close, te_frac=te_frac,
-                   hedge_cost=args.hedge_cost)
+        return 0
+
+    fx_close = None
+    if args.currency in {"eur_naive", "eur_smart"}:
+        fx_data, _, _ = fetch_all(["EURUSD=X"], "none", start_dt, end_dt, source="yahoo")
+        if "EURUSD=X" not in fx_data:
+            log.error("EURUSD=X data unavailable; cannot perform EUR conversion.")
+            return 1
+        fx_close = fx_data["EURUSD=X"]["close"]
+    te_frac = cur.te_invested_fraction(daily_data, TE_MA_PERIOD, TE_BUFFER)
+    print_score(daily_data, books, start_dt, end_dt, args.tax_rate,
+                args.currency, fx_close, te_frac, args.hedge_cost)
     return 0
 
 
