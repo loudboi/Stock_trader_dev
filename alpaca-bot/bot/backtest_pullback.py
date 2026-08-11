@@ -204,11 +204,11 @@ class PyramidBook:
 
 def exec_window(daily, intra, d, intraday: bool):
     if intraday:
-        if intra is None or intra.empty:
+        if intra is None or intra.empty or d + 1 >= len(daily):
             return daily.iloc[0:0]
-        t0 = daily.index[d]
-        if d + 1 < len(daily):
-            t1 = daily.index[d + 1]
+        t0 = daily.index[d + 1]
+        if d + 2 < len(daily):
+            t1 = daily.index[d + 2]
             return intra[(intra.index > t0) & (intra.index <= t1)]
         return intra[intra.index > t0]
     return daily.iloc[d + 1:d + 2]
@@ -314,9 +314,22 @@ def process_day(book, name, inst, strat, daily, ma_f, ma_s, atr_series, d,
     if pending and planned_qty and not filled and not closed:
         fb = _fallback_bar(daily, d, exec_is_intraday)
         if fb is not None:
-            current = book.positions.get(name)
-            actual_stop = current.stop_dist if current else stop_dist
-            book.add_fixed_tranche(name, float(fb["open"]), planned_qty, actual_stop, fb.name)
+            fallback_valid = True
+            if exec_is_intraday:
+                next_d = d + 1
+                current = book.positions.get(name)
+                trend = (
+                    next_d < len(daily) and strat.trend_ok(daily, ma_f, ma_s, next_d))
+                fallback_valid = trend and (
+                    (pending[0] == "enter" and current is None) or
+                    (pending[0] == "add" and current is not None and
+                     current.tranches < len(strat.p.tranches))
+                )
+            if fallback_valid:
+                current = book.positions.get(name)
+                actual_stop = current.stop_dist if current else stop_dist
+                book.add_fixed_tranche(
+                    name, float(fb["open"]), planned_qty, actual_stop, fb.name)
 
     if name in book.positions:
         book.positions[name].last_price = (float(win["close"].iloc[-1])

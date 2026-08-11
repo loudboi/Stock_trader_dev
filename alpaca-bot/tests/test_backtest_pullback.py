@@ -79,15 +79,36 @@ def test_exec_window_single_timeframe_is_next_daily_bar():
     assert len(win) == 1 and win.index[0] == daily.index[2]
 
 
-def test_exec_window_intraday_slices_between_daily_stamps():
-    daily = _daily([100, 101, 102])
-    intra_idx = pd.date_range(daily.index[1] + pd.Timedelta(hours=1),
-                              daily.index[2], freq="1h", tz="UTC")
-    intra = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0,
-                          "close": 1.0, "volume": 1.0}, index=intra_idx)
+def test_exec_window_intraday_uses_next_session_not_signal_session():
+    daily = _daily([100, 101, 102, 103])
+    same_session = pd.date_range(
+        daily.index[1] + pd.Timedelta(hours=1), daily.index[2],
+        freq="1h", tz="UTC")
+    next_session = pd.date_range(
+        daily.index[2] + pd.Timedelta(hours=1), daily.index[3],
+        freq="1h", tz="UTC")
+    idx = same_session.append(next_session)
+    intra = pd.DataFrame({
+        "open": 1.0, "high": 1.0, "low": 1.0,
+        "close": 1.0, "volume": 1.0}, index=idx)
     win = bp.exec_window(daily, intra, 1, intraday=True)
-    assert len(win) == len(intra_idx)
-    assert (win.index > daily.index[1]).all() and (win.index <= daily.index[2]).all()
+    assert len(win) == len(next_session)
+    assert (win.index > daily.index[2]).all()
+    assert (win.index <= daily.index[3]).all()
+    assert not win.index.isin(same_session).any()
+
+
+def test_intraday_fallback_revalidates_trend_before_market_entry(monkeypatch):
+    inst = _register_test_instrument()
+    strat = TrendPullbackStrategy(inst, PullbackParams())
+    daily = _daily([100.0, 99.0, 98.0])
+    dummy = pd.Series([1.0, 1.0, 1.0], index=daily.index)
+    monkeypatch.setattr(strat, "trend_ok", lambda *args, **kwargs: False)
+    book = bp.PyramidBook(initial=100_000)
+    bp.process_day(
+        book, "TEST", inst, strat, daily, dummy, dummy, dummy, 0,
+        daily.iloc[0:0], True, decision=("enter", 0.30), planned_qty=10)
+    assert not book.positions
 
 
 def test_explicit_no_action_is_never_recomputed(monkeypatch):

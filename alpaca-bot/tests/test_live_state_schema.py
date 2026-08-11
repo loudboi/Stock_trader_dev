@@ -50,7 +50,21 @@ def test_versionless_legacy_state_is_upgraded_with_defaults(tmp_path):
         "daily": {"date": None, "realized": 0.0},
     }
     trader = _load(tmp_path, payload)
-    assert trader.state["version"] == 2
+    assert trader.state["version"] == 3
     assert trader.state["pending"] == {}
     assert trader.state["runtime"] == {"symbols": ["SPY"]}
     assert trader.state["last_daily"]["SPY"] == "legacy"
+
+def test_older_managed_state_version_is_rejected(tmp_path):
+    payload = lp.PullbackLiveTrader._default_state()
+    payload["version"] = 2
+    payload["positions"]["SPY"] = {"qty": 1.0}
+    with pytest.raises(RuntimeError, match="explicit migration"):
+        _load(tmp_path, payload)
+
+
+def test_malformed_pending_record_is_rejected(tmp_path):
+    payload = lp.PullbackLiveTrader._default_state()
+    payload["pending"]["SPY"] = {"type": "buy", "order_id": "x"}
+    with pytest.raises(RuntimeError, match="missing required field"):
+        _load(tmp_path, payload)

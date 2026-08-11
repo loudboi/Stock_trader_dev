@@ -24,7 +24,7 @@ log = logging.getLogger("portfolio_ibkr")
 _CANCEL_CONFIRM_POLLS = 12
 _CANCEL_POLL_SECONDS = 0.25
 _IBKR_CANCEL_CONFIRMED = {"cancelled", "apicancelled"}
-_IBKR_TERMINAL = {"filled", *_IBKR_CANCEL_CONFIRMED}
+_IBKR_TERMINAL = {"filled", "inactive", *_IBKR_CANCEL_CONFIRMED}
 
 
 def contract_kwargs(spec: dict) -> dict:
@@ -352,8 +352,11 @@ class IBKRPortfolio:
 
     def order_status(self, order_id):
         """Normalized order state, including completed-order recovery after restart."""
-        self._ensure()
         wanted = str(order_id)
+        if wanted == "already-flat":
+            return {"status": "already-flat", "filled_qty": 0.0,
+                    "qty": 0.0, "terminal": True}
+        self._ensure()
         try:
             for trade in self.ib.trades():
                 oid, status = self._normalized_trade_status(trade)

@@ -53,6 +53,8 @@ STALL_ALERT_AFTER = 5
 ORDER_CONFIRM_SECONDS = 10.0
 ORDER_CONFIRM_INTERVAL = 0.25
 CANCEL_RETRY_SECONDS = 2.0
+PENDING_RECOVERY_ALERT_SECONDS = 30.0
+STATE_VERSION = 3
 _RUNNING = True
 
 
@@ -134,6 +136,7 @@ class PullbackLiveTrader:
         # to retry a cancellation that previously failed rather than trusting a stale
         # persisted "cancel_requested" flag forever.
         self._cancel_retry_after = {}
+        self._pending_alerted = set()
 
     def notify(self, message: str) -> None:
         log.info("ALERT: %s", message)
@@ -141,8 +144,30 @@ class PullbackLiveTrader:
 
     @staticmethod
     def _default_state():
-        return {"version": 2, "positions": {}, "intents": {}, "pending": {},
+        return {"version": STATE_VERSION, "positions": {}, "intents": {}, "pending": {},
                 "last_daily": {}, "daily": {"date": None, "realized": 0.0}, "runtime": {}}
+
+    @staticmethod
+    def _validate_pending_record(name, pending):
+        if not isinstance(pending, dict):
+            raise RuntimeError(f"Invalid state: pending[{name!r}] must be a JSON object")
+        typ = pending.get("type")
+        required = {
+            "buy": {"order_id", "before_qty", "before_avg_entry", "tranche_index",
+                    "stop_dist", "signal_price", "requested_qty", "how", "submitted_at"},
+            "buy_submit": {"submission_id", "before_qty", "before_avg_entry", "tranche_index",
+                           "stop_dist", "signal_price", "requested_qty", "how", "submitted_at"},
+            "close": {"order_id", "reason", "position", "submitted_at"},
+            "close_submit": {"submission_id", "reason", "position", "submitted_at"},
+        }
+        if typ not in required:
+            raise RuntimeError(f"Invalid state: pending[{name!r}] has unsupported type {typ!r}")
+        missing = sorted(required[typ] - set(pending))
+        if missing:
+            raise RuntimeError(
+                f"Invalid state: pending[{name!r}] missing required field(s): {', '.join(missing)}")
+        if typ.startswith("close") and not isinstance(pending.get("position"), dict):
+            raise RuntimeError(f"Invalid state: pending[{name!r}].position must be a JSON object")
 
     def _load_state(self):
         state = self._default_state()
@@ -155,10 +180,48 @@ class PullbackLiveTrader:
             raise RuntimeError(f"Could not safely read state file {self.state_file}: {e}") from e
         if not isinstance(loaded, dict):
             raise RuntimeError(f"Invalid state file {self.state_file}: expected JSON object")
+
+        for key in ("positions", "intents", "pending", "last_daily", "daily", "runtime"):
+            if key in loaded and not isinstance(loaded[key], dict):
+                raise RuntimeError(
+                    f"Invalid state file {self.state_file}: '{key}' must be a JSON object")
+
+        version = loaded.get("version")
+        if version is not None and (type(version) is not int or version < 1):
+            raise RuntimeError(
+                f"Invalid state file {self.state_file}: version must be a positive integer")
+        if version is not None and version > STATE_VERSION:
+            raise RuntimeError(
+                f"State file {self.state_file} version {version} is newer than supported "
+                f"({STATE_VERSION}); refusing to guess unknown state")
+        if version is None or version < STATE_VERSION:
+            if any(bool(loaded.get(k)) for k in ("positions", "intents", "pending")):
+                label = "versionless" if version is None else f"version {version}"
+                raise RuntimeError(
+                    f"State file {self.state_file} {label} contains managed trading state; "
+                    f"explicit migration/reconciliation to version {STATE_VERSION} is required")
+
         state.update(loaded)
+        state["version"] = STATE_VERSION
         for key in ("positions", "intents", "pending", "last_daily", "runtime"):
             state.setdefault(key, {})
         state.setdefault("daily", {"date": None, "realized": 0.0})
+
+        for name, pos in state["positions"].items():
+            if not isinstance(pos, dict):
+                raise RuntimeError(f"Invalid state: positions[{name!r}] must be a JSON object")
+        for name, intent in state["intents"].items():
+            if not isinstance(intent, dict):
+                raise RuntimeError(f"Invalid state: intents[{name!r}] must be a JSON object")
+            if intent.get("type") not in {"enter", "add"}:
+                raise RuntimeError(f"Invalid state: intents[{name!r}] has unsupported type")
+            missing = {"tranche_index", "limit", "signal_ts"} - set(intent)
+            if missing:
+                raise RuntimeError(
+                    f"Invalid state: intents[{name!r}] missing required field(s): "
+                    f"{', '.join(sorted(missing))}")
+        for name, pending in state["pending"].items():
+            self._validate_pending_record(name, pending)
         return state
 
     def save_state(self):
@@ -194,6 +257,39 @@ class PullbackLiveTrader:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _pending_age_seconds(pending):
+        try:
+            ts = datetime.fromisoformat(str(pending.get("submitted_at", "")))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return max(
+                0.0,
+                (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def _alert_unresolved_pending(self, name, pending, broker=None, force=False):
+        if not force and self._pending_age_seconds(pending) < PENDING_RECOVERY_ALERT_SECONDS:
+            return
+        ident = str(
+            pending.get("order_id") or pending.get("submission_id") or "unknown")
+        key = f"{name}:{pending.get('type')}:{ident}"
+        if key in self._pending_alerted:
+            return
+        self._pending_alerted.add(key)
+        broker_text = (
+            f" Broker currently reports a {broker['qty']} long." if broker else "")
+        self.notify(
+            f"CRITICAL ORDER RECONCILIATION {name}: {pending.get('type')} {ident} cannot "
+            f"be terminally attributed.{broker_text} Symbol remains blocked; inspect broker "
+            "orders/executions and reconcile state manually before trading it again.")
+
+    @staticmethod
+    def _intent_is_fresh_for_fallback(intent, daily, i):
+        return i > 0 and intent.get("signal_ts") == str(daily.index[i - 1])
+
     def _pop_pending(self, name):
         pending = self.state["pending"].pop(name, None)
         if pending:
@@ -222,13 +318,25 @@ class PullbackLiveTrader:
         for p in self.state["positions"].values():
             qty = float(p.get("qty", 0) or 0)
             entry = float(p.get("avg_entry", 0) or 0)
-            dist = float(p.get("stop_dist", self.params.min_stop) or self.params.min_stop)
+            dist = float(
+                p.get("stop_dist", self.params.min_stop) or self.params.min_stop)
             mark = max(entry, float(p.get("last_price", entry) or entry))
             gross += qty * mark
             risk += qty * entry * dist
+        for p in self.state["pending"].values():
+            if p.get("type") not in {"buy", "buy_submit"}:
+                continue
+            qty = float(p.get("requested_qty", 0) or 0)
+            px = float(p.get("signal_price", 0) or 0)
+            dist = float(
+                p.get("stop_dist", self.params.min_stop) or self.params.min_stop)
+            gross += qty * px
+            risk += qty * px * dist
         return {
-            "gross_room": max(0.0, config.MAX_GROSS_EXPOSURE * equity - gross),
-            "risk_room": max(0.0, config.MAX_PORTFOLIO_RISK * equity - risk),
+            "gross_room": max(
+                0.0, config.MAX_GROSS_EXPOSURE * equity - gross),
+            "risk_room": max(
+                0.0, config.MAX_PORTFOLIO_RISK * equity - risk),
         }
 
     def _wait_pending(self, name, inst, seconds=ORDER_CONFIRM_SECONDS):
@@ -263,86 +371,114 @@ class PullbackLiveTrader:
         if filled_qty <= 1e-9:
             self._pop_pending(name)
             self.save_state()
-            self.notify(f"BUY ENDED WITHOUT BOT FILL: {name} order {pending['order_id']}.")
+            self.notify(
+                f"BUY ENDED WITHOUT BOT FILL: {name} order {pending['order_id']}.")
             return True
 
         if broker is None:
-            # The bot order did fill, but no long exists now. A separate sell/close
-            # happened before reconciliation. Preserve the known entry and record the
-            # unresolved exit rather than resurrecting a position or guessing P&L.
+            managed_pos = self.state["positions"].get(name)
+            if managed_pos and not self._release_protective_stop_after_flat(
+                    name, managed_pos):
+                return False
             known_entry = fill_px or pending["signal_price"]
             transient = {
-                "qty": filled_qty, "avg_entry": known_entry,
+                "qty": filled_qty,
+                "avg_entry": known_entry,
                 "tranches": pending["tranche_index"] + 1,
                 "entry_time": pending["submitted_at"],
                 "entry_orders": [{
                     "order_id": pending["order_id"],
-                    "requested_qty": requested, "filled_qty": filled_qty,
-                    "fill_price": fill_px, "fill_price_source": ("broker_order" if fill_px else "unavailable"),
+                    "requested_qty": requested,
+                    "filled_qty": filled_qty,
+                    "fill_price": fill_px,
+                    "fill_price_source": (
+                        "broker_order" if fill_px else "unavailable"),
                     "submitted_at": pending["submitted_at"],
-                    "tranche": pending["tranche_index"] + 1}],
+                    "tranche": pending["tranche_index"] + 1,
+                }],
             }
-            self._log_trade(name, transient, None, None,
-                            "bot buy filled, but broker was flat at reconciliation; "
-                            "exit fill unavailable; PnL not accrued", None)
+            self._log_trade(
+                name, transient, None, None,
+                "bot buy filled, but broker was flat at reconciliation; "
+                "exit fill unavailable; PnL not accrued", None)
             self._pop_pending(name)
             self.state["positions"].pop(name, None)
             self.save_state()
-            self.notify(f"BUY/FLAT RACE {name}: bot order filled {filled_qty}, but broker is flat; reconcile statement.")
+            self.notify(
+                f"BUY/FLAT RACE {name}: bot order filled {filled_qty}, but broker "
+                "is flat; reconcile statement.")
             return True
 
         broker_delta = broker["qty"] - before
-        exact_overlap = abs(broker_delta - filled_qty) > 1e-8
+        external_mismatch = abs(broker_delta - filled_qty) > 1e-8
         fill_source = "broker_order" if fill_px is not None else "unavailable"
         resolved_fill = fill_px
-        if resolved_fill is None and not exact_overlap:
+        if resolved_fill is None and not external_mismatch:
             before_avg = float(pending.get("before_avg_entry", 0.0) or 0.0)
-            inferred = (broker["qty"] * broker["avg_entry"] - before * before_avg) / filled_qty
+            inferred = (
+                broker["qty"] * broker["avg_entry"] - before * before_avg
+            ) / filled_qty
             if inferred > 0 and inferred == inferred:
                 resolved_fill = inferred
                 fill_source = "inferred_from_position"
 
         pos = self.state["positions"].get(name)
         if pos is None:
-            pos = {"tranches": 0, "stop_dist": pending["stop_dist"],
-                   "entry_time": pending["submitted_at"], "stop_order_id": None,
-                   "stop_level": None, "stop_qty": 0.0, "entry_orders": []}
+            pos = {
+                "tranches": 0,
+                "stop_dist": pending["stop_dist"],
+                "entry_time": pending["submitted_at"],
+                "stop_order_id": None,
+                "stop_level": None,
+                "stop_qty": 0.0,
+                "entry_orders": [],
+            }
         terminal_partial = filled_qty + 1e-8 < requested
-        if terminal_partial or exact_overlap:
+        if terminal_partial or external_mismatch:
             pos["tranches"] = len(self.params.tranches)
         else:
-            pos["tranches"] = max(pos.get("tranches", 0), pending["tranche_index"] + 1)
+            pos["tranches"] = max(
+                pos.get("tranches", 0), pending["tranche_index"] + 1)
         pos["qty"], pos["avg_entry"] = broker["qty"], broker["avg_entry"]
         pos["last_add_price"] = resolved_fill or broker["avg_entry"]
         pos["last_price"] = broker["avg_entry"]
         if terminal_partial:
             pos["partial_fill_frozen"] = True
-        if exact_overlap:
+        if external_mismatch:
             pos["external_overlap"] = True
             pos["tranches"] = len(self.params.tranches)
             pos["fill_search_since"] = datetime.now(timezone.utc).isoformat()
         pos.setdefault("entry_orders", []).append({
-            "order_id": pending["order_id"], "requested_qty": requested,
-            "filled_qty": filled_qty, "fill_price": resolved_fill,
+            "order_id": pending["order_id"],
+            "requested_qty": requested,
+            "filled_qty": filled_qty,
+            "fill_price": resolved_fill,
             "fill_price_source": fill_source,
             "submitted_at": pending["submitted_at"],
             "tranche": pending["tranche_index"] + 1,
-            "terminal_partial": terminal_partial})
+            "terminal_partial": terminal_partial,
+        })
         self.state["positions"][name] = pos
         self._pop_pending(name)
         protected = self._place_stop(name, inst, pos)
         self.save_state()
         if terminal_partial:
-            label = (f"PARTIAL BUY {name}: bot filled {filled_qty}/{requested}; "
-                     "position frozen as fully built")
-        elif exact_overlap:
-            label = (f"BUY {name}: bot filled {filled_qty}, but broker quantity changed by "
-                     f"{broker_delta}; external overlap detected and position frozen")
+            label = (
+                f"PARTIAL BUY {name}: bot filled {filled_qty}/{requested}; "
+                "position frozen as fully built")
+        elif external_mismatch:
+            label = (
+                f"BUY {name}: bot filled {filled_qty}, but broker quantity changed by "
+                f"{broker_delta}; external overlap detected and position frozen")
         else:
-            px_text = f"@~{resolved_fill:.4f}" if resolved_fill is not None else "@ fill unavailable"
-            label = (f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
-                     f"qty={filled_qty} {px_text} ({pending['how']})")
-        self.notify(label + ("" if protected else " [protective stop unavailable]"))
+            px_text = (
+                f"@~{resolved_fill:.4f}" if resolved_fill is not None
+                else "@ fill unavailable")
+            label = (
+                f"BUY {name} tranche {pos['tranches']}/{len(self.params.tranches)} "
+                f"qty={filled_qty} {px_text} ({pending['how']})")
+        self.notify(
+            label + ("" if protected else " [protective stop unavailable]"))
         return True
 
     def _record_close_piece(self, name, pos, qty, exit_px, reason, order_id):
@@ -369,8 +505,7 @@ class PullbackLiveTrader:
                 # another order/manual action. Attribute it as external, not to the
                 # bot's canceled/rejected close.
                 pos = self.state["positions"].get(name) or dict(original)
-                self._finalize_external_close(name, inst, pos)
-                return True
+                return self._finalize_external_close(name, inst, pos)
             pos = self.state["positions"].get(name) or dict(original)
             changed = (abs(float(pos.get("qty", 0)) - broker["qty"]) > 1e-9 or
                        abs(float(pos.get("avg_entry", 0)) - broker["avg_entry"]) > 1e-9)
@@ -439,24 +574,37 @@ class PullbackLiveTrader:
         stop_dist = self._current_stop_dist(name, inst, broker["avg_entry"])
         now = datetime.now(timezone.utc).isoformat()
         pos = {
-            "tranches": len(self.params.tranches), "qty": broker["qty"],
-            "avg_entry": broker["avg_entry"], "last_add_price": broker["avg_entry"],
+            "tranches": len(self.params.tranches),
+            "qty": broker["qty"],
+            "avg_entry": broker["avg_entry"],
+            "last_add_price": broker["avg_entry"],
             "last_price": broker["avg_entry"],
-            "stop_dist": stop_dist, "stop_order_id": None, "stop_level": None,
-            "stop_qty": 0.0, "entry_time": now, "fill_search_since": now,
-            "entry_orders": [], "adopted": True,
+            "stop_dist": stop_dist,
+            "stop_order_id": None,
+            "stop_level": None,
+            "stop_qty": 0.0,
+            "entry_time": now,
+            "fill_search_since": now,
+            "entry_orders": [],
+            "adopted": True,
         }
         self.state["positions"][name] = pos
-        self._place_stop(name, inst, pos)
+        pos["protection_confirmed"] = bool(self._place_stop(name, inst, pos))
         return pos
 
     def _handle_untracked_broker_long(self, name, inst, broker):
         if not self.adopt_existing:
             raise RuntimeError(
-                f"{name}: broker has an existing long but state does not. Refusing to guess tranche/"
-                "ownership. Re-run with --adopt-existing only if this bot should take it over.")
+                f"{name}: broker has an existing long but state does not. Refusing to "
+                "guess tranche/ownership. Re-run with --adopt-existing only if this bot "
+                "should take it over.")
         pos = self._adopt_long(name, inst, broker)
-        self.notify(f"ADOPTED {name}: existing broker long explicitly taken over as fully built.")
+        suffix = ""
+        if inst.asset_class != "crypto" and not pos.get("protection_confirmed"):
+            suffix = " [protective stop unavailable; manual protection required]"
+        self.notify(
+            f"ADOPTED {name}: existing broker long explicitly taken over as fully "
+            f"built.{suffix}")
         return pos
 
     def _apply_external_position_change(self, name, inst, pos, broker):
@@ -542,26 +690,49 @@ class PullbackLiveTrader:
         max_risk = room["risk_room"] / (price * risk_dist)
         qty = rm.round_qty(min(desired, max_gross, max_risk), inst.qty_decimals)
         if qty <= 0:
-            log.warning("%s: tranche %d blocked by size/portfolio limits.", name, tranche_index + 1)
+            log.warning(
+                "%s: tranche %d blocked by size/portfolio limits.",
+                name, tranche_index + 1)
             return False
-        order_id = self.pf.submit_market_order(inst, qty, "buy")
-        if not order_id:
-            return False
+
         submitted_at = datetime.now(timezone.utc).isoformat()
+        submission_id = f"{name}:buy:{tranche_index}:{submitted_at}"
         self.state["intents"].pop(name, None)
         self.state["pending"][name] = {
-            "type": "buy", "order_id": str(order_id), "before_qty": before_qty,
+            "type": "buy_submit",
+            "submission_id": submission_id,
+            "before_qty": before_qty,
             "before_avg_entry": before_avg,
-            "tranche_index": tranche_index, "stop_dist": risk_dist, "signal_price": price,
-            "requested_qty": qty, "how": how, "submitted_at": submitted_at,
+            "tranche_index": tranche_index,
+            "stop_dist": risk_dist,
+            "signal_price": price,
+            "requested_qty": qty,
+            "how": how,
+            "submitted_at": submitted_at,
         }
-        self.save_state(); self._wait_pending(name, inst)
+        self.save_state()
+        order_id = self.pf.submit_market_order(inst, qty, "buy")
+        if not order_id:
+            self._alert_unresolved_pending(
+                name, self.state["pending"][name], before, force=True)
+            return False
+        pending = self.state["pending"][name]
+        pending["type"] = "buy"
+        pending["order_id"] = str(order_id)
+        self.save_state()
+        self._wait_pending(name, inst)
         return name not in self.state["pending"]
 
     def _confirm_pending(self, name, inst):
         pending = self.state["pending"].get(name)
         if not pending:
             return True
+        if pending.get("type") in {"buy_submit", "close_submit"}:
+            broker = self._broker_position(inst)
+            self._alert_unresolved_pending(
+                name, pending, broker=broker, force=True)
+            return False
+
         broker = self._broker_position(inst)
         status = self._order_status(pending["order_id"])
         terminal = bool(status and status.get("terminal"))
@@ -569,62 +740,100 @@ class PullbackLiveTrader:
 
         if pending["type"] == "buy":
             before = float(pending["before_qty"])
-            broker_delta = max(0.0, (broker["qty"] if broker else 0.0) - before)
+            broker_delta = max(
+                0.0, (broker["qty"] if broker else 0.0) - before)
             if not terminal:
-                # Any observed quantity change while the exact bot order is still
-                # nonterminal is ambiguous: it can be a partial bot fill OR a manual
-                # trade. Cancel the bot order before attributing anything.
                 if broker_delta > 1e-9:
                     self._request_pending_cancel(pending)
                     status = self._order_status(pending["order_id"])
                     terminal = bool(status and status.get("terminal"))
                     filled_qty = self._filled_qty(status)
                 if not terminal:
+                    if status is None:
+                        self._alert_unresolved_pending(name, pending, broker)
                     return False
             if filled_qty is None:
+                self._alert_unresolved_pending(name, pending, broker)
                 return False
-            return self._settle_terminal_buy(name, inst, pending, broker, filled_qty)
+            return self._settle_terminal_buy(
+                name, inst, pending, broker, filled_qty)
 
         if pending["type"] == "close":
             original_qty = float(pending["position"]["qty"])
             broker_remaining = broker["qty"] if broker else 0.0
-            broker_changed = (broker is None or
-                              abs(broker_remaining - original_qty) > 1e-9)
+            broker_changed = (
+                broker is None or
+                abs(broker_remaining - original_qty) > 1e-9)
             if not terminal:
-                # Flat/partial broker state is not proof that this sell order caused
-                # it. Cancel the still-working bot sell before it can execute later
-                # against an externally changed position and create a short.
                 if broker_changed:
                     self._request_pending_cancel(pending)
                     status = self._order_status(pending["order_id"])
                     terminal = bool(status and status.get("terminal"))
                     filled_qty = self._filled_qty(status)
                 if not terminal:
+                    if status is None:
+                        self._alert_unresolved_pending(name, pending, broker)
                     return False
             if filled_qty is None:
+                self._alert_unresolved_pending(name, pending, broker)
                 return False
-            return self._settle_terminal_close(name, inst, pending, broker, filled_qty)
-        raise RuntimeError(f"Unknown pending order type for {name}: {pending['type']}")
+            return self._settle_terminal_close(
+                name, inst, pending, broker, filled_qty)
+        raise RuntimeError(
+            f"Unknown pending order type for {name}: {pending['type']}")
 
     def _place_stop(self, name, inst, pos):
         old_id, old_level = pos.get("stop_order_id"), pos.get("stop_level")
         old_qty = pos.get("stop_qty", pos.get("qty", 0.0))
         if old_id and not self.pf.cancel_order(old_id):
-            self.notify(f"STOP REPLACE FAILED: could not confirm cancellation of {name} stop {old_id}.")
+            self.notify(
+                f"STOP REPLACE FAILED: could not confirm cancellation of {name} stop "
+                f"{old_id}.")
             return False
         stop_level = pos["avg_entry"] * (1 - pos["stop_dist"])
         new_id = self.pf.submit_stop_order(inst, pos["qty"], stop_level)
         if new_id:
-            pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = str(new_id), stop_level, pos["qty"]
+            pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+                str(new_id), stop_level, pos["qty"])
             return True
-        pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = None, None, 0.0
+        pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+            None, None, 0.0)
         if old_id and old_level and old_qty:
             restored = self.pf.submit_stop_order(inst, old_qty, old_level)
             if restored:
-                pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = str(restored), old_level, old_qty
-                self.notify(f"STOP REPLACE FAILED for {name}; previous coverage restored.")
+                pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+                    str(restored), old_level, old_qty)
+                self.notify(
+                    f"STOP REPLACE FAILED for {name}; previous coverage restored.")
                 return False
-            self.notify(f"CRITICAL: {name} broker stop replacement and restore both failed.")
+            self.notify(
+                f"CRITICAL: {name} broker stop replacement and restore both failed.")
+        elif inst.asset_class != "crypto":
+            self.notify(
+                f"CRITICAL: {name} has a managed long but no broker protective stop "
+                "could be placed.")
+        return False
+
+    def _release_protective_stop_after_flat(self, name, pos):
+        """Retire a protective SELL only after terminal broker evidence."""
+        stop_id = pos.get("stop_order_id")
+        if not stop_id:
+            return True
+        if self.pf.cancel_order(stop_id):
+            pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+                None, None, 0.0)
+            return True
+        status = self._order_status(stop_id)
+        if status and status.get("terminal"):
+            pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+                None, None, 0.0)
+            return True
+        self.state["positions"][name] = pos
+        self.save_state()
+        self.notify(
+            f"CRITICAL ORPHAN-STOP RISK {name}: broker is flat but protective SELL "
+            f"{stop_id} could not be terminally cancelled or verified. State is retained "
+            "and the symbol remains blocked; cancel/verify the broker order manually.")
         return False
 
     def _close(self, name, inst, exit_price, reason):
@@ -635,44 +844,67 @@ class PullbackLiveTrader:
             return False
         old_stop = pos.get("stop_order_id")
         if old_stop and not self.pf.cancel_order(old_stop):
-            self.notify(f"CLOSE BLOCKED: could not cancel {name} protective stop; avoiding double sell.")
+            self.notify(
+                f"CLOSE BLOCKED: could not cancel {name} protective stop; avoiding "
+                "double sell.")
             return False
-        pos["stop_order_id"] = None
-        order_id = self.pf.close_position_raw(inst)
-        if not order_id:
-            self._place_stop(name, inst, pos)
-            return False
+        pos["stop_order_id"], pos["stop_level"], pos["stop_qty"] = (
+            None, None, 0.0)
+        submitted_at = datetime.now(timezone.utc).isoformat()
+        submission_id = f"{name}:close:{submitted_at}"
         self.state["pending"][name] = {
-            "type": "close", "order_id": str(order_id), "reason": reason,
-            "requested_exit_price": exit_price, "position": dict(pos),
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "type": "close_submit",
+            "submission_id": submission_id,
+            "reason": reason,
+            "requested_exit_price": exit_price,
+            "position": dict(pos),
+            "submitted_at": submitted_at,
         }
         self.state["intents"].pop(name, None)
-        self.save_state(); self._wait_pending(name, inst)
+        self.save_state()
+        order_id = self.pf.close_position_raw(inst)
+        if not order_id:
+            self._alert_unresolved_pending(
+                name, self.state["pending"][name],
+                self._broker_position(inst), force=True)
+            return False
+        pending = self.state["pending"][name]
+        pending["type"] = "close"
+        pending["order_id"] = str(order_id)
+        self.save_state()
+        self._wait_pending(name, inst)
         return name not in self.state["pending"]
 
     def _finalize_external_close(self, name, inst, pos):
+        if not self._release_protective_stop_after_flat(name, pos):
+            return False
         since = pos.get("fill_search_since") or pos.get("entry_time")
         exit_px = self.pf.recent_fill_price(inst, "sell", since=since)
-        if pos.get("stop_order_id"):
-            self.pf.cancel_order(pos["stop_order_id"])
         if exit_px is None:
-            self._log_trade(name, pos, None, None,
-                            "broker stop / external close (fill unavailable; PnL not accrued)", None)
+            self._log_trade(
+                name, pos, None, None,
+                "broker stop / external close (fill unavailable; PnL not accrued)", None)
         else:
             pnl = (exit_px - pos["avg_entry"]) * pos["qty"]
-            self._log_trade(name, pos, exit_px, pnl, "broker stop / external close", None)
+            self._log_trade(
+                name, pos, exit_px, pnl, "broker stop / external close", None)
             self._accrue_daily(pnl)
         pending = self.state["pending"].get(name)
         if pending:
-            self._cancel_retry_after.pop(str(pending.get("order_id", "")), None)
+            self._cancel_retry_after.pop(
+                str(pending.get("order_id", "")), None)
         for bucket in ("positions", "intents", "pending"):
             self.state[bucket].pop(name, None)
         self.save_state()
         if exit_px is None:
-            self.notify(f"CLOSE {name}: broker is flat but fill/PnL unavailable; reconcile statement (broker stop/external).")
+            self.notify(
+                f"CLOSE {name}: broker is flat but fill/PnL unavailable; reconcile "
+                "statement (broker stop/external).")
         else:
-            self.notify(f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} (broker stop/external)")
+            self.notify(
+                f"CLOSE {name} @~{exit_px:.4f} pnl={pnl:.2f} "
+                "(broker stop/external)")
+        return True
 
     def _log_trade(self, name, pos, exit_price, pnl, reason, exit_order_id=None):
         new = not os.path.exists(PULLBACK_TRADES_CSV)
@@ -735,6 +967,19 @@ class PullbackLiveTrader:
         broker, pos, closed = self._sync_broker_state(name, inst)
         if closed:
             return
+
+        latest = None
+        if pos and inst.asset_class == "crypto":
+            latest = self.pf.latest_price(inst)
+            if latest is None:
+                self._mark_data(name, False)
+                return
+            pos["last_price"] = latest
+            if latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):
+                self._close(
+                    name, inst, latest, "volatility stop max(5%,2xATR)")
+                return
+
         if not self.pf.is_tradable_now(inst):
             return
 
@@ -747,17 +992,20 @@ class PullbackLiveTrader:
             daily_full = self.pf.get_historical_bars(
                 inst, "1Day", end - timedelta(days=_DAILY_WARMUP_DAYS + 30), end)
             if daily_full is None or daily_full.empty:
-                self._mark_data(name, False); return
+                self._mark_data(name, False)
+                return
             self._daily_cache[name] = (today, daily_full)
         daily = daily_full[[d.date() < today for d in daily_full.index]]
         if len(daily) < strat.warmup():
-            self._mark_data(name, False); return
-        latest = self.pf.latest_price(inst)
+            self._mark_data(name, False)
+            return
         if latest is None:
-            self._mark_data(name, False); return
+            latest = self.pf.latest_price(inst)
+        if latest is None:
+            self._mark_data(name, False)
+            return
         self._mark_data(name, True)
 
-        # Broker state may have changed while data was being fetched.
         broker, pos, closed = self._sync_broker_state(name, inst)
         if closed:
             return
@@ -767,12 +1015,15 @@ class PullbackLiveTrader:
         i = len(daily) - 1
         price_i = float(daily["close"].iloc[i])
         a = atr_series.iloc[i]
-        stop_dist = strat.stop_distance(float(a) if a == a else 0.0, price_i)
+        stop_dist = strat.stop_distance(
+            float(a) if a == a else 0.0, price_i)
 
         if pos:
             pos["last_price"] = latest
         if pos and latest <= pos["avg_entry"] * (1 - pos["stop_dist"]):
-            self._close(name, inst, latest, "volatility stop max(5%,2xATR)"); return
+            self._close(
+                name, inst, latest, "volatility stop max(5%,2xATR)")
+            return
 
         cur_ts = str(daily.index[i])
         if cur_ts != self.state["last_daily"].get(name):
@@ -782,35 +1033,57 @@ class PullbackLiveTrader:
                 te = strat.trend_exit(daily, ma_f, i)
                 if te:
                     self.state["intents"].pop(name, None)
-                    self._close(name, inst, latest, te[1]); return
+                    self._close(name, inst, latest, te[1])
+                    return
             intent = self.state["intents"].get(name)
             if intent:
-                valid = trend and ((intent["type"] == "enter" and pos is None) or
-                    (intent["type"] == "add" and pos is not None and
-                     pos["tranches"] < len(self.params.tranches)))
-                if valid:
-                    self._buy_tranche(name, inst, latest, intent["tranche_index"], stop_dist, "fallback")
-                else:
+                if not self._intent_is_fresh_for_fallback(intent, daily, i):
                     self.state["intents"].pop(name, None)
-                if name in self.state["pending"]:
-                    return
+                    self.notify(
+                        f"INTENT EXPIRED {name}: signal {intent.get('signal_ts')} is "
+                        "older than the immediately preceding completed session; no "
+                        "stale fallback order sent.")
+                    intent = None
+                if intent:
+                    valid = trend and (
+                        (intent["type"] == "enter" and pos is None) or
+                        (intent["type"] == "add" and pos is not None and
+                         pos["tranches"] < len(self.params.tranches)))
+                    if valid:
+                        self._buy_tranche(
+                            name, inst, latest, intent["tranche_index"],
+                            stop_dist, "fallback")
+                    else:
+                        self.state["intents"].pop(name, None)
+                    if name in self.state["pending"]:
+                        return
             pos = self.state["positions"].get(name)
             if pos is None and trend:
                 ok, _ = strat.entry_signal(daily, ma_f, i)
                 if ok:
-                    self.state["intents"][name] = {"type": "enter", "tranche_index": 0,
-                        "limit": price_i * (1 - self.params.improve_pct)}
+                    self.state["intents"][name] = {
+                        "type": "enter",
+                        "tranche_index": 0,
+                        "limit": price_i * (1 - self.params.improve_pct),
+                        "signal_ts": cur_ts,
+                    }
             elif pos and trend and pos["tranches"] < len(self.params.tranches):
-                add, _ = strat.should_add(daily, ma_f, i, pos["last_add_price"])
+                add, _ = strat.should_add(
+                    daily, ma_f, i, pos["last_add_price"])
                 if add:
-                    self.state["intents"][name] = {"type": "add",
+                    self.state["intents"][name] = {
+                        "type": "add",
                         "tranche_index": pos["tranches"],
-                        "limit": price_i * (1 - self.params.improve_pct)}
+                        "limit": price_i * (1 - self.params.improve_pct),
+                        "signal_ts": cur_ts,
+                    }
             self.save_state()
 
         intent = self.state["intents"].get(name)
         if intent and latest <= intent["limit"]:
-            self._buy_tranche(name, inst, latest, intent["tranche_index"], stop_dist, "limit dip")
+            self._buy_tranche(
+                name, inst, latest, intent["tranche_index"],
+                stop_dist, "limit dip")
 
     def _mark_data(self, name, ok):
         if ok:
