@@ -1,0 +1,194 @@
+name: Strategy Family Research
+
+on:
+  pull_request:
+    branches: [agent/fix-repo-audit]
+    paths:
+      - .github/workflows/strategy-family-research.yml
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: alpaca-bot
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/profitability-research
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Compare fixed-rule strategy families
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+
+          import bot.lab as lab
+          import bot.momentum_rotation as mr
+          import bot.trend_exposure as te
+          from bot.backtest_pullback import INITIAL_EQUITY, buy_hold_combined, compute_metrics, fetch_all
+          from bot.data import clean_daily_data
+
+          SYMBOLS = ["SPY", "QQQ", "GLD", "TLT", "EFA", "EEM", "IWM"]
+          START = pd.Timestamp("2004-01-01", tz="UTC")
+          END = pd.Timestamp("2026-08-20", tz="UTC")
+          DEV_WINDOWS = [
+              (pd.Timestamp("2006-01-01", tz="UTC"), pd.Timestamp("2009-12-31", tz="UTC")),
+              (pd.Timestamp("2010-01-01", tz="UTC"), pd.Timestamp("2014-12-31", tz="UTC")),
+              (pd.Timestamp("2015-01-01", tz="UTC"), pd.Timestamp("2019-12-31", tz="UTC")),
+              (pd.Timestamp("2020-01-01", tz="UTC"), pd.Timestamp("2024-12-31", tz="UTC")),
+          ]
+          HOLDOUT = (pd.Timestamp("2025-01-01", tz="UTC"), END)
+
+          daily, _, _ = fetch_all(SYMBOLS, "none", START, END, source="yahoo")
+          if set(daily) != set(SYMBOLS):
+              raise RuntimeError(f"Missing Yahoo data: expected {SYMBOLS}, got {sorted(daily)}")
+          daily = clean_daily_data(daily)
+          panel = lab.build_panel(daily)
+
+          def metrics_from_returns(rets, start, end):
+              r = rets.loc[start:end].fillna(0.0)
+              if r.empty:
+                  return {"sharpe": 0.0, "total_return": 0.0, "max_drawdown": 0.0,
+                          "profit_factor": 0.0, "trades": 0, "cagr": 0.0}
+              eq = INITIAL_EQUITY * (1.0 + r).cumprod()
+              eq.attrs["initial_equity"] = INITIAL_EQUITY
+              m = compute_metrics([], eq)
+              years = max((eq.index[-1] - eq.index[0]).total_seconds() / (365.2425 * 86400), 1/365.2425)
+              m["cagr"] = (eq.iloc[-1] / INITIAL_EQUITY) ** (1 / years) - 1
+              return m
+
+          def fixed_mean(series):
+              return pd.concat(series, axis=1).fillna(0.0).sum(axis=1) / len(series)
+
+          def build(candidate, slip=0.0005):
+              family, p = candidate
+              te.SLIPPAGE = slip
+              mr.SLIPPAGE = slip
+              lab.SLIPPAGE = slip
+              if family == "trend_exposure":
+                  vals = [te.strategy_returns(d, p["ma"], p["buffer"], 1.0, 0.0)
+                          for d in daily.values()]
+                  return fixed_mean(vals)
+              if family == "momentum_rotation":
+                  w = mr.weight_panel(panel, p["lookback"], p["skip"], p["top_k"])
+                  return mr.portfolio_returns(panel, w)
+              if family == "managed_futures":
+                  return lab.managed_futures(panel, p["ma"], p["vol"])
+              if family == "inverse_vol":
+                  return lab.inverse_vol(panel, p["lookback"])
+              if family == "min_var":
+                  return lab.min_var(panel, p["cov"])
+              if family == "erc":
+                  return lab.erc(panel, p["cov"])
+              if family == "trend_vol":
+                  return lab.trend_vol(panel, ma_period=p["ma"], target_vol=p["target"],
+                                       vol_lookback=p["vol"], max_leverage=1.0,
+                                       borrow_rate=0.0)
+              if family == "mean_reversion":
+                  return lab.mean_reversion(panel, ma_trend=p["ma"], rsi_period=2,
+                                            buy=p["buy"], exit_=p["exit"])
+              raise ValueError(candidate)
+
+          candidates = []
+          for ma in (100, 150, 200, 250):
+              for buffer in (0.0, 0.01, 0.02):
+                  candidates.append(("trend_exposure", {"ma": ma, "buffer": buffer}))
+          for lb in (6, 9, 12):
+              for skip in (0, 1):
+                  for top_k in (1, 2, 3):
+                      candidates.append(("momentum_rotation", {"lookback": lb, "skip": skip, "top_k": top_k}))
+          for ma in (100, 150, 200, 250):
+              for vol in (20, 60):
+                  candidates.append(("managed_futures", {"ma": ma, "vol": vol}))
+          for lookback in (20, 60):
+              candidates.append(("inverse_vol", {"lookback": lookback}))
+          for cov in (60, 126):
+              candidates.append(("min_var", {"cov": cov}))
+              candidates.append(("erc", {"cov": cov}))
+          for ma in (150, 200):
+              for target in (0.10, 0.15):
+                  candidates.append(("trend_vol", {"ma": ma, "target": target, "vol": 20}))
+          candidates += [
+              ("mean_reversion", {"ma": 200, "buy": 10.0, "exit": 70.0}),
+              ("mean_reversion", {"ma": 200, "buy": 5.0, "exit": 60.0}),
+          ]
+
+          def label(c):
+              family, p = c
+              return family + " " + " ".join(f"{k}={v}" for k, v in p.items())
+
+          rows = []
+          for c in candidates:
+              r = build(c, 0.0005)
+              seg = [metrics_from_returns(r, a, b) for a, b in DEV_WINDOWS]
+              ss = [m["sharpe"] for m in seg]
+              cc = [m["cagr"] for m in seg]
+              rr = [m["total_return"] for m in seg]
+              dd = [m["max_drawdown"] for m in seg]
+              rows.append({"candidate": c, "positive": sum(x > 0 for x in ss),
+                           "min_sharpe": min(ss), "median_sharpe": float(np.median(ss)),
+                           "mean_sharpe": float(np.mean(ss)), "median_cagr": float(np.median(cc)),
+                           "worst_return": min(rr), "worst_dd": min(dd)})
+          rows.sort(key=lambda x: (x["positive"], x["min_sharpe"], x["median_sharpe"],
+                                  x["median_cagr"]), reverse=True)
+
+          print("DEVELOPMENT ROBUSTNESS 2006-2024")
+          for i, x in enumerate(rows[:20], 1):
+              print(f"{i:02d} {label(x['candidate'])} pos={x['positive']}/4 "
+                    f"minS={x['min_sharpe']:.2f} medS={x['median_sharpe']:.2f} "
+                    f"meanS={x['mean_sharpe']:.2f} medCAGR={x['median_cagr']:.2%} "
+                    f"worstRet={x['worst_return']:.2%} worstDD={x['worst_dd']:.2%}")
+
+          print("\nHELD-OUT 2025-01-01 -> 2026-08-20 (rank fixed from development)")
+          for x in rows[:12]:
+              r = build(x["candidate"], 0.0005)
+              m = metrics_from_returns(r, *HOLDOUT)
+              print(f"{label(x['candidate'])} Sharpe={m['sharpe']:.2f} CAGR={m['cagr']:.2%} "
+                    f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%}")
+
+          print("\nCOST STRESS ON TOP 6 DEVELOPMENT CANDIDATES")
+          for x in rows[:6]:
+              for slip in (0.0005, 0.0010, 0.0020):
+                  r = build(x["candidate"], slip)
+                  m = metrics_from_returns(r, *HOLDOUT)
+                  print(f"{label(x['candidate'])} slip={slip*10000:.0f}bp "
+                        f"Sharpe={m['sharpe']:.2f} CAGR={m['cagr']:.2%} "
+                        f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%}")
+
+          for title, window in (("DEVELOPMENT", (pd.Timestamp("2006-01-01", tz="UTC"),
+                                                  pd.Timestamp("2024-12-31", tz="UTC"))),
+                                ("HELD-OUT", HOLDOUT)):
+              bh = buy_hold_combined(daily, begin_ts=window[0])
+              bh = bh[bh.index <= window[1]]
+              m = compute_metrics([], bh)
+              years = max((bh.index[-1] - bh.index[0]).total_seconds() / (365.2425 * 86400), 1/365.2425)
+              cagr = (bh.iloc[-1] / INITIAL_EQUITY) ** (1 / years) - 1
+              spy = daily["SPY"].loc[window[0]:window[1], "close"]
+              spy_eq = INITIAL_EQUITY * spy / spy.iloc[0]
+              spy_eq.attrs["initial_equity"] = INITIAL_EQUITY
+              sm = compute_metrics([], spy_eq)
+              syears = max((spy_eq.index[-1] - spy_eq.index[0]).total_seconds() / (365.2425 * 86400), 1/365.2425)
+              scagr = (spy_eq.iloc[-1] / INITIAL_EQUITY) ** (1 / syears) - 1
+              print(f"\n{title} BENCHMARKS")
+              print(f"initial-allocation equal-weight B&H Sharpe={m['sharpe']:.2f} CAGR={cagr:.2%} "
+                    f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%}")
+              print(f"SPY B&H Sharpe={sm['sharpe']:.2f} CAGR={scagr:.2%} "
+                    f"Return={sm['total_return']:.2%} DD={sm['max_drawdown']:.2%}")
+          PY
