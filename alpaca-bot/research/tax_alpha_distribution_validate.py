@@ -28,7 +28,8 @@ def load_symbol(s):
  d=yf.Ticker(s).history(start=START,end=END,auto_adjust=False,actions=True,repair=False)
  if d is None or d.empty: raise RuntimeError(f"no raw history for {s}")
  idx=pd.DatetimeIndex(d.index)
- d=d.copy(); d.index=idx.tz_convert('UTC') if idx.tz is not None else idx.tz_localize('UTC')
+ idx=idx.tz_convert('UTC') if idx.tz is not None else idx.tz_localize('UTC')
+ d=d.copy(); d.index=idx.normalize(); d=d[~d.index.duplicated(keep='last')].sort_index()
  close=pd.to_numeric(d['Close'],errors='coerce')
  div=pd.to_numeric(d.get('Dividends',0.0),errors='coerce').fillna(0.0)
  split=pd.to_numeric(d.get('Stock Splits',0.0),errors='coerce').fillna(0.0)
@@ -38,12 +39,10 @@ def load_symbol(s):
 
 def run():
  raw={s:load_symbol(s) for s in SYMBOLS}
- common=max(d.index[0] for d in raw.values()); last=min(d.index[-1] for d in raw.values())
- idx=pd.date_range(common.normalize(),last.normalize(),freq='B',tz='UTC')
- # Keep only dates with at least one US market close; per-symbol prices carry forward over venue holidays.
- frame=pd.DataFrame({s:raw[s].close.reindex(idx).ffill() for s in SYMBOLS}).dropna()
+ # Use the union of actual normalized market dates. Prices may carry forward over
+ # venue-specific holidays, but cash distributions/splits occur only on source rows.
+ frame=pd.DataFrame({s:raw[s].close for s in SYMBOLS}).sort_index().ffill().dropna()
  idx=frame.index
- # Actions only happen on their true source rows; never forward-fill dividends or splits.
  div={s:raw[s].dividend.reindex(idx).fillna(0.0) for s in SYMBOLS}
  split={s:raw[s].split.reindex(idx).fillna(0.0) for s in SYMBOLS}
  f=pd.read_csv('https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXUSEU')
@@ -75,7 +74,7 @@ def run():
      if add_qty>0:
       qty+=add_qty; lots.append(Lot(add_qty,add_qty*p/float(fx.loc[ts]),ts))
     sleeve.append(eur_cash+qty*float(frame.loc[ts,s])/float(fx.loc[ts]))
-   ts=dates[-1]; p1=float(frame.loc[ts,s]); f1=float(fx.loc[ts]); disposal=qty*p1/f1
+   ts=dates[-1]; p1=float(frame.loc[ts,s]); f1=float(fx.loc[ts])
    cgt=0.0
    for lot in lots:
     lot_value=lot.qty*p1/f1; gain=lot_value-lot.basis_eur
