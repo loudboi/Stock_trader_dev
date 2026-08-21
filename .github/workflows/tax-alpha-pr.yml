@@ -33,4 +33,5 @@ jobs:
       - name: Run tax-aware search
         env:
           PYTHONUNBUFFERED: '1'
+          PYTHONPATH: .
         run: python research/tax_alpha_search.py
