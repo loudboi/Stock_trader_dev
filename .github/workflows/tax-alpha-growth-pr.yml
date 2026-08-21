@@ -1,0 +1,37 @@
+name: Tax Alpha Growth PR
+
+on:
+  pull_request:
+    branches: [agent/profitability-research]
+    paths:
+      - alpaca-bot/research/tax_alpha_growth.py
+      - .github/workflows/tax-alpha-growth-pr.yml
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: alpaca-bot
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run growth/trend tax search
+        env:
+          PYTHONUNBUFFERED: '1'
+          PYTHONPATH: .
+        run: python research/tax_alpha_growth.py
