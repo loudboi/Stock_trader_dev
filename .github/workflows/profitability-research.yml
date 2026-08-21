@@ -1,0 +1,178 @@
+name: Profitability Research
+
+on:
+  push:
+    branches: [agent/profitability-research]
+    paths:
+      - .github/workflows/profitability-research.yml
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: alpaca-bot
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/profitability-research
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run robustness and held-out study
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python - <<'PY'
+          from dataclasses import replace
+          from itertools import product
+          import numpy as np
+          import pandas as pd
+
+          import bot.backtest_pullback as bt
+          from bot.backtest_pullback import compute_metrics, fetch_all, run_combined
+          from bot.data import clean_daily_data
+          from bot.strategies.trend_pullback import PullbackParams
+
+          SYMBOLS = ["SPY", "QQQ", "GLD", "TLT"]
+          FETCH_START = pd.Timestamp("2005-01-01", tz="UTC")
+          END = pd.Timestamp("2026-08-20", tz="UTC")
+          DEV_WINDOWS = [
+              (pd.Timestamp("2006-01-01", tz="UTC"), pd.Timestamp("2009-12-31", tz="UTC")),
+              (pd.Timestamp("2010-01-01", tz="UTC"), pd.Timestamp("2014-12-31", tz="UTC")),
+              (pd.Timestamp("2015-01-01", tz="UTC"), pd.Timestamp("2019-12-31", tz="UTC")),
+              (pd.Timestamp("2020-01-01", tz="UTC"), pd.Timestamp("2024-12-31", tz="UTC")),
+          ]
+          HOLDOUT = (pd.Timestamp("2025-01-01", tz="UTC"), END)
+
+          daily, _, intraday = fetch_all(SYMBOLS, "none", FETCH_START, END, source="yahoo")
+          if set(daily) != set(SYMBOLS):
+              raise RuntimeError(f"Missing Yahoo data: expected {SYMBOLS}, got {sorted(daily)}")
+          daily = clean_daily_data(daily)
+          print("DATA")
+          for s in SYMBOLS:
+              df = daily[s]
+              print(s, df.index.min(), df.index.max(), len(df),
+                    "suspect=", len(df.attrs.get("suspect_timestamps", [])),
+                    "quarantined=", len(df.attrs.get("quarantined_timestamps", [])))
+
+          def run_case(params, start, end, slippage=0.0005, subset=None):
+              bt.SLIPPAGE = slippage
+              names = SYMBOLS if subset is None else list(subset)
+              sliced = {n: daily[n][daily[n].index <= end] for n in names}
+              trades, eq = run_combined(sliced, {}, params, False, begin_ts=start)
+              m = compute_metrics(trades, eq)
+              if len(eq) and eq.attrs.get("initial_equity", 0) > 0:
+                  years = max((eq.index[-1] - eq.index[0]).total_seconds() / (365.2425 * 86400), 1/365.2425)
+                  m["cagr"] = (eq.iloc[-1] / eq.attrs["initial_equity"]) ** (1 / years) - 1
+              else:
+                  m["cagr"] = 0.0
+              return m
+
+          def benchmark(start, end):
+              frames = []
+              for s in SYMBOLS:
+                  r = daily[s]["close"].loc[start:end].pct_change(fill_method=None).rename(s)
+                  frames.append(r)
+              rets = pd.concat(frames, axis=1).dropna(how="any").mean(axis=1)
+              eq = 100000.0 * (1.0 + rets).cumprod()
+              eq.attrs["initial_equity"] = 100000.0
+              m = compute_metrics([], eq)
+              years = max((eq.index[-1] - eq.index[0]).total_seconds() / (365.2425 * 86400), 1/365.2425)
+              m["cagr"] = (eq.iloc[-1] / 100000.0) ** (1 / years) - 1
+              return m
+
+          base = PullbackParams()
+          combos = []
+          for ema, add_step, atr_mult, touch_band, vol_contract in product(
+                  [False, True], [0.02, 0.03, 0.04], [1.5, 2.0, 2.5], [0.015, 0.02], [0.80, 0.90]):
+              p = replace(base, use_ema=ema, add_step=add_step, atr_mult=atr_mult,
+                          touch_band=touch_band, vol_contraction=vol_contract)
+              seg = [run_case(p, a, b) for a, b in DEV_WINDOWS]
+              sharpes = [m["sharpe"] for m in seg]
+              cagrs = [m["cagr"] for m in seg]
+              returns = [m["total_return"] for m in seg]
+              dds = [m["max_drawdown"] for m in seg]
+              combos.append({
+                  "params": p,
+                  "positive": sum(s > 0 for s in sharpes),
+                  "min_sharpe": min(sharpes),
+                  "median_sharpe": float(np.median(sharpes)),
+                  "mean_sharpe": float(np.mean(sharpes)),
+                  "median_cagr": float(np.median(cagrs)),
+                  "worst_return": min(returns),
+                  "worst_dd": min(dds),
+                  "trades": sum(m["trades"] for m in seg),
+                  "segments": seg,
+              })
+
+          combos.sort(key=lambda r: (r["positive"], r["min_sharpe"], r["median_sharpe"],
+                                     r["median_cagr"]), reverse=True)
+
+          def label(p):
+              return (f"{'EMA' if p.use_ema else 'SMA'} add={p.add_step:.2f} atr={p.atr_mult:.1f} "
+                      f"band={p.touch_band:.3f} vol={p.vol_contraction:.2f}")
+
+          print("\nDEVELOPMENT ROBUSTNESS 2006-2024 (holdout unseen during ranking)")
+          for i, r in enumerate(combos[:12], 1):
+              print(f"{i:02d} {label(r['params'])} pos={r['positive']}/4 "
+                    f"minS={r['min_sharpe']:.2f} medS={r['median_sharpe']:.2f} "
+                    f"meanS={r['mean_sharpe']:.2f} medCAGR={r['median_cagr']:.2%} "
+                    f"worstRet={r['worst_return']:.2%} worstDD={r['worst_dd']:.2%} trades={r['trades']}")
+
+          candidates = []
+          seen = set()
+          for p in [base, replace(base, use_ema=True)] + [r["params"] for r in combos[:8]]:
+              key = (p.use_ema, p.add_step, p.atr_mult, p.touch_band, p.vol_contraction)
+              if key not in seen:
+                  seen.add(key)
+                  candidates.append(p)
+
+          print("\nHELD-OUT 2025-01-01 -> 2026-08-20 @ 5 bps/fill")
+          holdout_rows = []
+          for p in candidates:
+              m = run_case(p, *HOLDOUT, slippage=0.0005)
+              holdout_rows.append((p, m))
+              print(f"{label(p)} Sharpe={m['sharpe']:.2f} CAGR={m['cagr']:.2%} "
+                    f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%} "
+                    f"PF={m['profit_factor']:.2f} Trades={m['trades']}")
+
+          bh = benchmark(*HOLDOUT)
+          print(f"BENCHMARK equal-weight B&H Sharpe={bh['sharpe']:.2f} CAGR={bh['cagr']:.2%} "
+                f"Return={bh['total_return']:.2%} DD={bh['max_drawdown']:.2%}")
+
+          # Stress the best three candidates by held-out Sharpe without changing parameters.
+          holdout_rows.sort(key=lambda item: item[1]["sharpe"], reverse=True)
+          print("\nHELD-OUT COST STRESS")
+          for p, _ in holdout_rows[:3]:
+              for slip in (0.0005, 0.0010, 0.0020):
+                  m = run_case(p, *HOLDOUT, slippage=slip)
+                  print(f"{label(p)} slip={slip*10000:.0f}bp Sharpe={m['sharpe']:.2f} "
+                        f"CAGR={m['cagr']:.2%} Return={m['total_return']:.2%} "
+                        f"DD={m['max_drawdown']:.2%} Trades={m['trades']}")
+
+          best = holdout_rows[0][0]
+          print("\nBEST-CANDIDATE HELD-OUT CONTRIBUTION BY SYMBOL")
+          for s in SYMBOLS:
+              m = run_case(best, *HOLDOUT, slippage=0.0010, subset=[s])
+              print(f"{s} Sharpe={m['sharpe']:.2f} CAGR={m['cagr']:.2%} "
+                    f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%} Trades={m['trades']}")
+
+          # A pre-holdout benchmark helps distinguish 'profitable' from a generally rising market.
+          dev_bh = benchmark(pd.Timestamp("2006-01-01", tz="UTC"), pd.Timestamp("2024-12-31", tz="UTC"))
+          print("\nDEVELOPMENT BENCHMARK")
+          print(f"equal-weight B&H Sharpe={dev_bh['sharpe']:.2f} CAGR={dev_bh['cagr']:.2%} "
+                f"Return={dev_bh['total_return']:.2%} DD={dev_bh['max_drawdown']:.2%}")
+          PY
