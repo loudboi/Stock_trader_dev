@@ -5,6 +5,10 @@ on:
     branches: [agent/profitability-research]
     paths:
       - .github/workflows/profitability-research.yml
+  pull_request:
+    branches: [agent/fix-repo-audit]
+    paths:
+      - .github/workflows/profitability-research.yml
 
 permissions:
   contents: read
@@ -153,7 +157,6 @@ jobs:
           print(f"BENCHMARK equal-weight B&H Sharpe={bh['sharpe']:.2f} CAGR={bh['cagr']:.2%} "
                 f"Return={bh['total_return']:.2%} DD={bh['max_drawdown']:.2%}")
 
-          # Stress the best three candidates by held-out Sharpe without changing parameters.
           holdout_rows.sort(key=lambda item: item[1]["sharpe"], reverse=True)
           print("\nHELD-OUT COST STRESS")
           for p, _ in holdout_rows[:3]:
@@ -170,7 +173,6 @@ jobs:
               print(f"{s} Sharpe={m['sharpe']:.2f} CAGR={m['cagr']:.2%} "
                     f"Return={m['total_return']:.2%} DD={m['max_drawdown']:.2%} Trades={m['trades']}")
 
-          # A pre-holdout benchmark helps distinguish 'profitable' from a generally rising market.
           dev_bh = benchmark(pd.Timestamp("2006-01-01", tz="UTC"), pd.Timestamp("2024-12-31", tz="UTC"))
           print("\nDEVELOPMENT BENCHMARK")
           print(f"equal-weight B&H Sharpe={dev_bh['sharpe']:.2f} CAGR={dev_bh['cagr']:.2%} "
