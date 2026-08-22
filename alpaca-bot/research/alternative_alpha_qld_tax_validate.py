@@ -45,8 +45,9 @@ def _symbol(symbol: str) -> pd.DataFrame:
     close = pd.to_numeric(d["Close"], errors="coerce")
     adj = pd.to_numeric(d["Adj Close"], errors="coerce") if "Adj Close" in d else close
     div = pd.to_numeric(d.get("Dividends", 0.0), errors="coerce").fillna(0.0)
-    split = pd.to_numeric(d.get("Stock Splits", 0.0), errors="coerce").fillna(0.0)
-    return pd.DataFrame({"close": close, "adj": adj, "div": div, "split": split}).dropna()
+    # Yahoo historical Close is already split-adjusted. Do NOT also multiply share
+    # quantities by Stock Splits; doing so double-counts QLD's split history.
+    return pd.DataFrame({"close": close, "adj": adj, "div": div}).dropna()
 
 
 def _fred_fx(index: pd.Index) -> pd.Series:
@@ -67,27 +68,25 @@ def load_market():
     close = pd.DataFrame({s: raw[s]["close"].reindex(idx).ffill() for s in raw})
     adj = pd.DataFrame({s: raw[s]["adj"].reindex(idx).ffill() for s in raw})
     divs = {s: raw[s]["div"].reindex(idx).fillna(0.0) for s in raw}
-    splits = {s: raw[s]["split"].reindex(idx).fillna(0.0) for s in raw}
     fx = _fred_fx(idx)
 
-    start = idx[idx >= BEGIN][0]
+    begin = idx[idx >= BEGIN][0]
     end = idx[idx <= FINISH][-1]
-    if close.loc[start:end, ["QQQ", "QLD"]].isna().any().any():
+    if close.loc[begin:end, ["QQQ", "QLD"]].isna().any().any():
         raise RuntimeError("missing QQQ/QLD development prices")
 
     q = adj["QQQ"]
     prior = q.shift(1)
     momentum = q.shift(1) / q.shift(1 + LOOKBACK) - 1.0
     ma = q.shift(1).rolling(MA_WINDOW, min_periods=MA_WINDOW).mean()
-    month = pd.Series(idx.tz_localize(None).to_period("M"), index=idx)
-    first = month.ne(month.shift(1))
+    months = pd.Series(idx.tz_localize(None).to_period("M"), index=idx)
     events = {}
-    for ts in idx[first]:
-        if ts < start or ts > end:
+    for ts in idx[months.ne(months.shift(1))]:
+        if ts < begin or ts > end:
             continue
         if np.isfinite(momentum.loc[ts]) and np.isfinite(ma.loc[ts]):
             events[ts] = "QLD" if (float(momentum.loc[ts]) > 0.0 and float(prior.loc[ts]) > float(ma.loc[ts])) else "QQQ"
-    return idx, close, adj, divs, splits, fx, events, start, end
+    return idx, close, adj, divs, fx, events, begin, end
 
 
 def metrics(path: pd.Series) -> dict[str, float]:
@@ -130,7 +129,7 @@ def _tax_on_sale(lots: deque[Lot], qty: float, price: float, fx: float, ts: pd.T
 
 
 def simulate_rotation(data, switch_cost: float = TRADING_COST):
-    idx, close, _, divs, splits, fx, events, begin, end = data
+    idx, close, _, divs, fx, events, begin, end = data
     dates = idx[(idx >= begin) & (idx <= end)]
     fx0 = float(fx.loc[dates[0]])
     cash = INITIAL_EUR * fx0
@@ -140,13 +139,7 @@ def simulate_rotation(data, switch_cost: float = TRADING_COST):
     cgt = divtax = traded = gains = losses = 0.0
     switches = buys = sells = 0
     rows = []
-
-    current_choice = events.get(dates[0], "QQQ")
-    for event_date in sorted(events):
-        if event_date <= dates[0]:
-            current_choice = events[event_date]
-        else:
-            break
+    choice = events.get(dates[0], "QQQ")
 
     def price(symbol: str, ts: pd.Timestamp) -> float:
         return float(close.loc[ts, symbol])
@@ -157,27 +150,28 @@ def simulate_rotation(data, switch_cost: float = TRADING_COST):
     def buy_all(symbol: str, ts: pd.Timestamp, charge_cost: bool = True):
         nonlocal cash, held, qty, traded, buys
         p = price(symbol, ts)
-        divisor = p * (1.0 + switch_cost) if charge_cost else p
-        add = cash / divisor if divisor > 0 else 0.0
+        fee = switch_cost if charge_cost else 0.0
+        add = cash / (p * (1.0 + fee))
         if add <= 0:
             return
         notional = add * p
+        cash -= notional * (1.0 + fee)
         if charge_cost:
             traded += notional
-        cash -= notional * (1.0 + (switch_cost if charge_cost else 0.0))
         lots.append(Lot(add, p / float(fx.loc[ts]), ts))
         held = symbol
-        qty += add
+        qty = add
         buys += 1
 
     def sell_all(ts: pd.Timestamp, charge_cost: bool = True):
         nonlocal cash, held, qty, cgt, traded, sells, gains, losses
-        if not held or qty <= 0:
+        if held is None or qty <= 0:
             return
         p = price(held, ts)
         local_tax, local_gains, local_losses = _tax_on_sale(lots, qty, p, float(fx.loc[ts]), ts)
         notional = qty * p
-        cash += notional * (1.0 - (switch_cost if charge_cost else 0.0)) - local_tax * float(fx.loc[ts])
+        fee = switch_cost if charge_cost else 0.0
+        cash += notional * (1.0 - fee) - local_tax * float(fx.loc[ts])
         if charge_cost:
             traded += notional
         cgt += local_tax
@@ -188,14 +182,7 @@ def simulate_rotation(data, switch_cost: float = TRADING_COST):
         sells += 1
 
     for j, ts in enumerate(dates):
-        if held:
-            ratio = float(splits[held].loc[ts])
-            if ratio > 0 and abs(ratio - 1.0) > 1e-12:
-                qty *= ratio
-                for lot in lots:
-                    lot.qty *= ratio
-                    lot.basis_eur_per_share /= ratio
-
+        if held is not None:
             dv = float(divs[held].loc[ts])
             if dv > 0 and qty > 0:
                 gross = qty * dv
@@ -203,29 +190,34 @@ def simulate_rotation(data, switch_cost: float = TRADING_COST):
                 net_usd = gross - tax_eur * float(fx.loc[ts])
                 divtax += tax_eur
                 p = price(held, ts)
-                add = net_usd / p
+                add = net_usd / p  # zero-cost automatic reinvestment, same convention as passive
                 qty += add
                 lots.append(Lot(add, p / float(fx.loc[ts]), ts))
 
-        desired = current_choice
         if ts in events:
-            desired = events[ts]
-            current_choice = desired
+            choice = events[ts]
 
+        switched = False
         if j == 0:
-            buy_all(desired, ts, charge_cost=True)
-        elif desired != held:
+            buy_all(choice, ts, charge_cost=True)
+        elif choice != held:
             sell_all(ts, charge_cost=True)
-            buy_all(desired, ts, charge_cost=True)
+            buy_all(choice, ts, charge_cost=True)
             switches += 1
+            switched = True
 
-        nav_eur = nav_usd(ts) / float(fx.loc[ts])
-        rows.append({"date": ts, "nav_eur": nav_eur, "held": held, "switch": bool(j and ts in events and desired == held and rows[-1]["held"] != held) if rows else False})
+        rows.append(
+            {
+                "date": ts,
+                "nav_eur": nav_usd(ts) / float(fx.loc[ts]),
+                "held": held,
+                "switch": switched,
+            }
+        )
 
-    # Terminal liquidation is an evaluation event: apply tax but no artificial trading cost.
+    # Terminal liquidation is an evaluation event: apply tax but no artificial transaction cost.
     sell_all(dates[-1], charge_cost=False)
-    final_eur = cash / float(fx.loc[dates[-1]])
-    rows[-1]["nav_eur"] = final_eur
+    rows[-1]["nav_eur"] = cash / float(fx.loc[dates[-1]])
     frame = pd.DataFrame(rows).set_index("date")
     return {
         "path": frame.nav_eur.astype(float),
@@ -243,7 +235,7 @@ def simulate_rotation(data, switch_cost: float = TRADING_COST):
 
 
 def simulate_passive(data, symbol: str):
-    idx, close, _, divs, splits, fx, _, begin, end = data
+    idx, close, _, divs, fx, _, begin, end = data
     dates = idx[(idx >= begin) & (idx <= end)]
     fx0 = float(fx.loc[dates[0]])
     p0 = float(close.loc[dates[0], symbol])
@@ -253,20 +245,15 @@ def simulate_passive(data, symbol: str):
     path = []
 
     for ts in dates:
-        ratio = float(splits[symbol].loc[ts])
-        if ratio > 0 and abs(ratio - 1.0) > 1e-12:
-            qty *= ratio
-            for lot in lots:
-                lot.qty *= ratio
-                lot.basis_eur_per_share /= ratio
         dv = float(divs[symbol].loc[ts])
         if dv > 0:
             gross = qty * dv
             tax_eur = gross / float(fx.loc[ts]) * DIVIDEND_TAX
             divtax += tax_eur
-            add = (gross - tax_eur * float(fx.loc[ts])) / float(close.loc[ts, symbol])
+            p = float(close.loc[ts, symbol])
+            add = (gross - tax_eur * float(fx.loc[ts])) / p
             qty += add
-            lots.append(Lot(add, float(close.loc[ts, symbol]) / float(fx.loc[ts]), ts))
+            lots.append(Lot(add, p / float(fx.loc[ts]), ts))
         path.append(qty * float(close.loc[ts, symbol]) / float(fx.loc[ts]))
 
     ts = dates[-1]
@@ -284,7 +271,7 @@ def simulate_passive(data, symbol: str):
 
 
 def adjusted_attribution(data):
-    idx, _, adj, _, _, _, events, begin, end = data
+    idx, _, adj, _, _, events, begin, end = data
     dates = idx[(idx >= begin) & (idx <= end)]
     qret = adj.loc[dates, "QQQ"].pct_change(fill_method=None).fillna(0.0)
     lret = adj.loc[dates, "QLD"].pct_change(fill_method=None).fillna(0.0)
@@ -295,10 +282,10 @@ def adjusted_attribution(data):
             choice = events[ts]
         state.loc[ts] = 1.0 if choice == "QLD" else 0.0
     w = float(state.mean())
-    matched_ret = (1.0 - w) * qret + w * lret
-    matched_path = (1.0 + matched_ret).cumprod() * INITIAL_EUR
     strategy_ret = (1.0 - state) * qret + state * lret
+    matched_ret = (1.0 - w) * qret + w * lret
     strategy_path = (1.0 + strategy_ret).cumprod() * INITIAL_EUR
+    matched_path = (1.0 + matched_ret).cumprod() * INITIAL_EUR
     return {
         "qld_day_fraction": w,
         "costless_rotation_metrics": metrics(strategy_path),
@@ -316,9 +303,10 @@ def show(label: str, result: dict):
 
 def main():
     data = load_market()
-    _, _, _, _, _, _, events, begin, end = data
-    print(f"FROZEN_RULE QLD if QQQ 126-session momentum>0 and QQQ>200-session MA; else QQQ")
+    _, _, _, _, _, events, begin, end = data
+    print("FROZEN_RULE QLD if QQQ 126-session momentum>0 and QQQ>200-session MA; else QQQ")
     print(f"CONTINUOUS_DEVELOPMENT_ONLY {begin.date()}..{end.date()} holdoutLoaded=false events={len(events)}")
+    print("PRICE_CONVENTION Yahoo historical Close is split-adjusted; split actions are not applied to quantities")
 
     active = simulate_rotation(data, TRADING_COST)
     qqq = simulate_passive(data, "QQQ")
@@ -337,10 +325,10 @@ def main():
     )
 
     attr = adjusted_attribution(data)
-    print("\nLEVERAGE / TIMING ATTRIBUTION — adjusted USD, costless diagnostic")
-    print(f"QLD day fraction={attr['qld_day_fraction']:.4%}")
     am = attr["costless_rotation_metrics"]
     mm = attr["costless_static_mix_metrics"]
+    print("\nLEVERAGE / TIMING ATTRIBUTION — adjusted USD, costless diagnostic")
+    print(f"QLD day fraction={attr['qld_day_fraction']:.4%}")
     print(f"ROTATION CAGR={am['cagr']:.4%} vol={am['ann_vol']:.4%} DD={am['max_dd']:.4%}")
     print(f"STATIC_MIX CAGR={mm['cagr']:.4%} vol={mm['ann_vol']:.4%} DD={mm['max_dd']:.4%}")
     print(f"TIMING_RESIDUAL_CAGR={am['cagr']-mm['cagr']:+.4%}")
@@ -358,6 +346,7 @@ def main():
         "start": str(begin.date()),
         "end": str(end.date()),
         "holdout_loaded": False,
+        "price_convention": "Yahoo historical Close split-adjusted; split actions not reapplied",
         "rule": {"lookback": LOOKBACK, "ma_window": MA_WINDOW},
         "active": active["metrics"],
         "qqq": qqq["metrics"],
