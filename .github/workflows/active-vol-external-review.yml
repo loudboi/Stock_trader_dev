@@ -20,6 +20,7 @@ jobs:
     defaults:
       run:
         working-directory: alpaca-bot
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,15 +35,22 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt -r requirements-backtest.txt
       - name: Run continuous external-review validation
-        run: python research/active_vol_managed_external_review.py | tee external_review_results.txt
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/active_vol_managed_external_review.py | tee external_review_results.txt
       - name: Verify frozen target engine parity
-        run: python research/active_vol_target_parity_review.py | tee external_review_target_parity.txt
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/active_vol_target_parity_review.py | tee external_review_target_parity.txt
       - name: Run crisis round-trip and drifted-margin attribution
-        run: python research/active_vol_roundtrip_attribution.py | tee external_review_roundtrip_results.txt
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/active_vol_roundtrip_attribution.py | tee external_review_roundtrip_results.txt
       - name: Upload review artifacts
         uses: actions/upload-artifact@v4
         with:
           name: active-vol-external-review
+          if-no-files-found: error
           path: |
             alpaca-bot/external_review_results.txt
             alpaca-bot/external_review_active_exposure.csv
@@ -55,6 +63,7 @@ jobs:
         if: github.event_name == 'push'
         working-directory: .
         run: |
+          set -euo pipefail
           mkdir -p external-review-results
           cp alpaca-bot/external_review_results.txt external-review-results/results.txt
           cp alpaca-bot/external_review_active_exposure.csv external-review-results/active_exposure.csv
