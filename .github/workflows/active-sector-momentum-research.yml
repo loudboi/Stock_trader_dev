@@ -1,0 +1,35 @@
+name: Active Sector Momentum Research
+
+on:
+  pull_request:
+    branches:
+      - agent/tax-alpha-research
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install research dependencies
+        working-directory: alpaca-bot
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run active sector momentum search
+        working-directory: alpaca-bot
+        env:
+          PYTHONUNBUFFERED: '1'
+          PYTHONPATH: .
+        run: python research/active_sector_momentum_search.py
