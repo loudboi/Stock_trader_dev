@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/active-alpha-external-review
+  pull_request:
+    branches:
+      - agent/active-alpha-research
   workflow_dispatch:
 
 jobs:
