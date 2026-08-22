@@ -1,0 +1,45 @@
+name: Alternative alpha QLD risk-matched benchmark
+
+on:
+  push:
+    branches:
+      - agent/alternative-alpha-research
+  pull_request:
+    branches:
+      - agent/tax-alpha-research
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: alpaca-bot
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run passive risk-matched benchmark
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/alternative_alpha_qld_risk_matched_benchmark.py | tee alternative_alpha_qld_risk_match_results.txt
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alternative-alpha-qld-risk-match
+          if-no-files-found: error
+          path: |
+            alpaca-bot/alternative_alpha_qld_risk_match_results.txt
+            alpaca-bot/alternative_alpha_qld_risk_match_summary.json
