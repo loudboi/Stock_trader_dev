@@ -1,0 +1,46 @@
+name: Alternative alpha panic reversal tax validation
+
+on:
+  push:
+    branches:
+      - agent/alternative-alpha-research
+  pull_request:
+    branches:
+      - agent/tax-alpha-research
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: alpaca-bot
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run frozen panic reversal validation
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python research/alternative_alpha_panic_tax_validate.py | tee alternative_alpha_panic_results.txt
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alternative-alpha-panic-tax
+          if-no-files-found: error
+          path: |
+            alpaca-bot/alternative_alpha_panic_results.txt
+            alpaca-bot/alternative_alpha_panic_path.csv
+            alpaca-bot/alternative_alpha_panic_summary.json

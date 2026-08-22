@@ -1,0 +1,46 @@
+name: Alternative alpha family screen
+
+on:
+  push:
+    branches:
+      - agent/alternative-alpha-research
+  pull_request:
+    branches:
+      - agent/tax-alpha-research
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: alpaca-bot
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            alpaca-bot/requirements.txt
+            alpaca-bot/requirements-backtest.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-backtest.txt
+      - name: Run preregistered family screen
+        run: |
+          set -o pipefail
+          python research/alternative_alpha_family_screen.py | tee alternative_alpha_family_screen.txt
+      - name: Upload screen artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alternative-alpha-family-screen
+          if-no-files-found: error
+          path: |
+            alpaca-bot/alternative_alpha_family_screen.txt
+            alpaca-bot/alternative_alpha_family_screen.csv
+            alpaca-bot/alternative_alpha_family_screen.json
