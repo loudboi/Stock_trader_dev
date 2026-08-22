@@ -1,9 +1,9 @@
 REALIZED-EXPOSURE-MATCHED CONTROL
-activeMeanRealizedGross=1.380307 constantTarget=1.454000 controlMeanRealizedGross=1.380475 mismatch=+0.000169
+activeMeanRealizedGross=1.380307 constantTarget=1.454000 controlMeanRealizedGross=1.380475 mismatch=+0.000168
 activeCAGR=15.1989% matchedCAGR=19.3367% timingResidualCAGR=-4.1378%
 
 REALIZED GROSS EXPOSURE BY REGIME
-2006-2009 mean=1.2550 median=1.3036 min=0.4533 max=1.8295
+2006-2009 mean=1.2550 median=1.3036 min=0.4533 max=1.8296
 2010-2014 mean=1.5068 median=1.6053 min=0.5040 max=1.8850
 2015-2019 mean=1.5017 median=1.6744 min=0.7277 max=1.9129
 2020-2024 mean=1.2377 median=1.2258 min=0.5004 max=1.8262
@@ -20,8 +20,8 @@ COVID_ROUNDTRIP logTimingResidual crash=+0.06783 rebound=-0.41610 sum=-0.34828
 
 DRIFTED EXPOSURE / DAILY-LOW MARGIN DIAGNOSTIC
 fullPathMaxPreTradeCloseExposure=1.9129x on 2015-08-25
-2020-02-19 preCloseExp=1.5170 postCloseExp=1.5170 target=1.7500 debtUSD=432183.68
-2020-02-28 preCloseExp=1.6466 postCloseExp=1.6466 target=1.7500 debtUSD=432442.82
+2020-02-19 preCloseExp=1.5170 postCloseExp=1.5170 target=1.7500 debtUSD=432182.58
+2020-02-28 preCloseExp=1.6466 postCloseExp=1.6466 target=1.7500 debtUSD=432441.72
 2020-03-02 preCloseExp=1.5960 postCloseExp=0.8838 target=0.8569 debtUSD=0.00
 2020-03-23 preCloseExp=0.8558 postCloseExp=0.8558 target=0.8569 debtUSD=0.00
 GFC minMarginAtDailyLow=61.19% on 2007-10-04 maxGrossAtLow=1.634x breachDays30/35/40/50=0/0/0/0
