@@ -1,0 +1,147 @@
+{
+  "active_realized_mean_gross_exposure": 1.3803067606193993,
+  "matched_constant_target": 1.4540000000000002,
+  "matched_realized_mean_gross_exposure": 1.380475491646719,
+  "active_cagr": 0.15198885886609248,
+  "matched_cagr": 0.19336684034157336,
+  "timing_residual_cagr": -0.041377981475480885,
+  "regime_exposure": [
+    {
+      "label": "2006-2009",
+      "mean": 1.2550421303449095,
+      "median": 1.3036228934836807,
+      "min": 0.45329820943688665,
+      "max": 1.8295070726607325
+    },
+    {
+      "label": "2010-2014",
+      "mean": 1.5067897615677115,
+      "median": 1.6053235171025784,
+      "min": 0.5039670949685909,
+      "max": 1.8850005768716425
+    },
+    {
+      "label": "2015-2019",
+      "mean": 1.5016677708072186,
+      "median": 1.674447972141268,
+      "min": 0.7276981985157909,
+      "max": 1.9128948449160743
+    },
+    {
+      "label": "2020-2024",
+      "mean": 1.2377073402588634,
+      "median": 1.2258243370039286,
+      "min": 0.5003641788487514,
+      "max": 1.826246626050998
+    },
+    {
+      "label": "2025-2026-burned",
+      "mean": 1.3650103975160068,
+      "median": 1.3748717108422595,
+      "min": 0.501275493402882,
+      "max": 1.7925243173607621
+    }
+  ],
+  "apr_dec_2020_exposure": {
+    "mean": 0.9336906195371959,
+    "median": 0.9273859758503316,
+    "min": 0.5003641788487514,
+    "max": 1.5814714550694238
+  },
+  "event_attribution": [
+    {
+      "label": "GFC_CRASH",
+      "start": "2007-10-31",
+      "end": "2009-03-09",
+      "active_return": -0.42744418086612324,
+      "matched_return": -0.6451504541496962,
+      "qqq_return": -0.462591001271906,
+      "active_minus_matched_return_pp": 0.21770627328357295,
+      "active_minus_qqq_return_pp": 0.035146820405782764,
+      "log_timing_residual": 0.4784163462115619,
+      "active_mean_exposure": 0.8828773837240538,
+      "active_max_exposure": 1.5704855738165742,
+      "matched_mean_exposure": 1.487811128258708
+    },
+    {
+      "label": "GFC_REBOUND",
+      "start": "2009-03-09",
+      "end": "2009-12-31",
+      "active_return": 0.586000723829049,
+      "matched_return": 1.0254765914240216,
+      "qqq_return": 0.5735378385579115,
+      "active_minus_matched_return_pp": -0.4394758675949726,
+      "active_minus_qqq_return_pp": 0.01246288527113748,
+      "log_timing_residual": -0.24458944705769442,
+      "active_mean_exposure": 1.1920738137832574,
+      "active_max_exposure": 1.6682634536824612,
+      "matched_mean_exposure": 1.376618863943204
+    },
+    {
+      "label": "COVID_CRASH",
+      "start": "2020-02-19",
+      "end": "2020-03-23",
+      "active_return": -0.31327033401990534,
+      "matched_return": -0.3583043103619279,
+      "qqq_return": -0.2772734055818722,
+      "active_minus_matched_return_pp": 0.04503397634202255,
+      "active_minus_qqq_return_pp": -0.03599692843803315,
+      "log_timing_residual": 0.06782652784432142,
+      "active_mean_exposure": 1.1070352425520502,
+      "active_max_exposure": 1.6473067027743067,
+      "matched_mean_exposure": 1.3628356494009513
+    },
+    {
+      "label": "COVID_REBOUND",
+      "start": "2020-03-23",
+      "end": "2020-12-31",
+      "active_return": 0.3238319682098252,
+      "matched_return": 1.0069861200453691,
+      "qqq_return": 0.6236172645459617,
+      "active_minus_matched_return_pp": -0.683154151835544,
+      "active_minus_qqq_return_pp": -0.2997852963361365,
+      "log_timing_residual": -0.4161036167856245,
+      "active_mean_exposure": 0.9312823549252521,
+      "active_max_exposure": 1.5814714550694238,
+      "matched_mean_exposure": 1.3649798923669363
+    }
+  ],
+  "margin_windows": [
+    {
+      "name": "GFC",
+      "min_margin_ratio": 0.6119195296886758,
+      "date": "2007-10-04",
+      "max_gross_at_low": 1.63420180511115,
+      "breach_days": {
+        "30": 0,
+        "35": 0,
+        "40": 0,
+        "50": 0
+      }
+    },
+    {
+      "name": "COVID",
+      "min_margin_ratio": 0.5922044504608426,
+      "date": "2020-02-28",
+      "max_gross_at_low": 1.6886060197991055,
+      "breach_days": {
+        "30": 0,
+        "35": 0,
+        "40": 0,
+        "50": 0
+      }
+    },
+    {
+      "name": "FULL",
+      "min_margin_ratio": 0.4476097266893652,
+      "date": "2015-08-24",
+      "max_gross_at_low": 2.2340890744181388,
+      "breach_days": {
+        "30": 0,
+        "35": 0,
+        "40": 0,
+        "50": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+CONTINUOUS dates=2006-01-03..2026-08-20
+TIMING decision-close D uses returns only through D-1; execution is next exchange session E
+
+CONTINUOUS FULL-PATH RESULTS — passive benchmarks have zero transaction cost
+ACTIVE CAGR=15.1989% vol=27.4306% Sharpe0=0.655 Sortino0=0.858 DD=-45.7987% betaQQQ=1.118 downsideCapture=1.000
+QQQ CAGR=15.5754% vol=22.6604% Sharpe0=0.754 Sortino0=1.009 DD=-46.4465%
+SPY CAGR=10.6713% vol=19.8820% Sharpe0=0.610 Sortino0=0.782 DD=-51.7375%
+ACTIVE CGT=692344.35 DivTax=24944.17 interestUSD=143411.36 turnover=286.381x trades=116 forced=0 realizedGainsEUR=2769377.42 realizedLossesEUR=61717.42
+QQQ CGT=23846.85 DivTax=18094.25 exemptTerminalGainEUR=1716096.23 taxableTerminalGainEUR=133934.54
+EXCESS active-vs-QQQ=-0.3765% active-vs-SPY=4.5276%
+
+MATCHED-LEVERAGE ATTRIBUTION CONTROL
+mean monthly target=1.393322
+CONST_MEAN_TARGET CAGR=18.7275% vol=30.2575% Sharpe0=0.720 Sortino0=0.954 DD=-62.4401% betaQQQ=1.323 downsideCapture=1.000
+TIMING_RESIDUAL_CAGR=-3.5286%
+
+VOLATILITY-MATCHED ATTRIBUTION CONTROL
+constant target=1.283424 activeAnnVol=27.4306%
+CONST_VOL_MATCH CAGR=16.2258% vol=27.7621% Sharpe0=0.682 Sortino0=0.895 DD=-60.2767% betaQQQ=1.215 downsideCapture=1.000
+RISK_MATCHED_CAGR_RESIDUAL=-1.0270%
+
+COVID TRACE
+2020-02-19 navEUR=774444.03 preExp=1.5170 postExp=1.5170 target=1.7500 eventTarget=nan trade=False debtUSD=432183.49
+2020-03-02 navEUR=630166.00 preExp=1.5960 postExp=0.8838 target=0.8569 eventTarget=0.8569 trade=True debtUSD=0.00
+2020-03-16 navEUR=510044.43 preExp=0.8561 postExp=0.8561 target=0.8569 eventTarget=nan trade=False debtUSD=0.00
+2020-03-23 navEUR=531834.06 preExp=0.8558 postExp=0.8558 target=0.8569 eventTarget=nan trade=False debtUSD=0.00
+2020_DD=-34.1406% trough=2020-03-16
+
+REBALANCE_COUNTS monthlyEvents=248 tradedEventsIncludingInitial=115 terminalLiquidationTrade=1
+
+CONTINUOUS COST/FINANCING SENSITIVITY — passive QQQ remains zero-cost
+cost=0.200% spread=1.500% CAGR=15.1989% exQQQ=-0.3765% DD=-45.7987%
+cost=0.400% spread=2.000% CAGR=14.3975% exQQQ=-1.1779% DD=-46.2918%
+cost=0.800% spread=3.000% CAGR=12.8012% exQQQ=-2.7742% DD=-47.2699%
+
+NOTES
+The final 32-grid is not the full adaptive hypothesis space of the project; no alpha significance claim is made here.
+Active CGT remains a conservative per-sale approximation: no same-year loss offsets or normalized expenses are credited.
+FRED DEXUSEU remains a research FX proxy, not the legally authoritative filing source.
+ARTIFACTS external_review_active_exposure.csv external_review_summary.json
