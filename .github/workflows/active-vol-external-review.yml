@@ -9,8 +9,12 @@ on:
       - agent/active-alpha-research
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   validate:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[review-results]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -18,6 +22,8 @@ jobs:
         working-directory: alpaca-bot
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || github.head_ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -37,3 +43,20 @@ jobs:
             alpaca-bot/external_review_results.txt
             alpaca-bot/external_review_active_exposure.csv
             alpaca-bot/external_review_summary.json
+      - name: Publish results on isolated review branch
+        if: github.event_name == 'push'
+        working-directory: .
+        run: |
+          mkdir -p external-review-results
+          cp alpaca-bot/external_review_results.txt external-review-results/results.txt
+          cp alpaca-bot/external_review_active_exposure.csv external-review-results/active_exposure.csv
+          cp alpaca-bot/external_review_summary.json external-review-results/summary.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add external-review-results
+          if git diff --cached --quiet; then
+            echo 'No result changes to publish.'
+            exit 0
+          fi
+          git commit -m 'Publish external review results [review-results]'
+          git push origin HEAD:agent/active-alpha-external-review
