@@ -1,0 +1,36 @@
+REALIZED-EXPOSURE-MATCHED CONTROL
+activeMeanRealizedGross=1.380307 constantTarget=1.454000 controlMeanRealizedGross=1.380475 mismatch=+0.000168
+activeCAGR=15.1989% matchedCAGR=19.3367% timingResidualCAGR=-4.1378%
+
+REALIZED GROSS EXPOSURE BY REGIME
+2006-2009 mean=1.2550 median=1.3036 min=0.4533 max=1.8296
+2010-2014 mean=1.5068 median=1.6053 min=0.5040 max=1.8850
+2015-2019 mean=1.5017 median=1.6744 min=0.7277 max=1.9129
+2020-2024 mean=1.2377 median=1.2258 min=0.5004 max=1.8262
+2025-2026-burned mean=1.3650 median=1.3749 min=0.5013 max=1.7925
+2020_APR_DEC mean=0.9337 median=0.9274 min=0.5004 max=1.5815
+
+CRASH / REBOUND ATTRIBUTION
+GFC_CRASH 2007-10-31..2009-03-09 active=-42.74% matched=-64.52% QQQ=-46.26% active-matched=+21.77% logResidual=+0.47842 meanExp(active/matched)=0.883/1.488 maxActiveExp=1.570
+GFC_REBOUND 2009-03-09..2009-12-31 active=58.60% matched=102.55% QQQ=57.35% active-matched=-43.95% logResidual=-0.24459 meanExp(active/matched)=1.192/1.377 maxActiveExp=1.668
+COVID_CRASH 2020-02-19..2020-03-23 active=-31.33% matched=-35.83% QQQ=-27.73% active-matched=+4.50% logResidual=+0.06783 meanExp(active/matched)=1.107/1.363 maxActiveExp=1.647
+COVID_REBOUND 2020-03-23..2020-12-31 active=32.38% matched=100.70% QQQ=62.36% active-matched=-68.32% logResidual=-0.41610 meanExp(active/matched)=0.931/1.365 maxActiveExp=1.581
+GFC_ROUNDTRIP logTimingResidual crash=+0.47842 rebound=-0.24459 sum=+0.23383
+COVID_ROUNDTRIP logTimingResidual crash=+0.06783 rebound=-0.41610 sum=-0.34828
+
+DRIFTED EXPOSURE / DAILY-LOW MARGIN DIAGNOSTIC
+fullPathMaxPreTradeCloseExposure=1.9129x on 2015-08-25
+2020-02-19 preCloseExp=1.5170 postCloseExp=1.5170 target=1.7500 debtUSD=432182.58
+2020-02-28 preCloseExp=1.6466 postCloseExp=1.6466 target=1.7500 debtUSD=432441.72
+2020-03-02 preCloseExp=1.5960 postCloseExp=0.8838 target=0.8569 debtUSD=0.00
+2020-03-23 preCloseExp=0.8558 postCloseExp=0.8558 target=0.8569 debtUSD=0.00
+GFC minMarginAtDailyLow=61.19% on 2007-10-04 maxGrossAtLow=1.634x breachDays30/35/40/50=0/0/0/0
+COVID minMarginAtDailyLow=59.22% on 2020-02-28 maxGrossAtLow=1.689x breachDays30/35/40/50=0/0/0/0
+FULL minMarginAtDailyLow=44.76% on 2015-08-24 maxGrossAtLow=2.234x breachDays30/35/40/50=0/0/0/1
+
+INTERPRETATION GUARDRAILS
+Event windows are hindsight-defined diagnostics and are not new selection or validation folds.
+The matched control is ex-post calibrated for attribution; it is not a proposed trading strategy.
+Daily-low margin ratios are stricter than close-only checks but do not reproduce broker house-margin rules or intraday path ordering.
+The 2025-2026 interval remains burned and is not used to change any parameter.
+ARTIFACTS external_review_margin_drift.csv external_review_roundtrip.json
