@@ -64,16 +64,16 @@ def run():
             if not np.isfinite(prev_ma) or prev_ma <= 0:
                 continue
             m12 = prev_px / float(panel[risk_asset].iloc[i - 1 - 252]) - 1.0
-            currently_on = state == "risk"
+            currently_on = state == risk_asset
             if currently_on:
                 risk_on = prev_px >= prev_ma * (1.0 - buffer)
             else:
                 risk_on = prev_px > prev_ma * (1.0 + buffer)
             if confirm12:
                 risk_on = risk_on and m12 > 0
-            new_state = "risk" if risk_on else fallback
+            new_state = risk_asset if risk_on else fallback
             if new_state != state:
-                events[ts] = (new_state, leverage if new_state == "risk" else 1.0)
+                events[ts] = (new_state, leverage if new_state == risk_asset else 1.0)
                 state = new_state
         return events
 
@@ -131,14 +131,13 @@ def run():
             name, lev = desired_state
             if name == "cash":
                 return
-            symbol = risk_asset if name == "risk" else name
+            symbol = name
             nav = cash
             if nav <= 0:
                 return
             gross = nav * lev
             px = float(panel.loc[ts, symbol])
-            fee_factor = 1.0 + cost
-            qty = gross / (px * fee_factor)
+            qty = gross / (px * (1.0 + cost))
             actual_notional = qty * px
             fee = actual_notional * cost
             borrow = max(0.0, actual_notional + fee - cash)
@@ -148,16 +147,10 @@ def run():
             traded += actual_notional
 
         def switch(ts, desired_state):
-            current_name = "cash" if pos.symbol is None else ("risk" if pos.symbol == risk_asset else pos.symbol)
-            current_lev = 1.0
-            if pos.symbol is not None:
-                mv = pos.qty * float(panel.loc[ts, pos.symbol])
-                nav = cash + mv - debt
-                current_lev = mv / nav if nav > 1e-12 else np.inf
+            current_name = "cash" if pos.symbol is None else pos.symbol
             target_name, target_lev = desired_state
-            same_regime = current_name == target_name
-            # Do not rebalance merely because leverage drifted; this reduces tax/turnover.
-            if same_regime:
+            if current_name == target_name:
+                # Do not rebalance merely because leverage drifted; this reduces tax/turnover.
                 return
             close_position(ts)
             open_state(ts, (target_name, target_lev))
@@ -219,7 +212,6 @@ def run():
 
     def benchmark(begin, end, symbol, cost=COST):
         first = panel.loc[begin:end].index[0]
-        # A single buy-and-hold state. No borrowing.
         return simulate({first: (symbol, 1.0)}, begin, end, cost=cost)
 
     benchmarks = {w: {s: benchmark(*w, s) for s in ("SPY", "QQQ")} for w in DEV + [HOLD]}
@@ -308,7 +300,6 @@ def run():
     print("\nWINNER COST / FINANCING STRESS")
     for c, spread in ((0.001, 0.010), (0.002, 0.015), (0.004, 0.020), (0.008, 0.030)):
         vals = [simulate(winner["events"], *w, cost=c, borrow_spread=spread) for w in DEV]
-        # Benchmark is stressed with the same trading cost but no financing.
         es = [m["cagr"] - benchmark(*w, "SPY", cost=c)["cagr"] for m, w in zip(vals, DEV)]
         hold = simulate(winner["events"], *HOLD, cost=c, borrow_spread=spread)
         hspy = benchmark(*HOLD, "SPY", cost=c)
