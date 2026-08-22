@@ -32,4 +32,6 @@ jobs:
         env:
           PYTHONUNBUFFERED: '1'
           PYTHONPATH: .
-        run: python research/active_vol_managed_hardening.py
+        run: |
+          sed -i 's/raw\[s\]\.div/raw[s]["div"]/g' research/active_vol_managed_hardening.py
+          python research/active_vol_managed_hardening.py
