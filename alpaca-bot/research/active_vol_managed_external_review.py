@@ -80,7 +80,7 @@ def load_market():
     idx = close.index.intersection(adj.index)
     close = close.loc[idx]
     adj = adj.loc[idx]
-    divs = {s: raw[s].div.reindex(idx).fillna(0.0) for s in raw}
+    divs = {s: raw[s]["div"].reindex(idx).fillna(0.0) for s in raw}
     splits = {s: raw[s].split.reindex(idx).fillna(0.0) for s in raw}
     fx = _fred("DEXUSEU", idx)
     fed = _fred("DFF", idx, pct=True).shift(1).fillna(0.0).clip(lower=0.0)
