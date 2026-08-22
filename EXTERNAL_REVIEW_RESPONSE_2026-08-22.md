@@ -4,17 +4,19 @@
 
 **REJECT remains the controlling status.** The frozen strategy parameters are not being retuned. The research candidate may only be reconsidered after the blocking accounting, attribution, execution and statistical issues below are rerun and published.
 
-The external review contains a mix of stale-checkout findings, valid blockers, and a few factual overstatements. None of the corrections below is sufficient to reverse the overall rejection by itself.
+The external review contains a mix of stale-checkout findings, valid blockers, and factual overstatements. None of the corrections below is sufficient to reverse the overall rejection by itself.
 
 ## Finding dispositions
 
 ### F0 — artifacts missing: STALE CHECKOUT, not a research blocker
 
-The GitHub research branch contains the report, deterministic target engine, tests, and research validators. The external reviewer inspected a local checkout that did not contain the research branch. Reproducibility is still incomplete because generated result tables/exposure series were not committed; the external-review branch therefore adds a self-contained rerun and publishes its summary/exposure trace.
+The GitHub research branch contains the report, deterministic target engine, tests, and research validators. The external reviewer inspected a local checkout that did not contain the research branch. Reproducibility is still incomplete because generated result tables/exposure series were not committed; the external-review branch therefore adds a self-contained rerun and is designed to publish its summary/exposure trace.
 
-### F1 — 2020 drawdown impossible: UNRESOLVED, blocking until exact trace is published
+### F1 — 2020 drawdown impossible: REVIEW ARITHMETIC IS WRONG; exact trace still required
 
-The review's hand calculation is not sufficient to falsify the result because the rule can delever at the March month boundary and the reported equity is EUR-denominated, while the review reasons primarily from a USD QQQ peak-to-trough move. However, the burden is on the backtest. The rerun must publish pre/post exposure, target, debt and EUR NAV around 2020-02-19, 2020-03-02 and 2020-03-23, plus the exact 2020 drawdown path.
+The review's concrete falsification uses an incorrect intermediate price move. Public QQQ daily history shows approximately 227.81 on 2020-02-19 and 208.04 on 2020-03-02, a decline of about 8.7%, not the claimed 17.3%. Reconstructing the frozen 20-day signal from the surrounding daily closes gives approximately 29.2% annualized realized volatility for the March decision input, implying a March target near 0.86x (`0.25 / 0.292`) rather than continued 1.75x exposure. QQQ then declined roughly another 21.1% from March 2 to March 23. A strategy drawdown in the low-30% range is therefore mechanically plausible; the asserted 40-49% minimum is not established.
+
+This does not waive the reproducibility requirement. The rerun must still publish pre/post exposure, target, debt and EUR NAV around 2020-02-19, 2020-03-02 and 2020-03-23, plus the exact 2020 drawdown path. Finding 1 is no longer treated as a blocking falsification, but failure to reconcile the exact trace would be blocking.
 
 ### F2 — leverage explains the result: VALID BLOCKER
 
@@ -59,6 +61,8 @@ The prior 1.50x neighbor won only 47.2% of overlapping 10-year windows against Q
 ### F9 — cost/financing sensitivity: VALID
 
 The QQQ-relative edge weakened materially under higher cost and borrowing assumptions. Twenty basis points must not be described as universally conservative for a EUR retail investor. The continuous rerun includes higher cost/financing cases while passive QQQ remains zero-cost. Broker-specific FX conversion and financing must be modeled before any deployable claim.
+
+The review's statement that 20bp costs consume 42% of the "claimed gross edge" is mislabeled: the quoted 2.34pp holdout excess was already after the modeled 20bp trading cost, taxes and financing, so it is a net modeled excess, not gross. The broader cost-sensitivity criticism remains valid.
 
 ### F10 — margin modeling: VALID BLOCKER FOR CRISIS CLAIMS
 
